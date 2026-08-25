@@ -1,0 +1,915 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cut room</title>
+<style>
+  :root {
+    --bg:        oklch(0.148 0.006 130);
+    --surface:   oklch(0.196 0.006 130);
+    --raised:    oklch(0.244 0.006 130);
+    --ink:       oklch(0.918 0.010 85);
+    --ink-2:     oklch(0.760 0.008 85);
+    --ink-3:     oklch(0.598 0.008 85);
+    --rule:      oklch(0.918 0.010 85 / 0.11);
+    --rule-2:    oklch(0.918 0.010 85 / 0.05);
+    --accent:    oklch(0.700 0.055 175);
+    --warn:      oklch(0.740 0.120 70);
+    --danger:    oklch(0.640 0.120 25);
+    --mono: ui-monospace,"SF Mono",Menlo,monospace;
+    --sans: -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;
+    --ease: cubic-bezier(0.16,1,0.3,1);
+  }
+  * { box-sizing:border-box; }
+  body, #ruler, .lane, .clip, header, #bin { user-select:none; -webkit-user-select:none; }
+  #insp input, .args, #addpath { user-select:text; -webkit-user-select:text; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:400 13px/1.45 var(--sans); font-variant-numeric:tabular-nums;
+    height:100vh; overflow:hidden;
+    display:grid; grid-template-columns:216px 1fr 360px; grid-template-rows:48px 1fr;
+  }
+
+  /* ── header: three zones, separated by space, not by rules ─────────── */
+  header { grid-column:1/-1; display:flex; align-items:center; gap:32px;
+           padding:0 20px; background:var(--surface); }
+  .zone { display:flex; align-items:center; gap:12px; }
+  .zone.grow { flex:1; }
+  .film { font:600 16px/1 var(--sans); letter-spacing:-0.01em; }
+  .badge { font:600 11px/1 var(--mono); letter-spacing:0.08em;
+           background:var(--warn); color:oklch(0.20 0.03 70);
+           padding:4px 7px; border-radius:3px; }
+  .len { font:400 13px/1 var(--mono); color:var(--ink-3); }
+  .len b { color:var(--ink-2); font-weight:400; }
+  .len.off { color:var(--danger); }
+
+  button, select {
+    background:var(--raised); color:var(--ink-2); border:1px solid var(--rule);
+    border-radius:5px; padding:6px 12px; font:500 13px/1 var(--sans);
+    cursor:pointer; transition:border-color .15s var(--ease),
+                               color .15s var(--ease), background .15s var(--ease);
+  }
+  button:hover, select:hover { color:var(--ink); border-color:var(--rule); background:oklch(0.29 0.006 130); }
+  button.primary { color:var(--ink); }
+  .zoom { display:flex; align-items:center; gap:2px; }
+  .zoom button { padding:6px 10px; font:500 14px/1 var(--mono); }
+  .zoom span { font:400 11px/1 var(--mono); color:var(--ink-3); width:52px;
+               text-align:center; }
+  #status { font:400 12px/1 var(--sans); color:var(--ink-3); }
+
+  /* ── bin ──────────────────────────────────────────────────────────── */
+  #bin { overflow-y:auto; background:var(--surface); padding-bottom:24px;
+         position:relative; }
+  #bin h4 { margin:20px 16px 8px; font:600 11px/1 var(--sans);
+            letter-spacing:0.1em; text-transform:uppercase; color:var(--ink-3); }
+  #bin .row { display:flex; gap:12px; align-items:center; padding:6px 16px;
+              cursor:grab; transition:background .15s var(--ease); }
+  #bin .row:hover { background:var(--raised); }
+  #bin img { width:40px; height:71px; object-fit:cover; background:var(--bg);
+             border-radius:3px; }
+  #bin .noimg { width:40px; height:71px; flex:none; border-radius:3px;
+                background:var(--bg); border:1px dashed var(--rule); }
+  #bin .stem { font:500 13px/1.3 var(--sans); color:var(--ink);
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #bin .sub { font:400 11px/1.4 var(--mono); color:var(--ink-3); }
+  #bin .odd { color:var(--warn); }
+  #bin .gone { color:var(--danger); }
+  /* The add block: a real drop target, a picker, and a path field. All three
+     are here because only the last two can be relied on — see addNote(). */
+  #add { margin:14px 16px 8px; display:flex; flex-direction:column; gap:8px; }
+  #add button { width:100%; }
+  #addpath { width:100%; background:var(--bg); color:var(--ink);
+             border:1px solid var(--rule); border-radius:4px;
+             font:400 11px/1.3 var(--mono); padding:7px 8px; }
+  #addpath:focus { outline:none; border-color:var(--accent); }
+  #addhint { font:400 11px/1.45 var(--sans); color:var(--ink-3); }
+  #bin.dragover:after { content:'drop to add to this project';
+    position:absolute; inset:6px; border:2px dashed var(--accent); border-radius:8px;
+    display:flex; align-items:center; justify-content:center; text-align:center;
+    padding:0 24px; font:500 12px/1.4 var(--sans); color:var(--accent);
+    background:oklch(0.196 0.006 130 / 0.86); z-index:9; pointer-events:none; }
+
+  /* ── timeline ─────────────────────────────────────────────────────── */
+  #stage { overflow:auto; position:relative; background:var(--bg); }
+  #ruler { position:sticky; top:0; height:32px; background:var(--bg);
+           border-bottom:1px solid var(--rule); z-index:3; cursor:crosshair; }
+  /* Five-second marks only. The 0.25s snap grid is felt, not drawn — ninety
+     hairlines behind twenty-eight cards was most of the noise. */
+  #ruler .sec { position:absolute; top:20px; bottom:0; width:1px; background:var(--rule); }
+  #ruler .sec span { position:absolute; left:5px; top:-14px;
+                     font:400 11px/1 var(--mono); color:var(--ink-3); }
+
+  /* Lanes separate by surface value. No borders. */
+  .lane { position:relative; height:76px; }
+  .lane:nth-child(even) { background:oklch(0.170 0.006 130); }
+  .lane .tag { position:absolute; left:6px; top:6px; font:500 11px/1 var(--mono);
+               color:var(--ink-3); opacity:.45; z-index:1; pointer-events:none; }
+  /* A crossfade spans the lane stack, because overlap in TIME is what blends,
+     not adjacency in a lane. Drawing it per-lane would imply layering. */
+  #xfades { position:absolute; inset:0; pointer-events:none; z-index:2; }
+  .xf { position:absolute; border-radius:4px;
+        background:repeating-linear-gradient(135deg,
+          oklch(0.918 0.010 85 / 0.10) 0 3px,
+          oklch(0.918 0.010 85 / 0)    3px 7px); }
+  .xf span { position:absolute; bottom:3px; left:50%; transform:translateX(-50%);
+             font:500 10px/1 var(--mono); color:var(--ink-2);
+             background:var(--bg); padding:2px 5px; border-radius:3px;
+             white-space:nowrap; }
+  #lanes { padding-bottom:48px; }
+
+  .clip { position:absolute; top:8px; height:60px; border-radius:4px;
+          border:1px solid oklch(0.918 0.010 85 / 0.14); overflow:hidden;
+          cursor:grab; user-select:none;
+          transition:border-color .15s var(--ease), box-shadow .15s var(--ease); }
+  .clip:hover { border-color:oklch(0.918 0.010 85 / 0.30); }
+  .clip.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .clip .id { display:block; font:600 13px/1 var(--sans); color:var(--ink);
+              padding:9px 9px 0; white-space:nowrap; pointer-events:none; }
+  .clip .dur { display:block; font:400 11px/1 var(--mono); color:var(--ink-2);
+               padding:5px 9px 0; white-space:nowrap; pointer-events:none; }
+  .clip .h { position:absolute; top:0; bottom:0; width:8px; z-index:2; cursor:ew-resize; }
+  .clip .h.l { left:0; } .clip .h.r { right:0; }
+  .clip.narrow .id, .clip.narrow .dur { display:none; }
+  /* OFFLINE: the file behind this card cannot be read right now. The card
+     stays exactly where it is and keeps its trim — nothing is dropped and
+     nothing is rewritten — it just says so, and export will name it. */
+  .clip.offline { background:repeating-linear-gradient(135deg,
+                    oklch(0.30 0.05 25) 0 7px, oklch(0.24 0.03 25) 7px 14px) !important;
+                  border-color:var(--danger); }
+  .clip.offline .id:after { content:' OFFLINE'; color:var(--danger);
+                            font:600 10px/1 var(--mono); letter-spacing:0.06em; }
+  /* A card being dragged between lanes overflows its own lane, so it has to
+     outrank every other card and the crossfade hatch. */
+  .clip.dragging { z-index:20; box-shadow:0 6px 20px oklch(0.10 0 0 / 0.5),
+                                          0 0 0 1px var(--accent); cursor:grabbing; }
+  .lane.target { background:oklch(0.225 0.010 175); }
+
+  #playhead { position:absolute; top:0; bottom:0; width:1px; background:var(--warn);
+              z-index:5; pointer-events:none; }
+  /* Grab target lives in the ruler band only, so it never eats a clip click. */
+  #ph-grab { position:absolute; top:0; left:-9px; width:19px; height:32px;
+             cursor:ew-resize; pointer-events:auto; }
+  #ph-grab:before { content:''; position:absolute; top:2px; left:5px;
+                    border:5px solid transparent; border-top-color:var(--warn);
+                    transition:border-top-color .15s var(--ease); }
+  #ph-grab:hover:before, #playhead.drag #ph-grab:before {
+                    border-top-color:oklch(0.86 0.13 70); }
+  #playhead.drag { background:oklch(0.86 0.13 70); }
+
+  /* ── right column: monitor over inspector ─────────────────────────── */
+  #side { background:var(--surface); overflow-y:auto; padding:20px; }
+  /* Chrome desaturates as it approaches the monitor: a saturated element
+     beside a graded frame shifts the frame's apparent colour. */
+  #monitor { position:relative; width:100%; aspect-ratio:9/16; background:var(--bg);
+             border-radius:5px; overflow:hidden; }
+  #monitor video { position:absolute; inset:0; width:100%; height:100%;
+                   object-fit:contain; }
+  #mono-t { display:flex; justify-content:space-between; align-items:baseline;
+            padding:12px 2px 0; }
+  #tc { font:500 16px/1 var(--mono); color:var(--ink); }
+  #tc-what { font:400 12px/1 var(--sans); color:var(--ink-3); }
+
+  #insp { margin-top:32px; }
+  #insp .shot { font:600 20px/1 var(--sans); letter-spacing:-0.015em; }
+  #insp .file { font:400 11px/1.5 var(--mono); color:var(--ink-3); margin:6px 0 20px;
+                overflow-wrap:anywhere; }
+  #insp label { display:flex; justify-content:space-between; align-items:center;
+                padding:5px 0; font:400 13px/1 var(--sans); color:var(--ink-2); }
+  #insp input { width:104px; background:var(--bg); color:var(--ink);
+                border:1px solid var(--rule); border-radius:4px;
+                font:400 13px/1 var(--mono); padding:6px 8px;
+                font-variant-numeric:tabular-nums;
+                transition:border-color .15s var(--ease); }
+  #insp input:focus { outline:none; border-color:var(--accent); }
+  #insp h4 { margin:28px 0 4px; font:600 11px/1.4 var(--sans);
+             letter-spacing:0.1em; text-transform:uppercase; color:var(--ink-3); }
+  #insp .master-note { font:400 12px/1.4 var(--sans); color:var(--warn);
+                       margin:0 0 10px; }
+  #insp select, #insp .args { width:100%; margin-bottom:6px; }
+  #insp .args { background:var(--bg); color:var(--ink); border:1px solid var(--rule);
+                border-radius:4px; font:400 12px/1 var(--mono); padding:7px 8px; }
+  #insp .run { width:100%; }
+  #problems { font:400 12px/1.5 var(--mono); color:var(--danger);
+              white-space:pre-wrap; margin-top:10px; overflow-wrap:anywhere; }
+  .empty { font:400 13px/1.5 var(--sans); color:var(--ink-3); }
+
+  /* Explanations live behind these, not as standing text. Nothing a person
+     reads once should occupy the surface forever. */
+  .info { position:relative; display:inline-flex; align-items:center;
+          justify-content:center; width:16px; height:16px; flex:none;
+          border-radius:50%; border:1px solid var(--rule);
+          font:600 10px/1 var(--sans); color:var(--ink-3); cursor:help;
+          transition:color .15s var(--ease), border-color .15s var(--ease); }
+  .info:hover, .info:focus-visible { color:var(--ink); border-color:var(--ink-3);
+                                     outline:none; }
+  .tip { position:absolute; top:24px; left:-8px; width:288px; z-index:60;
+         background:var(--raised); border:1px solid var(--rule); border-radius:7px;
+         padding:12px 14px; box-shadow:0 10px 32px oklch(0.08 0 0 / 0.55);
+         font:400 12px/1.55 var(--sans); color:var(--ink-2);
+         opacity:0; visibility:hidden; transform:translateY(-3px);
+         transition:opacity .15s var(--ease), transform .15s var(--ease),
+                    visibility .15s var(--ease); text-align:left; cursor:default; }
+  .info:hover .tip, .info:focus-visible .tip {
+         opacity:1; visibility:visible; transform:translateY(0); }
+  .tip.r { left:auto; right:-8px; }
+  .tip b { display:block; color:var(--ink); font-weight:600; margin-bottom:5px; }
+  .tip p { margin:0 0 8px; } .tip p:last-child { margin-bottom:0; }
+  .tip kbd { font:500 11px/1 var(--mono); color:var(--ink);
+             background:var(--bg); border:1px solid var(--rule);
+             border-radius:3px; padding:2px 4px; }
+  .tip em { color:var(--warn); font-style:normal; }
+</style>
+
+<header>
+  <div class="zone">
+    <span class="film" id="film">—</span>
+    <span class="info" tabindex="0">i<span class="tip">
+      <b>The cut room</b>
+      <p>The cut lives in one JSON file under <kbd>~/cutroom-projects/</kbd>, not in
+         this page. Every change saves straight to it, and Claude edits the same
+         file. Neither of you has to describe the cut to the other.</p>
+      <p>Output is <kbd id="tip-res">720&times;1280</kbd> at <kbd id="tip-fps">24</kbd> fps,
+         crf 10. Sources of another size are fitted and padded, never stretched.</p>
+      <p><em>cutroom never writes to, moves or deletes your media.</em> It reads.
+         A pass writes a new file into the project's own <kbd>derived/</kbd>
+         folder and re-points the clip at it.</p>
+      <p><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> one frame ·
+         <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> one second ·
+         <kbd>home</kbd><kbd>end</kbd> jump ·
+         <kbd>-</kbd><kbd>=</kbd> zoom · <kbd>delete</kbd> remove a clip.</p>
+    </span></span>
+  </div>
+  <div class="zone grow">
+    <span class="len" id="len">—</span>
+  </div>
+  <div class="zone">
+    <div class="zoom">
+      <button id="zout">−</button><span id="zlab">10 px/s</span><button id="zin">+</button>
+    </div>
+    <button id="addlane">+ lane</button>
+    <span class="info" tabindex="0">i<span class="tip r">
+      <b>Lanes are a workspace, not layers</b>
+      <p>Nothing is ever composited over anything. Lanes just let you keep a
+         section separate, or park an alternate take beside the shot it might
+         replace.</p>
+      <p>Two clips blend when they overlap in <em>time</em>, in one lane or
+         across lanes, it makes no difference. The renderer sorts by time and
+         ignores the lane entirely.</p>
+      <p>Drag a clip up or down to move it. Drop it one row past the last lane
+         to make a new one.</p>
+    </span></span>
+  </div>
+  <div class="zone">
+    <button id="play" class="primary">▶ play</button>
+    <button id="export">export</button>
+    <select id="hist" title="restore an earlier state of the cut"><option>history…</option></select>
+  </div>
+  <div class="zone"><span id="status"></span></div>
+</header>
+
+<div id="bin"></div>
+<div id="stage"><div id="ruler"></div>
+  <div style="position:relative"><div id="lanes"></div><div id="xfades"></div></div>
+  <div id="playhead"><div id="ph-grab"></div></div></div>
+<div id="side">
+  <div id="monitor"><video id="mA" muted playsinline></video>
+                    <video id="mB" muted playsinline></video></div>
+  <div id="mono-t"><span id="tc">0.00s</span>
+    <span style="display:flex;align-items:center;gap:7px">
+      <span id="tc-what">—</span>
+      <span class="info" tabindex="0">i<span class="tip r">
+        <b>True about the cut, not about the look</b>
+        <p>Two video elements cross-faded in the browser. Order, timing, trim and
+           where a blend lands are all exact.</p>
+        <p><em>Not shown here:</em> the downscale to the project's resolution and
+           ffmpeg's real crossfade curve. Export before deciding a look
+           question.</p>
+      </span></span>
+    </span></div>
+  <div id="insp"><p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p></div>
+</div>
+
+<script>
+const ZOOMS = [6, 10, 18, 34];
+const LANE_H = 76;          // keep in step with .lane height
+let ZI = 1, PX = ZOOMS[ZI];
+const SNAP = 0.25;
+let DOC = null, MEDIA = [], PASSES = [], OFFLINE = {}, SEL = null, EXTRA = 0;
+let RAF = null, T0 = 0, CLOCK = 0;
+const MON = {};
+
+const el=(t,c)=>{const e=document.createElement(t); if(c) e.className=c; return e;};
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+const totalLen = () => DOC.clips.length ? Math.max(...DOC.clips.map(endOf)) : 0;
+const snap = (v,free) => free ? Math.max(0,v) : Math.max(0, Math.round(v/SNAP)*SNAP);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+  ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+const mediaOf = mid => MEDIA.find(m => m.mid === mid) || null;
+// Media is addressed by mid over the wire too, so a path never travels in a
+// URL and there is nothing for a request to try to spell differently.
+const mediaURL = mid => '/media/' + encodeURIComponent(mid);
+
+// Source tint. Each media item gets its own hue, so a timeline reads as colour
+// fields — which is what lets the per-second gridlines go away — and two cuts
+// of the same source are visibly the same source.
+const hueOf = mid => { const i = MEDIA.findIndex(m => m.mid === mid);
+  return 140 + ((i < 0 ? 0 : i) * 47) % 300; };
+const tint = (c, L) => `oklch(${L} 0.014 ${hueOf(c.mid)})`;
+
+// >>> save-loop (extracted verbatim by test_server.py — keep both markers)
+function note(m, col) { const s=document.getElementById('status');
+  s.textContent = m; s.style.color = col || 'var(--ink-3)'; }
+// One save in flight at a time. Two quick edits otherwise both capture the
+// same DOC.version before either await resolves: the server serialises them
+// and hands the loser a perfectly legitimate 409, which throws that edit away
+// and blames an outside writer that was in fact this page. Coalesce instead —
+// the whole document goes over the wire every time, so one more save after the
+// current one lands carries the latest state, however many edits it merged.
+let SAVING = false, SAVE_AGAIN = false, THEIRS = null;
+async function saveOnce() {
+  let r, body;
+  try {
+    r = await fetch('/project', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(DOC)
+    });
+    body = await r.json();
+  } catch (e) {
+    // The one thing this tool may never do is lose an edit quietly.
+    return note('not saved — the cut room is not answering (' + e.message + ')',
+                'var(--danger)');
+  }
+  if (r.status === 409) {
+    // Somebody else wrote since this page read. Almost always the agent.
+    //
+    // THE RULE: a conflict never throws away the director's work, and never
+    // reports "saved". The old code adopted the server's document wholesale
+    // right here, which silently binned two things at once — the edit that
+    // just lost the race, and any drag queued while the PUT was in flight
+    // (SAVE_AGAIN), because the coalescing loop then re-saved the freshly
+    // adopted server copy and the header flipped to "saved" over an edit that
+    // no longer existed anywhere.
+    //
+    // So: hold the server's copy aside, keep the local timeline exactly as it
+    // is, stop the loop, and make the director choose. Nothing is written
+    // until they do.
+    THEIRS = body; SAVE_AGAIN = false;
+    conflictNote();
+  } else if (r.status === 422) {
+    note((body.problems || ['refused'])[0], 'var(--danger)');
+  } else if (!r.ok) {
+    note('not saved — ' + r.status, 'var(--danger)');
+  } else {
+    // Take the new version NUMBER, never the new object graph. Every card's
+    // pointer handler and every inspector field closes over a clip object
+    // from DOC.clips; assigning DOC = body swaps those objects out from under
+    // them, and from the next drag on the page mutates orphans — the timeline
+    // snaps back, the header still says "saved", and the edit is gone. On a
+    // 200 the server's document is our own body with version + 1, so the
+    // number is the only thing that is actually new.
+    DOC.version = body.version;
+    note('saved');
+  }
+}
+// The conflict banner: the state of the cut in one line, plus the only two
+// honest ways out of it. It stays up until one of them is clicked.
+function conflictNote() {
+  const s = document.getElementById('status');
+  s.textContent = '';
+  s.style.color = 'var(--warn)';
+  s.append('NOT SAVED — the file changed under you. Your edits are still here: ');
+  const mine = el('button'); mine.textContent = 'keep mine';
+  mine.onclick = keepMine;
+  const theirs = el('button'); theirs.textContent = 'take theirs';
+  theirs.onclick = takeTheirs;
+  s.append(mine, ' ', theirs);
+}
+// Re-base the local cut onto whatever version the file is at now and save it.
+// This overwrites the other writer's change — deliberately, and only because
+// a human just said so; their state is still in .snapshots/ either way.
+function keepMine() {
+  if (!THEIRS) return;
+  DOC.version = THEIRS.version;
+  THEIRS = null;
+  save();
+}
+// Drop the local edits and adopt the file. What the old code did on its own,
+// now only when asked, and it says out loud what it cost.
+function takeTheirs() {
+  if (!THEIRS) return;
+  // Adopting a whole new object graph orphans every card and inspector field
+  // bound to the old one, so re-render and re-bind, selection and all.
+  DOC = THEIRS; THEIRS = null;
+  draw(); reselect();
+  note('reloaded from disk — your unsaved edits were discarded', 'var(--warn)');
+}
+// Re-bind the inspector after the clip objects have been replaced wholesale.
+function reselect() {
+  const c = SEL && DOC.clips.find(x => x.uid === SEL);
+  if (c) return inspect(c);
+  SEL = null;
+  document.getElementById('insp').innerHTML =
+    '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>';
+}
+async function save() {
+  // An unresolved conflict blocks every save: the director can go on dragging
+  // and nothing is lost, but the page will not write over a file it knows it
+  // has not seen until "keep mine" says so.
+  if (THEIRS) { conflictNote(); return; }
+  if (SAVING) { SAVE_AGAIN = true; return; }   // the running save will re-fire
+  SAVING = true;
+  try {
+    do { SAVE_AGAIN = false; await saveOnce(); } while (SAVE_AGAIN && !THEIRS);
+  } finally { SAVING = false; }
+}
+// <<< save-loop
+
+// ── adding media ─────────────────────────────────────────────────────────
+// A browser is not allowed to tell a page where a dropped file lives on disk.
+// Chrome and Safari both withhold it, deliberately and permanently. And cutroom
+// may not go looking for a file by name, because looking means scanning a
+// directory and scanning a directory is exactly the habit that cost 226 clips.
+// So the drop target reads a path when the browser offers one (some do, in
+// text/uri-list) and SAYS SO OUT LOUD when it does not, rather than failing
+// silently. The picker button and the path field always work.
+function pathsFromDrop(dt) {
+  const out = [];
+  const uris = (dt.getData('text/uri-list') || '') + '\n' + (dt.getData('text/plain') || '');
+  for (const line of uris.split(/[\r\n]+/)) {
+    const s = line.trim();
+    if (s.startsWith('file://')) {
+      try { out.push(decodeURIComponent(new URL(s).pathname)); } catch (e) {}
+    } else if (s.startsWith('/')) out.push(s);
+  }
+  for (const f of dt.files || []) if (f.path) out.push(f.path);   // not a browser
+  return [...new Set(out)];
+}
+async function addPaths(paths) {
+  if (!paths.length) return null;
+  note('adding…', 'var(--warn)');
+  const r = await fetch('/media', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({paths})});
+  const b = await r.json();
+  if (!r.ok) { note((b.problems || ['could not add'])[0], 'var(--danger)'); return null; }
+  adopt(b.project);
+  const n = b.added.length;
+  note(n ? `added ${n} file${n > 1 ? 's' : ''}`
+         : 'already in this project', n ? 'var(--accent)' : null);
+  return b;
+}
+function addNote(kind) {
+  const box = document.getElementById('addhint');
+  box.style.color = kind === 'bad' ? 'var(--danger)' : 'var(--ink-3)';
+  box.textContent = kind === 'bad'
+    ? 'Your browser did not hand over that file’s path — it is not allowed to. '
+      + 'Use “Add media…”, paste the absolute path below, or run '
+      + '`cutroom add ' + (DOC ? DOC.name : '<project>') + ' <path>`.'
+    : 'Media enters only when you put it here. Nothing is ever scanned.';
+}
+async function dropped(e, lane) {
+  const paths = pathsFromDrop(e.dataTransfer);
+  if (!paths.length) { addNote('bad'); note('no path in that drop', 'var(--danger)'); return null; }
+  addNote('ok');
+  const b = await addPaths(paths);
+  if (!b) return null;
+  const first = b.added[0] || (b.already[0] && mediaOf(b.already[0]));
+  if (first && lane !== null) place(first.mid, lane, snap(e.offsetX / PX));
+  return b;
+}
+
+function drawBin() {
+  const box = document.getElementById('bin'); box.innerHTML='';
+  const h = el('h4');
+  h.innerHTML = `<span>Media · ${MEDIA.length}</span>
+    <span class="info" tabindex="0">i<span class="tip">
+      <b>The allowlist, not a folder</b>
+      <p>These are the only files this project can read. A file is here because
+         you put it here — cutroom never scans, indexes or watches a
+         directory.</p>
+      <p>Nothing here is in the film until you drag it onto a lane. A resolution
+         in amber does not match the project's own and will be fitted and padded
+         at render.</p>
+    </span></span>`;
+  h.style.cssText += 'display:flex;align-items:center;gap:7px;justify-content:space-between';
+  box.append(h);
+
+  const add = el('div'); add.id = 'add';
+  add.innerHTML = `<button id="pick">Add media…</button>
+    <input id="addpath" placeholder="or paste an absolute path" spellcheck="false">
+    <div id="addhint"></div>`;
+  box.append(add);
+  document.getElementById('pick').onclick = pickMedia;
+  document.getElementById('addpath').onkeydown = async e => {
+    if (e.key !== 'Enter') return;
+    const p = e.target.value.trim();
+    if (!p) return;
+    if (await addPaths([p])) e.target.value = '';
+  };
+  addNote('ok');
+
+  for (const m of MEDIA) {
+    const odd = DOC && (m.w !== DOC.resolution[0] || m.h !== DOC.resolution[1]);
+    const r = el('div','row'); r.draggable = true;
+    const sub = m.gone ? '<span class="gone">file not found</span>'
+      : `${(m.dur||0).toFixed(2)}s${odd ? ` · <span class="odd">${m.w}×${m.h}</span>` : ''}`;
+    r.innerHTML = `${m.gone ? '<div class="noimg"></div>'
+                            : `<img src="/thumb/${encodeURIComponent(m.mid)}" alt="">`}
+      <div style="min-width:0">
+        <div class="stem">${esc(m.label)}</div>
+        <div class="sub">${sub}</div>
+      </div>`;
+    r.title = m.path;
+    r.ondragstart = e => e.dataTransfer.setData('text/plain', 'mid:' + m.mid);
+    box.append(r);
+  }
+  const binEl = document.getElementById('bin');
+  binEl.ondragover = e => { e.preventDefault(); binEl.classList.add('dragover'); };
+  binEl.ondragleave = () => binEl.classList.remove('dragover');
+  binEl.ondrop = e => { e.preventDefault(); binEl.classList.remove('dragover');
+                        dropped(e, null); };
+}
+async function pickMedia() {
+  note('picker open…', 'var(--warn)');
+  const r = await fetch('/media/pick', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: '{}'});
+  const b = await r.json();
+  if (!r.ok) { addNote('bad'); return note((b.problems||['picker failed'])[0], 'var(--danger)'); }
+  if (b.cancelled) return note('');
+  adopt(b.project);
+  note(`added ${b.added.length} file${b.added.length === 1 ? '' : 's'}`, 'var(--accent)');
+}
+// Take a whole new document from the server (add media, run a pass) and rebind.
+function adopt(project) {
+  if (!project) return;
+  DOC = project; MEDIA = (DOC.media || []).map(m => ({...m}));
+  markOffline(); drawBin(); draw(); reselect();
+}
+// A media item reads as gone when some clip that names it came back OFFLINE.
+function markOffline() {
+  for (const m of MEDIA)
+    m.gone = DOC.clips.some(c => c.mid === m.mid && OFFLINE[c.uid]);
+}
+
+function drawRuler() {
+  const r = document.getElementById('ruler');
+  const span = Math.max(30, totalLen() + 10);
+  r.innerHTML=''; r.style.width = span*PX+'px';
+  const step = PX < 9 ? 10 : 5;
+  for (let s=step; s<=span; s+=step) {
+    const t = el('div','sec'); t.style.left = s*PX+'px';
+    t.innerHTML = `<span>${s}</span>`; r.append(t);
+  }
+}
+
+function card(c) {
+  const w = Math.max(3, dur(c)*PX);
+  const off = !!OFFLINE[c.uid];
+  const d = el('div','clip'+(SEL===c.uid?' sel':'')+(w<46?' narrow':'')+(off?' offline':''));
+  d.style.left = c.t*PX+'px'; d.style.width = w+'px';
+  d.style.background = tint(c, 0.255);
+  d.innerHTML = `<span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
+                 <div class="h l"></div><div class="h r"></div>`;
+  const m = mediaOf(c.mid);
+  d.title = `${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
+                                                       : (m ? m.path : c.mid)}`;
+  d.dataset.uid = c.uid;
+  d.onpointerdown = e => {
+    const mode = e.target.classList.contains('l') ? 'l'
+               : e.target.classList.contains('r') ? 'r' : 'move';
+    const x0=e.clientX, y0=e.clientY, t0=c.t, in0=c.in, out0=c.out, lane0=c.lane;
+    const src = mediaOf(c.mid); const cap = src && src.dur ? src.dur : out0;
+    const laneCount = document.querySelectorAll('.lane').length;
+    let lane = lane0;
+    SEL=c.uid; inspect(c); d.classList.add('sel');
+    if (mode==='move') d.classList.add('dragging');
+    d.setPointerCapture(e.pointerId); e.preventDefault();
+
+    d.onpointermove = ev => {
+      const ds=(ev.clientX-x0)/PX;
+      if (mode==='move') {
+        c.t = snap(t0+ds, ev.altKey);
+        // Vertical: one lane per LANE_H of travel. Dropping one row past the
+        // last lane creates a new one, so a clip never needs a button first.
+        const want = lane0 + Math.round((ev.clientY-y0)/LANE_H);
+        const next = Math.max(0, Math.min(laneCount, want));
+        if (next !== lane) {
+          lane = next;
+          document.querySelectorAll('.lane').forEach((L,i) =>
+            L.classList.toggle('target', i===lane));
+        }
+        d.style.top = (8 + (lane-lane0)*LANE_H) + 'px';
+      }
+      else if (mode==='l') { const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
+        c.t = snap(t0+(w2-in0)/c.rate, ev.altKey); c.in = w2; }
+      else c.out = Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate));
+      const nw = Math.max(3, dur(c)*PX);
+      d.style.left=c.t*PX+'px'; d.style.width=nw+'px';
+      d.classList.toggle('narrow', nw<46);
+      d.querySelector('.dur').textContent = dur(c).toFixed(2)+'s';
+    };
+    d.onpointerup = () => {
+      d.onpointermove=d.onpointerup=null;
+      d.classList.remove('dragging');
+      document.querySelectorAll('.lane').forEach(L=>L.classList.remove('target'));
+      c.lane = lane;
+      if (lane >= laneCount) EXTRA = lane + 1;   // dropped past the last lane
+      for (const k of ['t','in','out']) c[k]=Math.round(c[k]*1000)/1000;
+      // An emptied trailing lane disappears rather than lingering as a gap.
+      const used = DOC.clips.length ? Math.max(...DOC.clips.map(x=>x.lane))+1 : 1;
+      EXTRA = Math.min(EXTRA, used + 1);
+      draw(); save(); inspect(c);
+    };
+  };
+  return d;
+}
+
+function place(mid, lane, t) {
+  const m = mediaOf(mid); if (!m) return;
+  DOC.clips.push({uid:'c'+Math.random().toString(36).slice(2,8),
+    mid, lane, t, in:0, out:m.dur || 1.0, rate:1.0,
+    label:m.label, note:''});
+  draw(); save();
+}
+
+function drop(e, lane) {
+  e.preventDefault();
+  const text = e.dataTransfer.getData('text/plain') || '';
+  if (text.startsWith('mid:')) {
+    place(text.slice(4), lane, snap(e.offsetX/PX));
+    return;
+  }
+  dropped(e, lane);        // a file dragged straight from the desktop
+}
+
+function draw() {
+  drawRuler();
+  const span = Math.max(30, totalLen() + 10);
+  const box = document.getElementById('lanes'); box.innerHTML='';
+  const lanes = Math.max(1, EXTRA, ...DOC.clips.map(c=>c.lane+1));
+  for (let i=0;i<lanes;i++) {
+    const lane = el('div','lane'); lane.style.width=span*PX+'px';
+    lane.ondragover=e=>e.preventDefault(); lane.ondrop=e=>drop(e,i);
+    lane.innerHTML = `<span class="tag">lane ${i+1}</span>`;
+    for (const c of DOC.clips.filter(c=>c.lane===i)) lane.append(card(c));
+    box.append(lane);
+  }
+  // Overlaps are found across every clip in time order — lane is irrelevant.
+  const xf = document.getElementById('xfades'); xf.innerHTML='';
+  const byT = [...DOC.clips].sort((a,b)=>a.t-b.t);
+  for (let i=0;i<byT.length-1;i++) {
+    const a=byT[i], b=byT[i+1], ov = endOf(a)-b.t;
+    if (ov <= 0.001) continue;
+    const lo = Math.min(a.lane, b.lane), hi = Math.max(a.lane, b.lane);
+    const band = el('div','xf');
+    band.style.left   = b.t*PX+'px';
+    band.style.width  = Math.max(2, ov*PX)+'px';
+    band.style.top    = (lo*LANE_H + 8) + 'px';
+    band.style.height = ((hi-lo)*LANE_H + 60) + 'px';
+    if (ov*PX > 40) band.innerHTML = `<span>${ov.toFixed(2)}s</span>`;
+    band.title = `crossfade ${a.label} → ${b.label} · ${ov.toFixed(2)}s`;
+    xf.append(band);
+  }
+  const n = totalLen(), L = document.getElementById('len');
+  const nOff = Object.keys(OFFLINE).length;
+  L.className = 'len' + (nOff ? ' off' : '');
+  L.innerHTML = `<b>${n.toFixed(2)}s</b> · ${DOC.clips.length} clips`
+              + (nOff ? ` · ${nOff} OFFLINE — export is blocked` : '');
+  document.getElementById('zlab').textContent = PX + ' px/s';
+  document.getElementById('playhead').style.left = CLOCK*PX+'px';
+}
+
+const activeAt = t => DOC.clips.filter(c=>t>=c.t && t<endOf(c) && !OFFLINE[c.uid])
+                               .sort((a,b)=>a.t-b.t);
+function feed(slot,c,t) {
+  const v = document.getElementById(slot);
+  const want = mediaURL(c.mid);
+  if (MON[slot]!==want) { v.src=want; MON[slot]=want; }
+  const target = c.in + (t-c.t)*c.rate;
+  if (Math.abs(v.currentTime-target)>0.2) v.currentTime = target;
+  return v;
+}
+function paint(t) {
+  const live = activeAt(t);
+  const a=document.getElementById('mA'), b=document.getElementById('mB');
+  document.getElementById('tc').textContent = t.toFixed(2)+'s';
+  if (!live.length) { a.style.opacity=b.style.opacity=0;
+    document.getElementById('tc-what').textContent='black'; return []; }
+  const va = feed('mA',live[0],t); va.style.opacity=1;
+  let vb=null;
+  if (live[1]) { vb=feed('mB',live[1],t);
+    const ov = endOf(live[0])-live[1].t;
+    vb.style.opacity = Math.min(1,Math.max(0,(t-live[1].t)/ov)); }
+  else { b.style.opacity=0; MON.mB=null; }
+  document.getElementById('tc-what').textContent =
+    live.map(c=>c.label).join(' → ') + (live[1]?'  crossfade':'');
+  return [va,vb].filter(Boolean);
+}
+function scrubTo(t) { CLOCK=Math.max(0,t);
+  document.getElementById('playhead').style.left=CLOCK*PX+'px';
+  paint(CLOCK).forEach(v=>v.pause()); }
+function stopPlay() { cancelAnimationFrame(RAF); RAF=null;
+  document.querySelectorAll('#monitor video').forEach(v=>v.pause());
+  document.getElementById('play').textContent='▶ play'; }
+function tick() {
+  CLOCK=(performance.now()-T0)/1000;
+  document.getElementById('playhead').style.left=CLOCK*PX+'px';
+  document.getElementById('stage').scrollLeft =
+    Math.max(0, CLOCK*PX - window.innerWidth/3);
+  paint(CLOCK).forEach(v=>{ if(v.paused) v.play().catch(()=>{}); });
+  if (CLOCK>totalLen()) return stopPlay();
+  RAF=requestAnimationFrame(tick);
+}
+
+function inspect(c) {
+  const m = mediaOf(c.mid) || {dur:c.out, w:'?', h:'?', path:'(unknown media ' + c.mid + ')'};
+  const off = OFFLINE[c.uid];
+  document.getElementById('insp').innerHTML = `
+    <div class="shot">${esc(c.label)}</div>
+    <div class="file">${esc(m.path)}<br>
+      ${off ? '<span style="color:var(--danger)">OFFLINE — ' + esc(off.why) + '</span>'
+            : `source ${(m.dur||0).toFixed(2)}s · ${m.w}×${m.h}`}</div>
+    <label>in <input id="f-in" type="number" step="0.04" value="${c.in}"></label>
+    <label>out <input id="f-out" type="number" step="0.04" value="${c.out}"></label>
+    <label>position <input id="f-t" type="number" step="0.25" value="${c.t}"></label>
+    <label>rate <input id="f-rate" type="number" step="0.05" value="${c.rate}"></label>
+    <label>label <input id="f-label" type="text" value="${esc(c.label)}"></label>
+    <label>note <input id="f-note" type="text" value="${esc(c.note)}"></label>
+    <h4 style="display:flex;align-items:center;gap:7px">Post pass
+      <span class="info" tabindex="0">i<span class="tip r">
+        <b>Writes a new file. Always.</b>
+        <p>The pass reads your source and writes
+           <kbd>derived/&lt;name&gt;__&lt;pass&gt;.mp4</kbd> inside this project,
+           then points this clip at the new file. Your original is opened
+           read-only and is not touched, moved or renamed.</p>
+        <p>It runs on the whole source, never on the trim — a pass that ramps
+           across a clip's duration would compress its whole escalation into a
+           trimmed segment and every cut would restart it.</p>
+        <p>Passes come from <kbd>"passes"</kbd> in the project file. cutroom
+           ships none.</p>
+      </span></span></h4>
+    ${PASSES.length
+      ? `<select id="tool">${PASSES.map(t=>`<option>${esc(t)}</option>`).join('')}</select>
+         <input class="args" id="targs" placeholder="extra arguments">
+         <button class="run" id="runpass">Run pass</button>`
+      : `<p class="empty">No passes configured. Add an absolute script path to
+         <kbd>"passes"</kbd> in the project file.</p>`}
+    <div id="problems"></div>`;
+  scrubTo(c.t + 0.01);
+  for (const [f,k] of [['in','in'],['out','out'],['t','t'],['rate','rate'],
+                       ['label','label'],['note','note']])
+    document.getElementById('f-'+f).onchange = e => {
+      c[k] = (k==='note'||k==='label') ? e.target.value : parseFloat(e.target.value);
+      draw(); save(); };
+  const run = document.getElementById('runpass');
+  if (run) run.onclick = async () => {
+    note('running…', 'var(--warn)');
+    const r = await fetch('/pass', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid: c.uid, pass: document.getElementById('tool').value,
+                            args: document.getElementById('targs').value.split(/\s+/)
+                                    .filter(Boolean)})});
+    const b = await r.json();
+    if (!r.ok) { document.getElementById('problems').textContent =
+                   (b.problems||[]).join('\n');
+                 return note('pass failed', 'var(--danger)'); }
+    adopt(b.project);
+    note(`pass done · ${b.media.label} · ${(b.media.dur||0).toFixed(2)}s`, 'var(--accent)');
+    scrubTo(CLOCK);
+  };
+}
+
+function zoom(d) { ZI = Math.max(0, Math.min(ZOOMS.length-1, ZI+d));
+  PX = ZOOMS[ZI]; draw(); }
+document.getElementById('zin').onclick = () => zoom(1);
+document.getElementById('zout').onclick = () => zoom(-1);
+document.getElementById('play').onclick = () => {
+  if (RAF) return stopPlay();
+  T0 = performance.now()-CLOCK*1000;
+  document.getElementById('play').textContent='■ stop'; tick(); };
+document.getElementById('addlane').onclick = () => {
+  EXTRA = Math.max(1, ...DOC.clips.map(c=>c.lane+1))+1; draw(); };
+async function doExport() {
+  note('exporting…', 'var(--warn)');
+  const r = await fetch('/render', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({export: true})});
+  const b = await r.json();
+  if (!r.ok) { document.getElementById('insp').innerHTML =
+                 `<div id="problems">${esc((b.problems||[]).join('\n'))}</div>`;
+               return note('export failed', 'var(--danger)'); }
+  note(`${b.out} · ${b.seconds}s · ${b.frames} frames · ${b.mbps} Mbps`, 'var(--accent)');
+  window.open('/renders/' + encodeURIComponent(b.out), '_blank');
+}
+document.getElementById('export').onclick = doExport;
+
+// Restore. The list is filled on open rather than on load, so it is never
+// stale, and restore writes through the same version-guarded PUT — the
+// snapshot becomes the newest state instead of rewinding the file.
+const HIST = document.getElementById('hist');
+HIST.onmousedown = async () => {
+  try {
+    const {snapshots} = await (await fetch('/history')).json();
+    HIST.innerHTML = '<option>history…</option>' + snapshots.slice(-40).reverse()
+      .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  } catch (e) { note('could not list history — ' + e.message, 'var(--danger)'); }
+};
+HIST.onchange = async () => {
+  const stamp = HIST.value;
+  HIST.selectedIndex = 0;
+  if (!stamp || stamp === 'history…') return;
+  try {
+    const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST'});
+    const b = await r.json();
+    if (!r.ok) return note((b.problems || ['restore failed'])[0], 'var(--danger)');
+    // A restore IS a choice about which state wins, so it also settles any
+    // open conflict — otherwise THEIRS would go on blocking every save.
+    THEIRS = null;
+    adopt(b); scrubTo(CLOCK);
+    note('restored ' + stamp, 'var(--accent)');
+  } catch (e) { note('restore failed — ' + e.message, 'var(--danger)'); }
+};
+// Scrub by dragging — from anywhere on the ruler, or by the playhead handle.
+// Playing stops on grab: a playhead that keeps running while you drag it lies
+// about where you put it.
+function beginScrub(e, fromHandle) {
+  e.preventDefault();
+  const stage = document.getElementById('stage');
+  const ph = document.getElementById('playhead');
+  const wasPlaying = !!RAF;
+  if (wasPlaying) stopPlay();
+  ph.classList.add('drag');
+
+  const at = ev => (ev.clientX - stage.getBoundingClientRect().left
+                    + stage.scrollLeft) / PX;
+  if (!fromHandle) scrubTo(at(e));
+
+  const move = ev => {
+    scrubTo(at(ev));
+    // auto-scroll when dragged to either edge
+    const r = stage.getBoundingClientRect();
+    if (ev.clientX > r.right - 60) stage.scrollLeft += 14;
+    if (ev.clientX < r.left + 60) stage.scrollLeft -= 14;
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    ph.classList.remove('drag');
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
+document.getElementById('ruler').onpointerdown = e => beginScrub(e, false);
+document.getElementById('ph-grab').onpointerdown = e => beginScrub(e, true);
+document.addEventListener('keydown', e => {
+  if (document.activeElement.tagName==='INPUT') return;
+  if (e.code==='Space') { e.preventDefault(); document.getElementById('play').click(); }
+  if (e.key==='='||e.key==='+') zoom(1);
+  if (e.key==='-') zoom(-1);
+  if (e.key==='ArrowLeft')  { e.preventDefault(); scrubTo(CLOCK - (e.shiftKey?1:1/DOC.fps)); }
+  if (e.key==='ArrowRight') { e.preventDefault(); scrubTo(CLOCK + (e.shiftKey?1:1/DOC.fps)); }
+  if (e.key==='Home') scrubTo(0);
+  if (e.key==='End')  scrubTo(totalLen());
+  if ((e.key==='Backspace'||e.key==='Delete') && SEL) {
+    // Removes the CLIP from the timeline. The file it names stays in the
+    // media list and stays on disk — cutroom deletes nothing, anywhere.
+    DOC.clips=DOC.clips.filter(c=>c.uid!==SEL); SEL=null; draw(); save();
+    document.getElementById('insp').innerHTML =
+      '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>'; }
+});
+// A file dropped anywhere else must not navigate the page away to it.
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => e.preventDefault());
+
+// A boot that fails is fail-closed — draw() never runs, so nothing is lost —
+// but silence in the console is not a failure the director can see.
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + ' → ' + r.status);
+  return r.json();
+}
+async function boot() {
+  try {
+    const b = await getJSON('/project');
+    DOC = b.project;
+    MEDIA = (DOC.media || []).map(m => ({...m}));
+    PASSES = b.passes || [];
+    OFFLINE = {};
+    for (const o of b.offline) OFFLINE[o.uid] = o;
+    markOffline();
+    document.getElementById('film').textContent = DOC.name;
+    document.getElementById('tip-res').innerHTML =
+      DOC.resolution[0] + '&times;' + DOC.resolution[1];
+    document.getElementById('tip-fps').textContent = DOC.fps;
+    drawBin(); draw(); scrubTo(0);
+    if (Object.keys(OFFLINE).length)
+      note(Object.keys(OFFLINE).length + ' clip(s) OFFLINE — the cut is intact, '
+           + 'export is blocked until the files are back', 'var(--danger)');
+  } catch (e) {
+    note('could not load the cut — ' + e.message, 'var(--danger)');
+    document.getElementById('insp').innerHTML =
+      `<div id="problems">${esc(e.message)}\n\nThe timeline is not loaded. `
+      + `Nothing has been changed; reload once the cut room is answering.</div>`;
+  }
+}
+boot();
+</script>

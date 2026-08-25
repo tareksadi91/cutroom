@@ -1,0 +1,7 @@
+#!/bin/sh
+# cutroom — a standalone timeline. Python 3 stdlib + ffmpeg, nothing else.
+#
+#   ./cutroom new threshold
+#   ./cutroom add threshold /abs/path/to/a.mp4
+#   ./cutroom serve threshold
+exec python3 "$(dirname "$0")/src/server.py" "$@"
