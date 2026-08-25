@@ -709,15 +709,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
-        with open_source(path) as fh:
-            fh.seek(start)
-            remaining = end - start + 1
-            while remaining > 0:
-                chunk = fh.read(min(65536, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+        try:
+            with open_source(path) as fh:
+                fh.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = fh.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # NORMAL, and it happens constantly: a <video> element opens a
+            # range, decides it has seen enough and drops the socket. It is not
+            # an error and it must not print a traceback — the terminal is for
+            # render output, and a wall of stack traces during ordinary
+            # scrubbing is how a real failure gets missed.
+            pass
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):

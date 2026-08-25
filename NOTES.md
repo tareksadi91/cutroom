@@ -211,3 +211,27 @@ step and diffed, unchanged each time; the directory still holds its 41 files.
   consequence of never deleting: the director removes it by hand, or ignores it.
 - `duration()` is exact at `rate 1.0` and can be one frame out for a retimed
   clip. Unchanged, still honest, still tested with a `<= 1` tolerance.
+
+## After the first commit: two things a real browser found
+
+Verified by loading the page headlessly (gstack `browse`) against the real
+project, which caught two things no test would have:
+
+1. **A `<video>` aborting a Range request printed a stack trace per seek.**
+   `BrokenPipeError` / `ConnectionResetError` out of `wfile.write` is *normal*
+   when a video element decides it has read enough and drops the socket, and the
+   terminal filled with tracebacks during ordinary scrubbing — which is how a
+   real failure gets missed. `_file()` now swallows exactly those two, and
+   nothing else.
+2. **The opening zoom was tuned for a 92-second film.** At 10 px/s a five-second
+   cut is fifty pixels of timeline. Two wider steps were added to `ZOOMS`
+   (64 and 120 px/s, the original four untouched) and `fitZoom()` picks the
+   widest step that fits the stage — on load only, so the director's own zoom
+   is never overridden. The ruler shows single seconds at those two new steps
+   and keeps its five-second marks everywhere the design was drawn at.
+
+The OFFLINE state was checked the same way, by moving a source out from under a
+saved cut: the clip stays where it is, hatched red and labelled OFFLINE, the
+media row reads "file not found", the header says export is blocked, the
+inspector names the missing path — and the project file is byte-identical
+afterwards.

@@ -288,7 +288,10 @@
 </div>
 
 <script>
-const ZOOMS = [6, 10, 18, 34];
+// The first four steps are the film-length scale the design was drawn at; the
+// last two exist because a project is no longer always ninety seconds long and
+// a five-second cut at 10 px/s is fifty pixels of timeline.
+const ZOOMS = [6, 10, 18, 34, 64, 120];
 const LANE_H = 76;          // keep in step with .lane height
 let ZI = 1, PX = ZOOMS[ZI];
 const SNAP = 0.25;
@@ -550,11 +553,20 @@ function markOffline() {
     m.gone = DOC.clips.some(c => c.mid === m.mid && OFFLINE[c.uid]);
 }
 
+// How much time the ruler and the lanes cover: the cut plus room to drop
+// something after it, and never less than the width of the stage.
+function spanSeconds() {
+  const room = document.getElementById('stage').clientWidth / PX;
+  return Math.max(totalLen() + 5, room);
+}
 function drawRuler() {
   const r = document.getElementById('ruler');
-  const span = Math.max(30, totalLen() + 10);
+  const span = spanSeconds();
   r.innerHTML=''; r.style.width = span*PX+'px';
-  const step = PX < 9 ? 10 : 5;
+  // Five-second marks at every scale the design was drawn at; single seconds
+  // only at the two zoom steps added for short cuts, where a 5s mark would be
+  // six hundred pixels apart.
+  const step = PX < 9 ? 10 : PX > 40 ? 1 : 5;
   for (let s=step; s<=span; s+=step) {
     const t = el('div','sec'); t.style.left = s*PX+'px';
     t.innerHTML = `<span>${s}</span>`; r.append(t);
@@ -643,7 +655,7 @@ function drop(e, lane) {
 
 function draw() {
   drawRuler();
-  const span = Math.max(30, totalLen() + 10);
+  const span = spanSeconds();
   const box = document.getElementById('lanes'); box.innerHTML='';
   const lanes = Math.max(1, EXTRA, ...DOC.clips.map(c=>c.lane+1));
   for (let i=0;i<lanes;i++) {
@@ -780,6 +792,15 @@ function inspect(c) {
 
 function zoom(d) { ZI = Math.max(0, Math.min(ZOOMS.length-1, ZI+d));
   PX = ZOOMS[ZI]; draw(); }
+// On load only: the widest step whose timeline still fits the stage. A cut is
+// any length now, and a fixed opening zoom is right for exactly one of them.
+function fitZoom() {
+  const room = document.getElementById('stage').clientWidth - 24;
+  const need = Math.max(totalLen(), 4) + 2;
+  ZI = 0;
+  for (let i = 0; i < ZOOMS.length; i++) if (need * ZOOMS[i] <= room) ZI = i;
+  PX = ZOOMS[ZI];
+}
 document.getElementById('zin').onclick = () => zoom(1);
 document.getElementById('zout').onclick = () => zoom(-1);
 document.getElementById('play').onclick = () => {
@@ -900,6 +921,7 @@ async function boot() {
     document.getElementById('tip-res').innerHTML =
       DOC.resolution[0] + '&times;' + DOC.resolution[1];
     document.getElementById('tip-fps').textContent = DOC.fps;
+    fitZoom();
     drawBin(); draw(); scrubTo(0);
     if (Object.keys(OFFLINE).length)
       note(Object.keys(OFFLINE).length + ' clip(s) OFFLINE — the cut is intact, '

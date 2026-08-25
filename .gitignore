@@ -5,3 +5,4 @@ __pycache__/
 # will be: a project lives in ~/cutroom-projects/ and footage lives wherever
 # the director keeps it. This repository holds a program. That separation is
 # the whole point of the rewrite — read SPEC.md.
+.gstack/
