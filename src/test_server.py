@@ -8,6 +8,7 @@ directory and synthesises its own fixtures. NO TEST EVER ADDRESSES REAL
 FOOTAGE, and nothing here writes outside the directory it made.
 """
 import contextlib
+import errno
 import http.client
 import http.server
 import json
@@ -45,6 +46,39 @@ def project(name="t", clips=None, media=None, **kw):
             yield name, pathlib.Path(d)
         finally:
             server.ROOT = old
+
+
+@contextlib.contextmanager
+def passes_dir(root, tools=None):
+    """A --passes-dir with `tools` in it, installed on the module global.
+
+    The executable a pass runs comes from the SERVER'S STARTUP CONFIGURATION
+    and never from project data, so every pass test has to build one of these
+    instead of writing {"passes": {"name": "/abs/path"}} into the project — the
+    field that used to make `{"nuke": "/bin/rm"}` a runnable pass and is gone.
+
+    `tools` is {name: source}. The pass is then referred to BY NAME.
+    """
+    d = pathlib.Path(root) / "passes"
+    d.mkdir(parents=True, exist_ok=True)
+    for tool_name, source in (tools or {}).items():
+        (d / tool_name).write_text(source)
+    old, server.PASSES_DIR = server.PASSES_DIR, d.resolve()
+    try:
+        yield d.resolve()
+    finally:
+        server.PASSES_DIR = old
+
+
+# A pass: reads argv[1], writes argv[2]. Exactly the documented contract —
+# including that the destination ALREADY EXISTS as the empty file cutroom
+# claimed to reserve the name, so the tool overwrites it (-y, never -n).
+NEGATE = ("import subprocess, sys\n"
+          "subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', sys.argv[1],\n"
+          "                '-vf', 'negate', '-c:v', 'libx264', '-crf', '20',\n"
+          "                '-pix_fmt', 'yuv420p', sys.argv[2]], check=True)\n")
+
+COPY = "import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])\n"
 
 
 def synth(path, dur=1.0, size="160x120"):
@@ -404,18 +438,15 @@ def test_media_that_was_never_added_cannot_be_reached_by_any_route():
 
 
 def test_a_pass_cannot_address_media_that_is_not_in_the_project():
-    with project() as (name, root):
+    with project() as (name, root), passes_dir(root, {"copy.py": COPY}):
         src = synth(root / "src" / "x.mp4")
-        tool = root / "tool.py"
-        tool.write_text("import shutil,sys; shutil.copyfile(sys.argv[1], sys.argv[2])\n")
         # Written by hand, because a clip naming media the project does not have
         # cannot be SAVED — validate() refuses it. The pass has to refuse it too.
         doc = json.loads(server.project_path(name).read_text())
-        doc.update({"passes": {"copy": str(tool)},
-                    "media": [media_entry("m01", src)],
+        doc.update({"media": [media_entry("m01", src)],
                     "clips": [clip("c1", 0.0, "m99")]})
         server.project_path(name).write_text(json.dumps(doc))
-        status, payload = server.run_pass(name, "c1", "copy", [])
+        status, payload = server.run_pass(name, "c1", "copy.py", [])
         assert status == 404, (status, payload)
         assert "m99" in payload["problems"][0], payload
 
@@ -424,7 +455,7 @@ def test_a_pass_cannot_address_media_that_is_not_in_the_project():
         doc["media"] = []
         doc["clips"] = [clip("c1", 0.0, "m01")]
         server.project_path(name).write_text(json.dumps(doc))
-        status, payload = server.run_pass(name, "c1", "copy", [])
+        status, payload = server.run_pass(name, "c1", "copy.py", [])
         assert status == 404, (status, payload)
 
 
@@ -477,17 +508,15 @@ def test_a_symlinked_project_subdirectory_cannot_smuggle_a_write_out():
 
 
 def test_a_pass_through_a_symlinked_derived_directory_is_refused_not_followed():
-    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere:
+    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere, \
+            passes_dir(root, {"copy.py": COPY}):
         src = synth(root / "src" / "x.mp4")
         (root / name / "derived").symlink_to(elsewhere, target_is_directory=True)
-        tool = root / "tool.py"
-        tool.write_text("import shutil,sys; shutil.copyfile(sys.argv[1], sys.argv[2])\n")
         server.edit_project(name, lambda p: p.update(
-            {"passes": {"copy": str(tool)},
-             "media": [media_entry("m01", src)],
+            {"media": [media_entry("m01", src)],
              "clips": [clip("c1", 0.0, "m01")]}))
         try:
-            server.run_pass(name, "c1", "copy", [])
+            server.run_pass(name, "c1", "copy.py", [])
             assert False, "the pass wrote through the symlink"
         except server.Refused as e:
             assert "outside" in str(e), e
@@ -524,11 +553,20 @@ def test_an_existing_file_is_never_a_write_target():
 # ================================================= BOUNDARY 2: it deletes nothing
 
 def test_the_program_contains_no_way_to_delete_a_file():
-    """BOUNDARY 2, enforced by reading the program.
+    """BOUNDARY 2, enforced by reading the program — and stated at the width the
+    program can actually keep.
 
-    Every other boundary can be tested behaviourally; this one is best proved
-    by the absence of the call. A deletion cutroom cannot spell is a deletion
-    no future edit can reach by accident.
+    The old wording was "never deletes any file, anywhere, ever". It was false
+    as written: every save ends in tmp.replace(path), and a rename onto an
+    existing name destroys what was at the destination. The BEHAVIOUR is right
+    (it is the atomic-write pattern, and the state being replaced is
+    snapshotted first); the CLAIM was wrong, and a boundary written wider than
+    the code can hold is worse than no boundary, because it is the sentence
+    somebody trusts.
+
+    So: no deletion primitives at all, media and derived outputs are never
+    overwritten (O_EXCL on every create), and exactly one replace() — the
+    project file's own atomic swap.
     """
     for mod in ("server.py", "render.py"):
         src = (pathlib.Path(server.HERE) / mod).read_text()
@@ -538,34 +576,55 @@ def test_the_program_contains_no_way_to_delete_a_file():
         for forbidden in ("unlink(", "rmtree(", "os.remove(", "os.rmdir(",
                           "shutil.move(", "os.truncate(", "rename("):
             assert forbidden not in code, f"{mod} can spell {forbidden}"
-        # The only mode this program ever opens a file in is "rb" — plus "a+"
-        # on the advisory lock sidecar, which is opened and never written.
-        modes = sorted(set(re.findall(r"open\([^)]*?[\"']([rwax]b?\+?)[\"']", code)))
-        assert modes in ([], ["rb"], ["a+", "rb"]), (mod, modes)
-        assert '"-y"' not in code, f"{mod} passes ffmpeg -y and could overwrite"
+        # Sources are opened "rb" and in no other mode. The one writing mode is
+        # "w" through os.fdopen() of a descriptor that O_CREAT|O_EXCL just
+        # created — a path is never re-opened by name to be written, because
+        # re-opening by name is the check-then-use window all over again.
+        for call, mode in re.findall(r"(\w*open)\([^)]*?[\"']([rwax]b?\+?)[\"']", code):
+            assert (call, mode) == ("open", "rb"), (mod, call, mode)
+        # The one writing open, spelled out, because the regex above cannot see
+        # through a nested call and a rule nothing can violate is not a rule.
+        # A file is written by fdopen()ing the descriptor _open_new() just
+        # created — never by re-opening a path by name, which would be the
+        # check-then-use window all over again.
+        assert code.count("fdopen(") == (1 if mod == "server.py" else 0), mod
+        if mod == "server.py":
+            assert 'os.fdopen(_open_new(path), "w")' in code, \
+                "the only writing open is no longer on an _open_new descriptor"
+        # Every file this program creates is created with O_EXCL, which is what
+        # makes "never overwrites a derived output" true of ffmpeg's writes too:
+        # the destination is claimed first, so -y can only land on our own
+        # zero-byte claim.
+        assert "O_EXCL" in code, f"{mod} creates a file without claiming the name"
+        assert code.count('"-y"') <= 1, f"{mod} has an unaccounted-for ffmpeg -y"
     # exactly one replace() in the whole program: the project JSON swap, whose
     # prior state is snapshotted first.
     code = (pathlib.Path(server.HERE) / "server.py").read_text()
     assert code.count(".replace(") == 1, "a second in-place replace appeared"
     assert "tmp.replace(path)" in code
+    # and the claim is stated at that width everywhere a reader will meet it
+    for doc in (server.__doc__,
+                (pathlib.Path(server.HERE).parent / "SPEC.md").read_text(),
+                (pathlib.Path(server.HERE).parent / "README.md").read_text()):
+        flat = " ".join(doc.lower().split())
+        assert "delete anything, anywhere, ever" not in flat, \
+            "the un-keepable version of boundary 2 is back"
 
 
 def test_a_failed_pass_leaves_its_own_wreckage_and_deletes_nothing():
     """A tool that crashes halfway leaves a partial file in derived/ and
     touches nothing of the director's. Cleaning that up would mean deleting,
     and deleting is the one thing this program does not do."""
-    with project() as (name, root):
+    half = ("import sys\n"
+            "open(sys.argv[2], 'ab').write(b'HALF A FILE')\n"
+            "sys.exit(3)\n")
+    with project() as (name, root), passes_dir(root, {"half.py": half}):
         src = synth(root / "src" / "x.mp4")
         before = src.read_bytes()
-        tool = root / "half.py"
-        tool.write_text("import sys\n"
-                        "open(sys.argv[2], 'ab').write(b'HALF A FILE')\n"
-                        "sys.exit(3)\n")
         server.edit_project(name, lambda p: p.update(
-            {"passes": {"half": str(tool)},
-             "media": [media_entry("m01", src)],
+            {"media": [media_entry("m01", src)],
              "clips": [clip("c1", 0.0, "m01")]}))
-        status, payload = server.run_pass(name, "c1", "half", [])
+        status, payload = server.run_pass(name, "c1", "half.py", [])
         assert status == 500, (status, payload)
         partial = root / name / "derived" / "x__half.mp4"
         assert partial.read_bytes() == b"HALF A FILE", "the wreckage was cleaned up"
@@ -608,8 +667,9 @@ def test_nothing_is_indexed_and_nothing_is_scanned():
         code = (pathlib.Path(server.HERE) / "server.py").read_text()
         for forbidden in ("os.walk", "iterdir(", "scandir(", "rglob("):
             assert forbidden not in code, f"server.py can spell {forbidden}"
-        # the one glob is over cutroom's own snapshots, never over media
-        assert code.count(".glob(") == 2, "a new glob appeared — check what it walks"
+        # Three globs, none of them over media: this project's own snapshots,
+        # the project files in the root, and the operator's --passes-dir.
+        assert code.count(".glob(") == 3, "a new glob appeared — check what it walks"
 
 
 def test_add_media_takes_absolute_paths_and_nothing_else():
@@ -731,34 +791,20 @@ def test_a_malformed_request_is_a_400_not_a_dropped_connection():
 
 # ================================================ passes write derivatives only
 
-def _copy_tool(root):
-    """A pass: reads argv[1], writes argv[2]. Exactly the documented contract."""
-    tool = root / "tools" / "double.py"
-    tool.parent.mkdir(parents=True, exist_ok=True)
-    tool.write_text(
-        "import subprocess, sys\n"
-        "subprocess.run(['ffmpeg', '-v', 'error', '-n', '-i', sys.argv[1],\n"
-        "                '-vf', 'negate', '-c:v', 'libx264', '-crf', '20',\n"
-        "                '-pix_fmt', 'yuv420p', sys.argv[2]], check=True)\n")
-    return tool
-
-
 def test_a_pass_writes_a_derivative_and_leaves_the_source_untouched():
     """The rewrite in one test. A pass reads the source, writes a NEW file into
     derived/, adds it to media and re-points the clip. There is no backup to
     keep and no _raw to audit, because the original is never opened for writing
     by anyone."""
-    with project() as (name, root):
+    with project() as (name, root), passes_dir(root, {"negate.py": NEGATE}):
         src = synth(root / "src" / "x.mp4", dur=1.0)
         before, mtime = src.read_bytes(), src.stat().st_mtime_ns
         neighbours = sorted(p.name for p in src.parent.iterdir())
-        tool = _copy_tool(root)
         server.edit_project(name, lambda p: p.update(
-            {"passes": {"negate": str(tool)},
-             "media": [media_entry("m01", src)],
+            {"media": [media_entry("m01", src)],
              "clips": [clip("c1", 0.0, "m01")]}))
 
-        status, payload = server.run_pass(name, "c1", "negate", [])
+        status, payload = server.run_pass(name, "c1", "negate.py", [])
         assert status == 200, payload
 
         out = root / name / "derived" / "x__negate.mp4"
@@ -780,57 +826,60 @@ def test_a_pass_writes_a_derivative_and_leaves_the_source_untouched():
 
 
 def test_running_the_same_pass_twice_writes_a_second_file_not_over_the_first():
-    with project() as (name, root):
+    with project() as (name, root), passes_dir(root, {"negate.py": NEGATE}):
         src = synth(root / "src" / "x.mp4", dur=1.0)
-        tool = _copy_tool(root)
         server.edit_project(name, lambda p: p.update(
-            {"passes": {"negate": str(tool)},
-             "media": [media_entry("m01", src)],
+            {"media": [media_entry("m01", src)],
              "clips": [clip("c1", 0.0, "m01")]}))
-        first = server.run_pass(name, "c1", "negate", [])[1]["out"]
+        first = server.run_pass(name, "c1", "negate.py", [])[1]["out"]
         blob = pathlib.Path(first).read_bytes()
         # re-point back to the original and run it again
         server.edit_project(name, lambda p: p["clips"][0].update({"mid": "m01"}))
-        second = server.run_pass(name, "c1", "negate", [])[1]["out"]
+        second = server.run_pass(name, "c1", "negate.py", [])[1]["out"]
         assert first != second, first
         assert second.endswith("x__negate-2.mp4"), second
         assert pathlib.Path(first).read_bytes() == blob, "the first was overwritten"
 
 
-def test_an_unknown_pass_is_refused_and_the_allowlist_is_the_project_file():
-    with project() as (name, root):
+def test_an_unknown_pass_is_refused_and_the_allowlist_is_the_passes_directory():
+    with project() as (name, root), passes_dir(root, {"negate.py": NEGATE}) as pd:
         src = synth(root / "src" / "x.mp4")
         server.edit_project(name, lambda p: p.update(
             {"media": [media_entry("m01", src)], "clips": [clip("c1", 0.0, "m01")]}))
         status, payload = server.run_pass(name, "c1", "rm", ["-rf", "/"])
         assert status == 400, (status, payload)
-        assert "not one of this project's passes" in payload["problems"][0], payload
+        assert "is not a pass in" in payload["problems"][0], payload
+        # and the refusal names what IS available, from the directory
+        assert "negate.py" in payload["problems"][0], payload
+        assert server.pass_names() == ["negate.py"], server.pass_names()
         srv, port = start_server(name)
         try:
             wrong, _ = post(port, "/pass", {"uid": "c1", "pass": 3})
+            listed, raw, _ = request(port, "GET", "/project")
         finally:
             stop_server(srv)
         assert wrong == 400, wrong
+        # the page is offered the server's passes, never the project's
+        assert json.loads(raw)["passes"] == ["negate.py"], raw[:200]
+        assert str(pd) not in json.loads(raw)["project"].get("passes", ""), \
+            "a passes map is back in project data"
 
 
 def test_a_pass_runs_in_the_projects_own_work_directory():
     """A tool that scratches into a RELATIVE directory must litter inside the
     project, not wherever the server happened to be started."""
-    with project() as (name, root):
+    scratcher = ("import os, shutil, sys\n"
+                 "os.makedirs('_scratch', exist_ok=True)\n"
+                 "open('_scratch/marker.txt', 'x').write('here')\n"
+                 "shutil.copyfile(sys.argv[1], sys.argv[2])\n")
+    with project() as (name, root), passes_dir(root, {"scratch.py": scratcher}):
         src = synth(root / "src" / "x.mp4")
-        tool = root / "scratcher.py"
-        tool.write_text(
-            "import os, shutil, sys\n"
-            "os.makedirs('_scratch', exist_ok=True)\n"
-            "open('_scratch/marker.txt', 'x').write('here')\n"
-            "shutil.copyfile(sys.argv[1], sys.argv[2])\n")
         server.edit_project(name, lambda p: p.update(
-            {"passes": {"scratch": str(tool)},
-             "media": [media_entry("m01", src)],
+            {"media": [media_entry("m01", src)],
              "clips": [clip("c1", 0.0, "m01")]}))
         here = pathlib.Path.cwd() / "_scratch"
         assert not here.exists(), "fixture collision with the cwd"
-        status, _ = server.run_pass(name, "c1", "scratch", [])
+        status, _ = server.run_pass(name, "c1", "scratch.py", [])
         assert status == 200
         assert (root / name / "work" / "_scratch" / "marker.txt").is_file()
         assert not here.exists(), "the pass scratched next to the server"
@@ -1020,8 +1069,10 @@ def test_the_cli_makes_a_project_and_refuses_to_stand_on_one():
         try:
             server.main(["new", "film", "--fps", "24", "--res", "1080x1920"])
             doc = json.loads((pathlib.Path(d) / "film.json").read_text())
+            # no "passes" key: the executable a pass runs comes from
+            # --passes-dir at startup and never from project data
             assert doc == {"name": "film", "fps": 24, "resolution": [1080, 1920],
-                           "version": 1, "media": [], "clips": [], "passes": {}}, doc
+                           "version": 1, "media": [], "clips": []}, doc
             assert (pathlib.Path(d) / "film").is_dir()
             try:
                 server.create("film")
@@ -1033,9 +1084,493 @@ def test_the_cli_makes_a_project_and_refuses_to_stand_on_one():
             server.ROOT = old
 
 
+# ================================================ what the adversarial review found
+# One test per finding, each written against the broken version first and seen
+# to fail there. The order is the order of how much each one matters.
+
+def test_a_hostile_pass_name_cannot_execute():
+    """THE MOST IMPORTANT TEST IN THIS REPOSITORY.
+
+    A pass runs an executable. If a name can be steered at one cutroom did not
+    put there, then the tool whose entire reason for existing is that it cannot
+    destroy footage runs `/bin/rm <the director's footage>`. That was a real
+    reachable state: `passes` was a {name: absolute path} map in project data,
+    and a PUT could write `{"nuke": "/bin/rm"}`.
+
+    Five spellings of the escape, and a canary that would be gone if any of
+    them ran anything.
+    """
+    with project() as (name, root), tempfile.TemporaryDirectory() as outside:
+        src = synth(root / "src" / "x.mp4")
+        canary = pathlib.Path(outside) / "IRREPLACEABLE.mp4"
+        canary.write_bytes(b"226 CLIPS")
+        server.edit_project(name, lambda p: p.update(
+            {"media": [media_entry("m01", src)], "clips": [clip("c1", 0.0, "m01")]}))
+
+        # a project file that still spells the old field, by hand. It is data,
+        # and data never names an executable again.
+        doc = json.loads(server.project_path(name).read_text())
+        doc["passes"] = {"nuke": "/bin/rm", "rm": "/bin/rm"}
+        server.project_path(name).write_text(json.dumps(doc))
+
+        # 1..4: with a passes directory configured, every way of pointing out of it
+        with passes_dir(root, {"negate.py": NEGATE}) as pd:
+            (pd / "sneaky").symlink_to("/bin/rm")       # a link, not a copy
+            hostile = ["/bin/rm", "../../bin/rm", "../rm", "rm", "nuke",
+                       "sneaky", "./negate.py", "..", ".hidden",
+                       "negate.py/../../../../bin/rm", "", "sub/negate.py"]
+            for spelling in hostile:
+                status, payload = server.run_pass(
+                    name, "c1", spelling, ["-rf", str(canary)])
+                assert status == 400, (spelling, status, payload)
+                assert canary.read_bytes() == b"226 CLIPS", f"{spelling} RAN"
+                assert src.is_file(), f"{spelling} reached the source"
+            # the symlink is not even offered as a pass
+            assert server.pass_names() == ["negate.py"], server.pass_names()
+            # and the one real pass in the directory does run, so this test is
+            # measuring the gate and not a dead code path
+            assert server.run_pass(name, "c1", "negate.py", [])[0] == 200
+
+        # 5: a bare, legitimate-looking name with NO --passes-dir at all
+        assert server.PASSES_DIR is None
+        status, payload = server.run_pass(name, "c1", "negate.py", [])
+        assert status == 501, (status, payload)
+        assert "--passes-dir" in payload["problems"][0], payload
+
+        # and the same through the HTTP door, which is where a PUT would arrive
+        with passes_dir(root, {"negate.py": NEGATE}):
+            srv, port = start_server(name)
+            try:
+                got = [post(port, "/pass", {"uid": "c1", "pass": s,
+                                            "args": ["-rf", str(canary)]})[0]
+                       for s in hostile]
+            finally:
+                stop_server(srv)
+        assert all(s == 400 for s in got), list(zip(hostile, got))
+        assert canary.read_bytes() == b"226 CLIPS", "a hostile pass ran over HTTP"
+        assert sorted(p.name for p in pathlib.Path(outside).iterdir()) \
+            == ["IRREPLACEABLE.mp4"]
+
+
+def test_a_put_cannot_add_media_and_the_forged_path_stays_unservable():
+    """`media` is the allowlist servable() consults. A PUT that could append to
+    it is a gate on a list the caller writes — put `/etc/passwd` on it and then
+    GET it. So a PUT may not touch `media` AT ALL, and the proof is not that
+    the write is rejected but that the forged path is still 404 afterwards."""
+    with project() as (name, root):
+        src = synth(root / "src" / "x.mp4")
+        server.add_media(name, [str(src)])
+        secret = root / "src" / "not-added.mp4"
+        synth(secret)
+        before = json.loads(server.project_path(name).read_text())
+
+        srv, port = start_server(name)
+        try:
+            status, raw, _ = request(port, "PUT", "/project", {
+                "version": before["version"],
+                "clips": [],
+                "media": before["media"] + [
+                    {"mid": "leak", "path": "/etc/passwd", "label": "x"},
+                    {"mid": "m99", "path": str(secret), "label": "y"}],
+                "passes": {"nuke": "/bin/rm"}})
+            after = json.loads(raw)
+            leaked = [request(port, "GET", r)[0]
+                      for r in ("/media/leak", "/media/m99", "/thumb/leak")]
+            still, ok_raw, _ = request(port, "GET", "/media/m01")
+        finally:
+            stop_server(srv)
+
+        assert status == 200, after          # the CUT saved; the allowlist did not
+        assert after["media"] == before["media"], after["media"]
+        assert "passes" not in after, after
+        stored = json.loads(server.project_path(name).read_text())
+        assert stored["media"] == before["media"], stored["media"]
+        assert "passes" not in stored, stored
+        assert leaked == [404, 404, 404], leaked
+        assert still == 200 and len(ok_raw) == src.stat().st_size
+        # and the gate itself agrees, on the stored document
+        assert server.servable(stored, "/etc/passwd") is None
+        assert server.servable(stored, str(secret)) is None
+
+
+def test_a_symlinked_renders_directory_cannot_serve_a_file_from_outside():
+    """P1-3, the read-side twin of the write rule.
+
+    `is_symlink()` asks about the LAST component only, and `is_file()` follows
+    a symlinked parent without comment. Replace <project>/renders with a
+    symlink and request a file through it: the final path is not itself a
+    symlink, so a leaf-only check passes it and the file is served. The whole
+    chain has to be resolved, or the check is decoration.
+    """
+    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere:
+        elsewhere = pathlib.Path(elsewhere)
+        (elsewhere / "passwd").write_bytes(b"root:x:0:0:")
+        (elsewhere / "deep").mkdir()
+        (elsewhere / "deep" / "inner.mp4").write_bytes(b"NOT YOURS")
+        (root / name / "renders").symlink_to(elsewhere, target_is_directory=True)
+
+        srv, port = start_server(name)
+        try:
+            got = [request(port, "GET", r)[0]
+                   for r in ("/renders/passwd", "/renders/deep")]
+        finally:
+            stop_server(srv)
+        assert got == [404, 404], got
+
+    # and the legitimate case still works: a real file in a real renders/
+    with project() as (name, root):
+        real = server.mkdirs(root / name / "renders") / "out.mp4"
+        real.write_bytes(b"A RENDER")
+        # a symlink INSIDE renders pointing out is refused too — same rule,
+        # applied to the last component rather than the parent
+        (real.parent / "outward.mp4").symlink_to("/etc/passwd")
+        srv, port = start_server(name)
+        try:
+            ok, body, _ = request(port, "GET", "/renders/out.mp4")
+            out = request(port, "GET", "/renders/outward.mp4")[0]
+        finally:
+            stop_server(srv)
+        assert (ok, body) == (200, b"A RENDER"), (ok, body)
+        assert out == 404, out
+
+
+def test_writable_is_re_verified_at_the_moment_of_the_write():
+    """P1-4. writable() returns a path and the open happens later — so what it
+    checked and what gets written are two different questions unless the check
+    is repeated with the write. Here the checked directory is swapped for an
+    outward symlink in between, which is the accident's own shape."""
+    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere:
+        elsewhere = pathlib.Path(elsewhere)
+        (elsewhere / "precious.mp4").write_bytes(b"IRREPLACEABLE")
+        derived = server.mkdirs(root / name / "derived")
+        target = server.writable(derived / "precious.mp4")   # checked: inside
+
+        # the swap: derived is now a symlink pointing out of the root
+        (derived / "placeholder").mkdir()
+        os.rename(derived, root / name / "derived-was")
+        (root / name / "derived").symlink_to(elsewhere, target_is_directory=True)
+
+        for write in (lambda: server.write_new(target, "x"),
+                      lambda: server.claim(target)):
+            try:
+                write()
+                assert False, "the write followed the swapped directory out"
+            except server.Refused as e:
+                assert "outside" in str(e), e
+        assert (elsewhere / "precious.mp4").read_bytes() == b"IRREPLACEABLE"
+        assert sorted(p.name for p in elsewhere.iterdir()) == ["precious.mp4"]
+
+    # And the second belt, for the window the check cannot cover. writable() is
+    # stubbed out here to stand in for a race it loses — the point is that
+    # _open_new() does not rely on it alone: a symlink sitting at the
+    # destination name is refused by the OPEN, with O_EXCL answering first and
+    # O_NOFOLLOW behind it, and nothing is written through the link either way.
+    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere:
+        bait = pathlib.Path(elsewhere) / "precious.mp4"
+        bait.write_bytes(b"IRREPLACEABLE")
+        link = server.mkdirs(root / name / "derived") / "x.mp4"
+        link.symlink_to(bait)
+        real_writable, server.writable = server.writable, lambda p, **kw: p
+        try:
+            for write in (lambda: server.write_new(link, "OVERWRITTEN"),
+                          lambda: server.claim(link)):
+                try:
+                    write()
+                    assert False, "the open followed a symlink at the destination"
+                except OSError as e:
+                    assert e.errno in (errno.EEXIST, errno.ELOOP), e
+        finally:
+            server.writable = real_writable
+        assert bait.read_bytes() == b"IRREPLACEABLE"
+        assert link.is_symlink(), "the link itself was replaced"
+
+
+def test_a_pass_that_finishes_after_the_clip_moved_does_not_take_it_back():
+    """P1-5. A pass reads the clip, runs ffmpeg for minutes, then re-points the
+    clip — and in between the director saved a different source onto it. The
+    old code re-pointed anyway and said 200: a finishing pass silently eating
+    an edit made while it ran. The derivative is still written and still added
+    to media; what it may not do is decide the conflict by itself."""
+    slow = ("import shutil, sys, time\n"
+            "time.sleep(1.0)\n"
+            "shutil.copyfile(sys.argv[1], sys.argv[2])\n")
+    with project() as (name, root), passes_dir(root, {"slow.py": slow}):
+        a = synth(root / "src" / "a.mp4")
+        b = synth(root / "src" / "b.mp4")
+        server.add_media(name, [str(a), str(b)])
+        server.edit_project(name, lambda p: p["clips"].append(clip("c1", 0.0, "m01")))
+
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(
+                zip(("status", "payload"), server.run_pass(name, "c1", "slow.py", []))))
+        t.start()
+        time.sleep(0.4)                       # the pass is running
+        status, _ = server.edit_project(      # the director re-points the clip
+            name, lambda p: p["clips"][0].update({"mid": "m02"}))
+        assert status == 200
+        t.join(timeout=60)
+
+        assert result["status"] == 409, result
+        payload = result["payload"]
+        assert payload["was"] == "m01" and payload["now"] == "m02", payload
+        assert "m01" in payload["problems"][0] and "m02" in payload["problems"][0], \
+            payload["problems"]
+
+        doc = json.loads(server.project_path(name).read_text())
+        assert doc["clips"][0]["mid"] == "m02", "the pass overwrote the edit"
+        # the work is not thrown away: it is on the list, addressable, on disk
+        assert doc["media"][-1]["path"] == payload["out"], doc["media"]
+        assert doc["media"][-1]["mid"] == payload["media"]["mid"]
+        assert pathlib.Path(payload["out"]).is_file()
+        assert server.servable(doc, payload["out"]) is not None
+
+    # the same shape when the clip is deleted rather than re-pointed
+    with project() as (name, root), passes_dir(root, {"slow.py": slow}):
+        a = synth(root / "src" / "a.mp4")
+        server.add_media(name, [str(a)])
+        server.edit_project(name, lambda p: p["clips"].append(clip("c1", 0.0, "m01")))
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(
+                zip(("status", "payload"), server.run_pass(name, "c1", "slow.py", []))))
+        t.start()
+        time.sleep(0.4)
+        server.edit_project(name, lambda p: p["clips"].clear())
+        t.join(timeout=60)
+        assert result["status"] == 409, result
+        assert result["payload"]["now"] is None, result["payload"]
+        assert "removed" in result["payload"]["problems"][0], result["payload"]
+
+    # and the page treats that 409 as "done, not re-pointed" rather than as a
+    # failure — the derivative exists, and a page that discarded the response
+    # would hide a file the director now owns
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("const r = await fetch('/pass'")
+    region = html[a:a + 1400]
+    assert "r.status === 409" in region and "adopt(b.project)" in region, \
+        "the page still calls a pass conflict a failure and drops the project"
+
+
+def test_two_processes_cannot_claim_the_same_derivative_name():
+    """P1-6. The job lock is a threading.Lock: it serialises one server's
+    threads and knows nothing about a second server on another port. Both ask
+    for the next free name, both are told the same one, and the second ffmpeg
+    truncates the first's output. Looking is not taking."""
+    with project() as (name, root):
+        derived = server.mkdirs(root / name / "derived")
+
+        # the bug, in two lines: asking twice gives the same answer
+        assert server.free_name(derived, "x__desat", ".mp4") \
+            == server.free_name(derived, "x__desat", ".mp4")
+
+        # claiming twice cannot
+        first = server.claim_free(derived, "x__desat", ".mp4")
+        second = server.claim_free(derived, "x__desat", ".mp4")
+        assert first != second, first
+        assert (first.name, second.name) == ("x__desat.mp4", "x__desat-2.mp4")
+
+        # and across real processes, racing on purpose
+        script = root / "racer.py"
+        script.write_text(
+            "import pathlib, sys, time\n"
+            f"sys.path.insert(0, {str(server.HERE)!r})\n"
+            "import server\n"
+            f"server.ROOT = pathlib.Path({str(root)!r})\n"
+            "time.sleep(float(sys.argv[1]) - time.time())\n"
+            f"print(server.claim_free(pathlib.Path({str(derived)!r}), 'race', '.mp4'))\n")
+        at = time.time() + 2.0
+        procs = [subprocess.Popen([sys.executable, str(script), str(at)],
+                                  stdout=subprocess.PIPE, text=True) for _ in range(4)]
+        names = sorted(p.communicate()[0].strip() for p in procs)
+        assert all(n for n in names), names
+        assert len(set(names)) == 4, names
+        assert all(pathlib.Path(n).is_file() for n in names), names
+
+
+def test_a_range_that_names_nothing_is_malformed_not_the_whole_file():
+    """P2-8. `Range: bytes=` and `bytes=-` were parsed into start=0, end=EOF and
+    answered 206 with the entire file — a partial-content response to a request
+    that named no range. RFC 7233 calls that malformed."""
+    with project() as (name, root):
+        src = synth(root / "src" / "x.mp4")
+        server.add_media(name, [str(src)])
+        size = src.stat().st_size
+        srv, port = start_server(name)
+        try:
+            got = {}
+            for spelling in ("bytes=", "bytes=-", "bytes= - ", "bytes=-0",
+                             "bytes=,", "bytes=0", "bytes=--5"):
+                status, body, h = request(port, "GET", "/media/m01",
+                                          headers={"Range": spelling})
+                got[spelling] = (status, len(body), h.get("Content-Range"))
+            # the real ones still work
+            ok = request(port, "GET", "/media/m01",
+                         headers={"Range": "bytes=0-9"})[0]
+            tail = request(port, "GET", "/media/m01",
+                           headers={"Range": "bytes=-5"})[0]
+        finally:
+            stop_server(srv)
+        for spelling, (status, length, cr) in got.items():
+            assert status == 416, (spelling, status, length)
+            assert cr == f"bytes */{size}", (spelling, cr)
+            assert length < size, (spelling, length)
+        assert (ok, tail) == (206, 206), (ok, tail)
+
+
+def test_a_malformed_project_body_is_a_400_not_a_crash():
+    """P2-9. `{"clips": [{}]}` reached render.py, which indexed c["t"] and
+    raised KeyError — an exception the handler had no branch for, so a
+    malformed request became a dropped connection or a 500. "Is this a project
+    at all" has to be asked before any rule that reads a field."""
+    with project() as (name, root):
+        was = server.project_path(name).read_bytes()
+        srv, port = start_server(name)
+        try:
+            bodies = [
+                {"version": 3, "clips": [{}]},
+                {"version": 3, "clips": [{"uid": "c1"}]},
+                {"version": 3, "clips": "not a list"},
+                {"version": 3, "clips": [7]},
+                {"version": 3, "clips": [], "fps": "twenty four"},
+                {"version": 3, "clips": [], "resolution": [720]},
+                {"version": 3, "clips": [dict(clip("c1", 0.0, "m01"), t="0")]},
+                {"version": 3, "clips": [dict(clip("c1", 0.0, "m01"), out=None)]},
+                {"version": 3, "clips": [dict(clip("c1", 0.0, "m01"), mid=7)]},
+            ]
+            got = []
+            for body in bodies:
+                status, raw, _ = request(port, "PUT", "/project", body)
+                got.append((status, json.loads(raw or b"{}")))
+            alive, _ = post(port, "/history/nope")
+        finally:
+            stop_server(srv)
+        for (status, payload), body in zip(got, bodies):
+            assert status == 400, (body, status, payload)
+            assert payload["problems"], (body, payload)
+        assert alive == 404, "the server stopped answering"
+        assert server.project_path(name).read_bytes() == was, "a bad body was written"
+
+        # the agent's door is the same door
+        status, payload = server.edit_project(name, lambda p: {**p, "clips": [{}]})
+        assert status == 400, (status, payload)
+
+
+def test_the_renderer_cli_cannot_write_outside_the_projects_root():
+    """The renderer is a program too. `-o` used to be handed straight to
+    ffmpeg with no guard at all, which is a second way to name an output — and
+    boundary 1 is the claim that there is no second way."""
+    with project() as (name, root), tempfile.TemporaryDirectory() as elsewhere:
+        src = synth(root / "src" / "x.mp4", dur=1.0)
+        server.add_media(name, [str(src)])
+        server.edit_project(name, lambda p: p.update(
+            {"resolution": [160, 120], "clips": [clip("c1", 0.0, "m01", out=0.5)]}))
+        elsewhere = pathlib.Path(elsewhere)
+        (elsewhere / "master.mp4").write_bytes(b"IRREPLACEABLE")
+
+        runner = root / "cli.py"
+        runner.write_text(
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(server.HERE)!r})\n"
+            "import server, render\n"
+            f"server.ROOT = pathlib.Path({str(root)!r})\n"
+            "sys.argv = ['render.py'] + sys.argv[1:]\n"
+            "render.main()\n")
+
+        def run(*args):
+            return subprocess.run([sys.executable, str(runner),
+                                   str(server.project_path(name)), *args],
+                                  capture_output=True, text=True, timeout=600)
+
+        for out in (str(elsewhere / "new.mp4"),          # outside the root
+                    str(elsewhere / "master.mp4"),       # outside, and existing
+                    str(root / ".." / "escape.mp4"),
+                    "relative.mp4"):
+            r = run("-o", out)
+            assert r.returncode != 0, (out, r.stdout)
+            assert "outside" in r.stderr or "is not an absolute path" in r.stderr, \
+                (out, r.stderr)
+        assert (elsewhere / "master.mp4").read_bytes() == b"IRREPLACEABLE"
+        assert sorted(p.name for p in elsewhere.iterdir()) == ["master.mp4"]
+        assert not (pathlib.Path.cwd() / "relative.mp4").exists()
+
+        # inside the root it renders, and refuses to stand on its own output
+        good = root / name / "renders" / "cli.mp4"
+        r = run("-o", str(good))
+        assert r.returncode == 0, r.stderr
+        assert good.is_file() and good.stat().st_size > 0
+        blob = good.read_bytes()
+        r = run("-o", str(good))
+        assert r.returncode != 0 and "already exists" in r.stderr, r.stderr
+        assert good.read_bytes() == blob, "the second render overwrote the first"
+
+        # and with no -o at all it picks a free name in the project's renders/
+        r = run()
+        assert r.returncode == 0, r.stderr
+        assert (root / name / "renders" / f"{name}_cli.mp4").is_file(), r.stdout
+
+
+def test_what_an_external_pass_script_actually_receives():
+    """The pass contract, from the tool's side, because the tool is the part
+    cutroom does not control and the part that can do damage.
+
+    argv is [script, src, dst, *args] and nothing else; the cwd is the
+    project's own work/ directory; dst exists already and is empty, because
+    cutroom claimed the name before the tool was launched; src is the
+    director's file, unchanged, and the tool is never given a way to name
+    anything else.
+    """
+    reporter = ("import json, os, sys\n"
+                "open('report.json', 'w').write(json.dumps({\n"
+                "    'argv': sys.argv,\n"
+                "    'cwd': os.getcwd(),\n"
+                "    'dst_existed': os.path.exists(sys.argv[2]),\n"
+                "    'dst_size': os.path.getsize(sys.argv[2]),\n"
+                "    'src_bytes': os.path.getsize(sys.argv[1]),\n"
+                "}))\n"
+                "open(sys.argv[2], 'wb').write(open(sys.argv[1], 'rb').read())\n")
+    with project() as (name, root), passes_dir(root, {"report.py": reporter}) as pd:
+        src = synth(root / "src" / "x.mp4")
+        before, mtime = src.read_bytes(), src.stat().st_mtime_ns
+        server.add_media(name, [str(src)])
+        server.edit_project(name, lambda p: p["clips"].append(clip("c1", 0.0, "m01")))
+
+        status, payload = server.run_pass(name, "c1", "report.py", ["--strength", "0.5"])
+        assert status == 200, payload
+
+        work = root / name / "work"
+        report = json.loads((work / "report.json").read_text())
+        dst = root / name / "derived" / "x__report.mp4"
+        assert report["argv"] == [str(pd / "report.py"), str(src), str(dst),
+                                  "--strength", "0.5"], report["argv"]
+        assert pathlib.Path(report["cwd"]).resolve() == work.resolve(), report["cwd"]
+        assert report["dst_existed"] is True, "the name was not claimed first"
+        assert report["dst_size"] == 0, "the claim was not empty"
+        assert report["src_bytes"] == len(before)
+        assert src.read_bytes() == before and src.stat().st_mtime_ns == mtime
+        assert dst.read_bytes() == before, "the tool's output is not what landed"
+
+        # no shell anywhere: an argument that would be a redirect in one is an
+        # argument here, and the file it names is never created
+        status, payload = server.run_pass(
+            name, "c1", "report.py", [">", str(root / "shelled.txt"), "&&", "rm"])
+        assert status in (200, 409), payload
+        assert not (root / "shelled.txt").exists(), "the args went through a shell"
+        report = json.loads((work / "report.json").read_text())
+        assert report["argv"][3:] == [">", str(root / "shelled.txt"), "&&", "rm"]
+        code = (pathlib.Path(server.HERE) / "server.py").read_text()
+        assert "shell=True" not in code, "server.py can spell shell=True"
+
+
 if __name__ == "__main__":
+    # An optional substring argument runs one test. Used to demonstrate a fix
+    # FAILING FIRST against a patched copy of the module it fixes.
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    ran = 0
     for name_, fn in sorted(globals().items()):
-        if name_.startswith("test_"):
+        if name_.startswith("test_") and only in name_:
             fn()
+            ran += 1
             print("ok", name_)
+    assert ran, f"no test matched {only!r}"
     print("all ok")

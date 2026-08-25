@@ -756,15 +756,18 @@ function inspect(c) {
         <p>It runs on the whole source, never on the trim — a pass that ramps
            across a clip's duration would compress its whole escalation into a
            trimmed segment and every cut would restart it.</p>
-        <p>Passes come from <kbd>"passes"</kbd> in the project file. cutroom
-           ships none.</p>
+        <p>Passes come from the <kbd>--passes-dir</kbd> the server was
+           started with, never from the project file — a document a browser can
+           write must not be able to name an executable. cutroom ships none.</p>
+        <p>The destination is created empty before your script runs, so the
+           name is claimed; your pass overwrites it.</p>
       </span></span></h4>
     ${PASSES.length
       ? `<select id="tool">${PASSES.map(t=>`<option>${esc(t)}</option>`).join('')}</select>
          <input class="args" id="targs" placeholder="extra arguments">
          <button class="run" id="runpass">Run pass</button>`
-      : `<p class="empty">No passes configured. Add an absolute script path to
-         <kbd>"passes"</kbd> in the project file.</p>`}
+      : `<p class="empty">No passes configured. Restart the server with
+         <kbd>--passes-dir &lt;dir&gt;</kbd> to enable post passes.</p>`}
     <div id="problems"></div>`;
   scrubTo(c.t + 0.01);
   for (const [f,k] of [['in','in'],['out','out'],['t','t'],['rate','rate'],
@@ -781,6 +784,16 @@ function inspect(c) {
                             args: document.getElementById('targs').value.split(/\s+/)
                                     .filter(Boolean)})});
     const b = await r.json();
+    // 409 is NOT a failure: the pass finished, the derivative is written and
+    // is on the media list, and the only thing that did not happen is the
+    // re-point — because the clip moved while the pass was running. Adopting
+    // the project is what puts the new media in front of the director; calling
+    // it "failed" and dropping it would hide a file that exists.
+    if (r.status === 409 && b.project) {
+      adopt(b.project);
+      document.getElementById('problems').textContent = (b.problems||[]).join('\n');
+      return note('pass done, clip NOT re-pointed', 'var(--warn)');
+    }
     if (!r.ok) { document.getElementById('problems').textContent =
                    (b.problems||[]).join('\n');
                  return note('pass failed', 'var(--danger)'); }

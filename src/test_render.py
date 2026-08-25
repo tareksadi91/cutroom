@@ -693,8 +693,14 @@ def test_the_renderer_refuses_to_overwrite_an_existing_output():
 
 
 if __name__ == "__main__":
+    # An optional substring argument runs one test. Used to demonstrate a fix
+    # FAILING FIRST against a patched copy of the module it fixes.
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    ran = 0
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_"):
+        if name.startswith("test_") and only in name:
             fn()
+            ran += 1
             print("ok", name)
+    assert ran, f"no test matched {only!r}"
     print("all ok")

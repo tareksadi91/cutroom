@@ -28,14 +28,23 @@ THE FOUR BOUNDARIES, and where each one lives:
 
   1. Never write outside ~/cutroom-projects/  — every write goes through
      writable(), which realpath()s the target and refuses anything that does
-     not land inside the root. There is no other way to name an output.
-  2. Never delete any file, anywhere, including its own derived output — there
-     is no unlink, no rmtree, no shutil.move in this program, and ffmpeg is
-     always invoked with -n so it may create a file but never replace one.
-     test_server.py greps this file to keep it that way.
+     not land inside the root, and then through _open_new(), which re-runs that
+     check and opens the final component O_CREAT|O_EXCL|O_NOFOLLOW. There is no
+     other way to name an output.
+  2. Never delete or overwrite media or a derived output — there is no unlink,
+     no rmtree, no shutil.move in this program, and every file cutroom creates
+     is created with O_EXCL, so a name already in use is refused rather than
+     replaced. The one file cutroom does replace is its OWN project JSON, by an
+     atomic rename onto a name it owns, after the state being replaced has been
+     written into .snapshots/. That is the atomic-write pattern, and it is
+     stated here rather than hidden behind a "never deletes anything" that the
+     rename makes untrue. test_server.py greps this file to keep it that way.
   3. Never follow a symlink out of the project directory — writable() compares
      the REALPATH, so a `derived` symlinked at /tmp resolves outside the root
-     and is refused before anything is opened.
+     and is refused before anything is opened. On the READ side, the same rule:
+     a served render is resolved WHOLE and must land inside the project
+     directory, because checking only the last component follows a symlinked
+     parent straight out (a `renders` -> /etc symlink served /etc/passwd).
   4. Never accept a media path that is not already in `media` — servable() is
      the only gate, and it is an exact-string membership test against the
      project's own list. Not a prefix check, not a resolve-and-compare.
@@ -122,6 +131,13 @@ def writable(path, existing_ok=False):
     creates files, it does not replace them. The single exception is the
     project JSON itself (see _commit), whose previous state is snapshotted
     before the swap, so nothing is lost even there.
+
+    ⚠️ THIS IS A CHECK, NOT AN ENFORCEMENT. It returns a path, and whatever
+    opens that path does so LATER — which is a check-then-use window: swap a
+    checked directory for a symlink pointing outward in between and the write
+    follows it. Nothing that calls writable() may treat its answer as a
+    permission that survives; the enforcement is _open_new() below, which
+    re-runs this check and then opens the file in the same breath.
     """
     path = pathlib.Path(path)
     if not path.is_absolute():
@@ -139,6 +155,62 @@ def writable(path, existing_ok=False):
     return path
 
 
+def _open_new(path):
+    """Create `path` and return an open fd, or raise. THE only way a file is
+    created here.
+
+    writable() is re-run immediately before the open rather than trusted from
+    whenever the caller happened to compute the name, and the open itself
+    carries the two flags that make the last step atomic:
+
+      O_EXCL     — the name must be free. Two processes racing for the same
+                   derived name cannot both win, so one pass can never truncate
+                   another's output (a process-local threading.Lock does not
+                   span two servers; this does).
+      O_NOFOLLOW — the final component must not be a symlink. A `x.mp4`
+                   symlinked at the director's master between the check and the
+                   open fails with ELOOP instead of writing through it.
+
+    ⚠️ RESIDUAL, stated rather than papered over: O_NOFOLLOW covers the LAST
+    component only. An attacker who can swap a PARENT directory for a symlink
+    in the microseconds between realpath() and open() still wins — closing that
+    needs an openat() walk of every component, which the stdlib does not
+    expose. Inside a single-user ~/cutroom-projects that race needs an attacker
+    who already has the account; it is named here because a boundary you can
+    only mostly enforce must not be written down as one you can.
+    """
+    writable(path)                      # re-verified NOW, not earlier
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+
+
+def claim(path):
+    """Create `path` as an empty file and return it — the name is now taken.
+
+    This is how a destination is reserved BEFORE a subprocess is launched at
+    it. ffmpeg and an external pass do their own opening, which cutroom cannot
+    put O_NOFOLLOW on; what it can do is own the name first, atomically, so the
+    only thing either of them can ever write over is cutroom's own empty claim.
+
+    ⚠️ RESIDUAL: between this create and the subprocess's open, the file could
+    be replaced by a symlink; the subprocess would follow it. Same window as
+    _open_new's, and the same reason it cannot be closed from here — the write
+    is in another program. It is bounded by O_EXCL having proved the name was
+    free at claim time, and it is stated here because "ffmpeg cannot escape"
+    would be a claim this code cannot enforce.
+    """
+    os.close(_open_new(path))
+    return pathlib.Path(path)
+
+
+def write_new(path, text):
+    """Write `text` to a file that did not exist a moment ago, through the fd
+    _open_new() returns — so nothing between the check and the write can
+    redirect it."""
+    with os.fdopen(_open_new(path), "w") as fh:
+        fh.write(text)
+    return pathlib.Path(path)
+
+
 def mkdirs(path):
     """mkdir -p, but only ever inside the root."""
     writable(path, existing_ok=True)
@@ -152,6 +224,9 @@ def free_name(directory, stem, suffix):
 
     This is what replaces "overwrite the old one". A pass run twice makes two
     files and the director throws away whichever they like, by hand.
+
+    LOOKING is all this does. Use claim_free() to actually take one: between
+    this lexists() and a create, another process can take the same name.
     """
     directory = pathlib.Path(directory)
     candidate = directory / f"{stem}{suffix}"
@@ -160,6 +235,33 @@ def free_name(directory, stem, suffix):
         n += 1
         candidate = directory / f"{stem}-{n}{suffix}"
     return candidate
+
+
+def claim_free(directory, stem, suffix, limit=10000):
+    """The first free name in `directory`, CREATED, so it is now this process's.
+
+    free_name() + create is check-then-use across processes: the job lock is a
+    threading.Lock, which serialises one server's threads and knows nothing
+    about a second server on another port. Two of them ask for the next free
+    name at the same instant, both are told `x__desat.mp4`, and the second
+    ffmpeg truncates the first's output. So the loser of the race finds the
+    name taken by O_EXCL and moves to the next one instead.
+    """
+    directory = pathlib.Path(directory)
+    # Fail fast on a directory that is not ours — otherwise "outside the root"
+    # would be retried ten thousand times as if it were a name collision.
+    writable(directory, existing_ok=True)
+    for n in range(1, limit + 1):
+        candidate = directory / (f"{stem}{suffix}" if n == 1 else f"{stem}-{n}{suffix}")
+        try:
+            return claim(candidate)
+        except Refused:
+            if not os.path.lexists(candidate):
+                raise           # not a collision — a boundary said no
+            continue            # the name is taken — try the next one
+        except FileExistsError:
+            continue            # lost the race to another process — same answer
+    raise Refused(f"no free name for {stem}{suffix} in {directory} after {limit} tries")
 
 
 # ---------------------------------------------------------------- boundary 4
@@ -187,6 +289,29 @@ def servable(project, path):
         if m.get("path") == path:
             return pathlib.Path(path)
     return None
+
+
+def _inside_project(name, path):
+    """The resolved `path` if it is a real file inside <name>/, else None.
+
+    THE READ-SIDE SYMLINK RULE, and it is a whole-chain rule because the
+    alternative was a hole: checking `path.is_symlink()` asks only about the
+    LAST component, and `is_file()` happily follows a symlinked parent. Replace
+    <project>/renders with a symlink to /etc and request /renders/passwd — the
+    final path is not itself a symlink, so the leaf check passes, and the file
+    is served. Resolving the WHOLE path and requiring the result to stay inside
+    the project directory is the only version of this check that has no last
+    link to be fooled by.
+
+    Media is deliberately NOT routed through here: media lives wherever the
+    director's footage lives, and its gate is servable(), an exact-string
+    membership test. This is for the files cutroom made itself.
+    """
+    base = os.path.realpath(project_dir(name))
+    real = os.path.realpath(path)
+    if real != base and not real.startswith(base + os.sep):
+        return None
+    return pathlib.Path(real) if os.path.isfile(real) else None
 
 
 def open_source(path):
@@ -244,15 +369,17 @@ def _flock(name):
     """
     lock_path = mkdirs(project_dir(name)) / ".lock"
     writable(lock_path, existing_ok=True)
-    fh = open(lock_path, "a+")
+    # O_NOFOLLOW: the sidecar is cutroom's own file and must not be a symlink
+    # pointing at something of the director's. It is never written, only locked.
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        fh.close()
+        os.close(fd)
 
 
 def snapshot_dir(name):
@@ -264,9 +391,7 @@ def _stamp():
 
 
 def _snapshot(name, text, stamp=None):
-    path = writable(snapshot_dir(name) / f"{stamp or _stamp()}.json")
-    path.write_text(text)
-    return path
+    return write_new(snapshot_dir(name) / f"{stamp or _stamp()}.json", text)
 
 
 def _commit(name, merged, seen):
@@ -283,7 +408,11 @@ def _commit(name, merged, seen):
 
     The project JSON is the one file cutroom replaces, and the replacement is a
     rename onto a name it owns. The state being replaced is written to
-    .snapshots/ FIRST, so even that swap loses nothing.
+    .snapshots/ FIRST, so even that swap loses nothing. The rename does destroy
+    the previous DESTINATION inode — that is what replace() is — which is why
+    the guarantee is written everywhere as "never deletes or overwrites media
+    or a derived output, and updates its own project file atomically via
+    replace-after-snapshot" rather than as a "never deletes anything".
     """
     path = project_path(name)
     text = json.dumps(merged, indent=2)
@@ -292,8 +421,8 @@ def _commit(name, merged, seen):
     # the whole cut and it is rewritten on every drag; a truncated write is the
     # one way to lose it. The tmp name carries a per-write random suffix so
     # concurrent writers never share a path even without the locks.
-    tmp = writable(path.with_name(f"{name}.json.tmp.{stamp}.{uuid.uuid4().hex[:8]}"))
-    tmp.write_text(text)
+    tmp = write_new(
+        path.with_name(f"{name}.json.tmp.{stamp}.{uuid.uuid4().hex[:8]}"), text)
     if path.read_bytes() != seen:
         # Refused. The tmp file stays where it is — cutroom does not delete —
         # and it is inside the root, named for the moment it was written.
@@ -315,6 +444,15 @@ def _guarded_write(name, body):
     Only /render looks at the disk.
     """
     current, seen = body["current"], body["seen"]
+    # SHAPE FIRST, and this ordering is the whole fix for a 500 that should
+    # have been a 400: snap_project() and validate() both index fields
+    # directly, so a body like {"clips": [{}]} raised KeyError out of render.py
+    # before any rule ran, and the handler only knew how to answer Refused.
+    # "Is this a project at all" is a different question from "is this a
+    # renderable cut", and it has to be asked first.
+    malformed = render_mod.shape_problems(body["edited"])
+    if malformed:
+        return 400, {"problems": malformed}
     edited = render_mod.snap_project(body["edited"])
     problems = render_mod.validate(edited, check_files=False)
     if problems:
@@ -330,6 +468,27 @@ def _guarded_write(name, body):
 # entirely, which is the correct default: a tool that can run an executable is
 # a tool that can delete a file, so it stays off until the operator opts in.
 PASSES_DIR = None
+
+
+def pass_names():
+    """The passes this server will run: the file names in --passes-dir.
+
+    Listing a directory of scripts the operator pointed at is not the indexing
+    rule being broken — that rule is about MEDIA, which enters only by hand.
+    This walks no tree, follows nothing, and returns names, not paths.
+    """
+    if PASSES_DIR is None:
+        return []
+    base = pathlib.Path(PASSES_DIR).resolve()
+    if not base.is_dir():
+        return []
+    # A symlink inside the directory pointing at /bin/rm is not a pass, and it
+    # is not offered as one either — the listing applies the same containment
+    # rule run_pass() does, so the page can never show a name that would be
+    # refused when clicked.
+    return sorted(p.name for p in base.glob("*")
+                  if not p.name.startswith(".")
+                  and p.is_file() and base in p.resolve().parents)
 
 
 def write_project(name, body):
@@ -528,8 +687,10 @@ def pick_media(name):
 def thumb(name, project, mid):
     """One poster frame per media item, 160px wide, made once and never again.
 
-    Reads the source, writes into the project's own thumbs/ directory, and uses
-    ffmpeg -n so it can create the jpg but can never replace one.
+    Reads the source, writes into the project's own thumbs/ directory, and the
+    jpg is CLAIMED with O_EXCL before ffmpeg is started — so an existing
+    thumbnail is handed back rather than re-made, and ffmpeg only ever writes
+    into a name this process proved was free a moment ago.
     """
     entry = render_mod.media_index(project).get(mid)
     if entry is None:
@@ -538,11 +699,19 @@ def thumb(name, project, mid):
     if src is None or not src.is_file():
         return None
     out = mkdirs(project_dir(name) / "thumbs") / f"{mid}.jpg"
-    if out.is_file():
-        return out
-    writable(out)
+    try:
+        claim(out)
+    except (Refused, FileExistsError):
+        # Already there (or taken by another server in this instant). Made
+        # once and never again — that is the point, not a fallback. An EMPTY
+        # file is the claim of a run that failed; it is reported as "no
+        # thumbnail" rather than served as a broken image, and it is left
+        # where it is because cutroom does not delete.
+        return out if out.is_file() and out.stat().st_size > 0 else None
     proc = subprocess.run(
-        ["ffmpeg", "-v", "error", "-n", "-ss", "0.2", "-i", str(src),
+        # -y overwrites the empty file claim() just created and nothing else:
+        # the name was free, exclusively, one syscall ago.
+        ["ffmpeg", "-v", "error", "-y", "-ss", "0.2", "-i", str(src),
          "-frames:v", "1", "-vf", "scale=160:-2", str(out)],
         capture_output=True, text=True)
     return out if out.is_file() and proc.returncode == 0 else None
@@ -570,6 +739,21 @@ def run_pass(name, uid, pass_name, args):
     directory. A name carrying a separator, a `..`, or a leading dot is refused
     before it touches the filesystem, and the resolved path must still sit
     inside the directory. With no --passes-dir there are no passes at all.
+
+    THE DESTINATION IS CLAIMED BEFORE THE TOOL RUNS. claim_free() creates it
+    with O_CREAT|O_EXCL, so the name is this process's before a subprocess
+    exists — two servers cannot both be told the same free name and have the
+    second truncate the first's output. The tool therefore receives a path that
+    already exists as an empty file and MUST overwrite it (an ffmpeg-based pass
+    needs -y, not -n); what it can never do is land on a name something else
+    was using, because O_EXCL proved it was free.
+
+    AND THE CLIP MAY HAVE MOVED. A pass is a subprocess that runs for minutes
+    while the director keeps cutting. The mid is captured before the tool
+    starts and re-checked under the lock at the end: if the clip now names
+    different media, the derivative is still written and still added to
+    `media`, and the answer is a 409 naming both — never a silent re-point on
+    top of an edit made in the meantime.
     """
     if PASSES_DIR is None:
         return 501, {"problems": [
@@ -578,30 +762,38 @@ def run_pass(name, uid, pass_name, args):
     if (not pass_name or "/" in pass_name or "\\" in pass_name
             or pass_name.startswith(".") or ".." in pass_name):
         return 400, {"problems": [f"{pass_name!r} is not a plain pass name"]}
-    script = (PASSES_DIR / pass_name).resolve()
+    # Resolve the DIRECTORY too, and at use time: a PASSES_DIR that still spells
+    # a symlink (/tmp -> /private/tmp) would make every containment check below
+    # compare a resolved child against an unresolved parent and refuse
+    # everything — or, worse, be "fixed" by dropping the resolve.
+    base = pathlib.Path(PASSES_DIR).resolve()
+    script = (base / pass_name).resolve()
     # resolve() first, THEN confirm containment: a symlink inside the passes
     # directory pointing at /bin/rm must not become a runnable pass.
-    if PASSES_DIR not in script.parents or not script.is_file():
-        available = sorted(p.name for p in PASSES_DIR.glob("*")
-                           if p.is_file()) if PASSES_DIR.is_dir() else []
+    if base not in script.parents or not script.is_file():
         return 400, {"problems": [
-            f"{pass_name!r} is not a pass in {PASSES_DIR} "
-            f"({', '.join(available) or 'none found'})"]}
+            f"{pass_name!r} is not a pass in {base} "
+            f"({', '.join(pass_names()) or 'none found'})"]}
     project = json.loads(project_path(name).read_text())
 
     clip = next((c for c in project["clips"] if c["uid"] == uid), None)
     if clip is None:
         return 404, {"problems": [f"no clip {uid}"]}
-    entry = render_mod.media_index(project).get(clip.get("mid"))
+    started_mid = clip.get("mid")
+    entry = render_mod.media_index(project).get(started_mid)
     if entry is None:
-        return 404, {"problems": [f"{uid} names media {clip.get('mid')!r}, which is not "
+        return 404, {"problems": [f"{uid} names media {started_mid!r}, which is not "
                                   f"in this project"]}
     src = servable(project, entry["path"])
     if src is None or not src.is_file():
         return 404, {"problems": [f"{entry['path']} is not readable — the clip is OFFLINE"]}
 
     derived = mkdirs(project_dir(name) / "derived")
-    dst = writable(free_name(derived, f"{src.stem}__{pass_name}", ".mp4"))
+    # `desat.py` names the derivative `x__desat.mp4`, not `x__desat.py.mp4`.
+    # Safe to take the stem: pass_name has already been refused if it holds a
+    # separator, so this can only ever drop an extension.
+    tag = pathlib.PurePosixPath(pass_name).stem or pass_name
+    dst = claim_free(derived, f"{src.stem}__{tag}", ".mp4")
     # cwd matters, and not for tidiness: a tool that scratches into a RELATIVE
     # directory (and several do, and one of them deletes every png in it first)
     # must litter inside the project, not wherever the server was started.
@@ -619,22 +811,45 @@ def run_pass(name, uid, pass_name, args):
         return 500, {"problems": [proc.stderr.strip() or f"{pass_name} failed"],
                      "partial": str(dst) if os.path.lexists(dst) else None}
 
-    added = []
+    added, conflict = [], []
 
     def mutate(p):
         media = p.setdefault("media", [])
         entry2 = {"mid": _next_mid(p), "path": str(dst),
-                  "label": f"{entry.get('label', src.stem)} · {pass_name}",
+                  "label": f"{entry.get('label', src.stem)} · {tag}",
                   **probe(dst)}
         media.append(entry2)
         added.append(entry2)
+        # The derivative goes on the allowlist either way. What is conditional
+        # is the RE-POINT: only if the clip still names the media this pass was
+        # started against. Anything else and the director changed the clip
+        # while ffmpeg was running, and re-pointing would delete that edit
+        # without saying so — which is exactly how a finishing pass quietly
+        # eats a save.
         for c in p["clips"]:
             if c["uid"] == uid:
-                c["mid"] = entry2["mid"]
+                if c.get("mid") == started_mid:
+                    c["mid"] = entry2["mid"]
+                else:
+                    conflict.append(c.get("mid"))
+                break
+        else:
+            conflict.append(None)      # the clip itself is gone
 
     status, payload = edit_project(name, mutate)
     if status != 200:
         return status, payload
+    if conflict:
+        now = conflict[0]
+        gone = ("was removed while the pass ran" if now is None
+                else f"now names {now!r}, not {started_mid!r}")
+        return 409, {"problems": [
+            f"{uid} {gone}, so {pass_name} did NOT re-point it. The derivative "
+            f"is written and is on the media list as {added[0]['mid']} "
+            f"({dst}) — point the clip at it yourself if that is what you "
+            f"want, or ignore it."],
+            "media": added[0], "out": str(dst), "was": started_mid,
+            "now": now, "project": payload}
     return 200, {"ok": True, "stdout": proc.stdout.strip(),
                  "media": added[0], "out": str(dst), "project": payload}
 
@@ -647,9 +862,13 @@ def export_path(name, project):
     to the exact cut that made it, and that cut is still in .snapshots/, so any
     render can be reproduced rather than remembered. A second export of the
     same version lands beside the first as -2 rather than on top of it.
+
+    The name is CLAIMED, not merely chosen: it comes back as a zero-byte file
+    this process owns, so two servers exporting at the same instant get two
+    files instead of one truncated one.
     """
     out = mkdirs(project_dir(name) / "renders")
-    return writable(free_name(out, f"{name}_v{project['version']:03d}", ".mp4"))
+    return claim_free(out, f"{name}_v{project['version']:03d}", ".mp4")
 
 
 def export(name, t_from=None, t_to=None):
@@ -659,9 +878,19 @@ def export(name, t_from=None, t_to=None):
         return 422, {"problems": [f"{uid}: {why} — put the file back or re-point "
                                   f"the clip, then export again"
                                   for uid, why in missing]}
+    # Refuse an unrenderable cut BEFORE claiming a name. render() checks these
+    # again — it is a library and its other callers are not this one — but
+    # claiming first would leave a zero-byte file in renders/ every time
+    # somebody hit export on a cut that was never going to render, and cutroom
+    # cannot tidy that up afterwards.
+    problems = render_mod.validate(project)
+    if problems:
+        return 422, {"problems": problems}
+    if not project["clips"]:
+        return 422, {"problems": ["the timeline has no clips."]}
     out = export_path(name, project)
     try:
-        render_mod.render(project, out, t_from, t_to)
+        render_mod.render(project, out, t_from, t_to, claimed=True)
     except subprocess.CalledProcessError as e:
         return 500, {"problems": [(e.stderr or "")[-2000:]]}
     except ValueError as e:
@@ -717,7 +946,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         partial = rng.startswith("bytes=")
         if partial:
             try:
-                a, _, b = rng[6:].partition("-")
+                spec = rng[6:].strip()
+                a, sep, b = spec.partition("-")
+                a, b = a.strip(), b.strip()
+                # "bytes=" and "bytes=-" name no range at all. Answering them
+                # with a 206 of the whole file is a lie about what was sent:
+                # the client asked for nothing, and RFC 7233 calls a byte-range
+                # set with no first-pos AND no suffix-length malformed. 416.
+                if not sep or (a == "" and b == ""):
+                    raise ValueError(f"malformed range {rng!r}")
                 if a == "" and b != "":
                     # Suffix range (RFC 7233 §2.1): "bytes=-500" means the
                     # last 500 bytes, not "no start so start at 0".
@@ -771,7 +1008,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "project": project,
                     "offline": [{"uid": u, "why": w}
                                 for u, w in render_mod.offline(project)],
-                    "passes": sorted((project.get("passes") or {}).keys())})
+                    # From --passes-dir, NEVER from the project document. The
+                    # page shows what this server can actually run.
+                    "passes": pass_names()})
             if route == "/history":
                 return self._send(200, {"snapshots": history(name)})
             if route.startswith("/media/"):
@@ -788,6 +1027,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if route.startswith("/thumb/"):
                 project = self._project()
                 out = thumb(name, project, route[len("/thumb/"):])
+                out = _inside_project(name, out) if out is not None else None
                 if out is None:
                     return self._send(404, {"problems": ["no thumbnail"]})
                 return self._file(out)
@@ -795,8 +1035,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 leaf = route[len("/renders/"):]
                 if not re.fullmatch(r"[A-Za-z0-9._-]+", leaf):
                     return self._send(404, {"problems": [f"no {route}"]})
-                path = project_dir(name) / "renders" / leaf
-                if not path.is_file() or path.is_symlink():
+                path = _inside_project(name, project_dir(name) / "renders" / leaf)
+                if path is None:
                     return self._send(404, {"problems": [f"no {route}"]})
                 return self._file(path)
         except Refused as e:
@@ -904,10 +1144,10 @@ def create(name, fps=24, resolution=(720, 1280)):
     existing one — that is the no-overwrite rule, not politeness."""
     check_name(name)
     mkdirs(root())
-    path = writable(project_path(name))
+    writable(project_path(name))          # the friendly refusal, with a reason
     mkdirs(project_dir(name))
     doc = dict(BLANK, name=name, fps=fps, resolution=list(resolution))
-    path.write_text(json.dumps(doc, indent=2))
+    write_new(project_path(name), json.dumps(doc, indent=2))
     return doc
 
 

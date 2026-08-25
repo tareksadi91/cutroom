@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Render a project to a film. The project JSON is the single source of truth.
 
-    ./render.py ~/cutroom-projects/threshold.json -o out.mp4
-    ./render.py ~/cutroom-projects/threshold.json -o part.mp4 --from 12 --to 30
+    ./render.py ~/cutroom-projects/threshold.json
+    ./render.py ~/cutroom-projects/threshold.json --from 12 --to 30 \\
+        -o ~/cutroom-projects/threshold/renders/part.mp4
+
+-o is not a free hand: like every other write in cutroom it goes through
+server.writable(), so it must land inside ~/cutroom-projects/ and on a name
+nothing is using. Left off, the render goes to the project's own renders/.
 
 Lanes are organizational. Overlap means crossfade, same lane or not, and the
 renderer flattens every clip into one time-ordered chain.
@@ -16,6 +21,7 @@ opens a source read-only. Its only output is the file it was asked to write.
 import argparse
 import json
 import math
+import os
 import pathlib
 import subprocess
 import sys
@@ -251,6 +257,61 @@ def offline(project):
         elif not pathlib.Path(entry["path"]).is_file():
             out.append((c["uid"], f"missing {entry['path']}"))
     return out
+
+
+def shape_problems(project):
+    """Is this a project AT ALL — the question that comes before validate().
+
+    validate() answers "is this cut renderable", and every one of its rules
+    indexes a field: c["out"], c["rate"], project["fps"]. Handed a document
+    that is merely malformed — `{"clips": [{}]}` from a hand-written PUT — it
+    raised KeyError from inside the validator, which reached the HTTP layer as
+    a 500 for what is plainly a 400. Types and presence are checked here first,
+    so nothing downstream ever indexes a field that might not be there.
+
+    Deliberately shallow: it says nothing about whether the cut makes sense.
+    That is validate()'s job and it is a different job.
+    """
+    if not isinstance(project, dict):
+        return [f"a project must be a JSON object, got {type(project).__name__}"]
+
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    problems = []
+    fps = project.get("fps")
+    if not num(fps) or fps <= 0:
+        problems.append(f"fps must be a positive number, got {fps!r}")
+    res = project.get("resolution")
+    if not (isinstance(res, list) and len(res) == 2
+            and all(num(v) and v > 0 for v in res)):
+        problems.append(f"resolution must be [width, height], got {res!r}")
+
+    media = project.get("media", [])
+    if not isinstance(media, list):
+        problems.append(f"media must be a list, got {media!r}")
+    else:
+        for i, m in enumerate(media):
+            if not (isinstance(m, dict) and isinstance(m.get("mid"), str)
+                    and isinstance(m.get("path"), str)):
+                problems.append(
+                    f"media[{i}] must be an object with a string mid and path, got {m!r}")
+
+    clips = project.get("clips")
+    if not isinstance(clips, list):
+        return problems + [f"clips must be a list, got {clips!r}"]
+    for i, c in enumerate(clips):
+        if not isinstance(c, dict):
+            problems.append(f"clips[{i}] must be an object, got {c!r}")
+            continue
+        where = f"clips[{i}]" if not isinstance(c.get("uid"), str) else c["uid"]
+        for field in ("uid", "mid"):
+            if not isinstance(c.get(field), str):
+                problems.append(f"{where}: {field} must be a string, got {c.get(field)!r}")
+        for field in ("t", "in", "out", "rate"):
+            if not num(c.get(field)):
+                problems.append(f"{where}: {field} must be a number, got {c.get(field)!r}")
+    return problems
 
 
 def validate(project, check_files=True):
@@ -489,7 +550,48 @@ def timeline_length(project):
     return max(c["t"] + duration(c, fps) for c in project["clips"])
 
 
-def render(project, out_path, t_from=None, t_to=None):
+def claim_output(out_path):
+    """Create `out_path`, exclusively, and hand it back. The name is now ours.
+
+    O_EXCL rather than "check, then let ffmpeg use -n", for two reasons that
+    both bit:
+
+      - ffmpeg 8.1.1 answers -n on an existing file with "File already exists.
+        Exiting." and an EXIT CODE OF ZERO (measured). It protects the file and
+        reports success, so -n alone is a guarantee whose failure is invisible.
+      - a check followed by a subprocess is check-then-use: between deciding
+        the name is free and ffmpeg opening it, something else can take it.
+        O_EXCL makes taking the name and proving it was free the same syscall.
+
+    O_NOFOLLOW too, so the name cannot be a symlink at something else. ffmpeg
+    then overwrites the empty file we just made and nothing else — which is why
+    the encoder is invoked with -y here and it is still true that cutroom never
+    replaces a file it did not create one syscall earlier.
+
+    ⚠️ RESIDUAL: ffmpeg does its own open, so the window between this create
+    and that open cannot be closed from here. See server.claim().
+    """
+    out_path = pathlib.Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(out_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
+        raise FileExistsError(
+            f"{out_path} already exists — cutroom never overwrites a file; "
+            f"render to a name nothing is using")
+    os.close(fd)
+    return out_path
+
+
+def render(project, out_path, t_from=None, t_to=None, claimed=False):
+    """Render `project` into `out_path`.
+
+    `claimed` says the caller already created out_path with O_CREAT|O_EXCL
+    (server.export_path does, so that the name is reserved across processes
+    before this is called). Left False, this function claims it itself, which
+    is what makes the CLI and the tests obey the same no-overwrite rule.
+    """
     out_path = pathlib.Path(out_path)
     # Every door into the graph canonicalises, not just load(): render() is
     # called directly by the server, by the tests and by main().
@@ -517,22 +619,21 @@ def render(project, out_path, t_from=None, t_to=None):
         trim += ["-to", str(t_to)]
 
     # An output name that is already taken is refused HERE, before ffmpeg is
-    # started. -n below is the second belt and not the first, because ffmpeg
-    # 8.1.1 answers -n with "File already exists. Exiting." and an exit code of
-    # ZERO: it protects the file but reports success, so a caller that trusted
-    # the exit code would think it had rendered.
-    if out_path.exists():
-        raise FileExistsError(
-            f"{out_path} already exists — cutroom never overwrites a file; "
-            f"render to a name nothing is using")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # started, by taking the name atomically rather than by asking whether it
+    # is free. See claim_output() for why -n is not the mechanism.
+    if not claimed:
+        claim_output(out_path)
     # capture, don't stream: the server hands this stderr to the page, and an
     # exit code alone is useless when a filter graph is what went wrong.
     proc = subprocess.run(
-        ["ffmpeg", "-v", "error", "-n", *inputs,
+        # -y overwrites the zero-byte file claimed above — the only file this
+        # program's ffmpeg is ever pointed at, and one it created itself.
+        ["ffmpeg", "-v", "error", "-y", *inputs,
          "-filter_complex", graph, "-map", f"[{label}]", *trim, *ENCODE, str(out_path)],
         check=True, capture_output=True, text=True)
-    if not out_path.is_file():
+    # Size, not existence: the destination was created empty before ffmpeg ran,
+    # so "the file is there" no longer proves anything was written into it.
+    if not out_path.is_file() or out_path.stat().st_size == 0:
         raise RuntimeError(
             f"ffmpeg wrote nothing to {out_path}: {(proc.stderr or '').strip()[-2000:]}")
     return out_path
@@ -558,7 +659,9 @@ def frame_count(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("project", nargs="?")
-    ap.add_argument("-o", "--out", default="out.mp4")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output mp4, inside ~/cutroom-projects/ (default: the "
+                         "project's own renders/ directory)")
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
     ap.add_argument("--check", action="store_true")
@@ -572,8 +675,31 @@ def main():
     if not a.project:
         ap.error("need a project file, or --check")
 
+    # THE CLI IS A WRITE PATH TOO. -o used to be handed straight to ffmpeg, so
+    # `render.py p.json -o ~/footage/master.mp4` walked around every boundary
+    # the server enforces — a second way to name an output, which is precisely
+    # what boundary 1 says does not exist. The guard lives in server.py; it is
+    # imported HERE rather than at module scope because server imports this
+    # module, and a top-level import back would be a cycle.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import server as boundary
+
     try:
-        out = render(load(pathlib.Path(a.project)), a.out, a.t_from, a.t_to)
+        if a.out is None:
+            name = pathlib.Path(a.project).stem
+            out_dir = boundary.mkdirs(boundary.project_dir(name) / "renders")
+            out = boundary.claim_free(out_dir, f"{name}_cli", ".mp4")
+        else:
+            asked = pathlib.Path(a.out).expanduser().absolute()
+            # mkdirs() is guarded too, so an outward -o is refused here rather
+            # than creating a directory on the way to being refused.
+            boundary.mkdirs(asked.parent)
+            out = boundary.claim(asked)
+    except (boundary.Refused, FileExistsError) as e:
+        sys.exit(str(e))
+
+    try:
+        out = render(load(pathlib.Path(a.project)), out, a.t_from, a.t_to, claimed=True)
     except ValueError as e:
         sys.exit(str(e))
     print(f"{out}  {bitrate(out) / 1e6:.2f} Mbps")

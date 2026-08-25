@@ -16,8 +16,8 @@ film — went with them. They were gitignored, so git had no copy, and the
 recovery came from a cloud sync that was simultaneously trying to re-propagate
 the deletion. A timeline tool has no business being able to do that, so this
 one lives in its own repository with no shared history with any film, keeps its
-projects in `~/cutroom-projects/`, never scans a directory, and cannot spell a
-deletion.
+projects in `~/cutroom-projects/`, never scans a directory, and contains no
+deletion primitive at all — no `unlink`, no `rmtree`, no `shutil.move`.
 
 ## Start it
 
@@ -30,7 +30,8 @@ deletion.
 Other commands: `./cutroom export <project>`, `./cutroom ls`,
 `./cutroom check` (both test suites).
 
-`new` takes `--fps` and `--res 720x1280`. `serve` takes `--port`.
+`new` takes `--fps` and `--res 720x1280`. `serve` takes `--port` and
+`--passes-dir` (see **Post passes** — without it, passes are off).
 
 ## Add media
 
@@ -66,10 +67,13 @@ A project is **one JSON file** at `~/cutroom-projects/<name>.json`.
   "media": [{"mid": "m01", "path": "/…/b01_11_street.mp4",
              "label": "1.1 street", "dur": 8.042, "w": 720, "h": 1280}],
   "clips": [{"uid": "c00", "mid": "m01", "lane": 0, "t": 0.0,
-             "in": 0.0, "out": 1.5, "rate": 1.0, "label": "1.1", "note": ""}],
-  "passes": {"desat": "/abs/path/to/desat.py"}
+             "in": 0.0, "out": 1.5, "rate": 1.0, "label": "1.1", "note": ""}]
 }
 ```
+
+There is **no `passes` key**, and a `PUT` cannot add one — nor add to `media`.
+Anything that names an executable comes from the command line that started the
+server, never from a document a client can write.
 
 - **Clips reference media by `mid`, never by path.** Re-pointing a shot is a
   one-field edit and the timeline survives a file being moved.
@@ -100,30 +104,52 @@ Everything else cutroom owns lives beside the project file:
 
 ## Post passes
 
-A pass is an external script named in the project's `"passes"` map and invoked
-as `script src dst [args]`. It reads `src` and writes `dst` —
+```sh
+./cutroom serve threshold --passes-dir ~/film/studio/tools
+```
+
+A pass is an external script **in the directory given at startup**, invoked as
+`script src dst [args]`. The project names a pass by name only; the name is
+resolved inside that directory and must still land inside it, so a separator, a
+`..`, a leading dot, an absolute path or a symlink pointing at `/bin/rm` are
+all refused. **Without `--passes-dir` there are no passes at all** — the safe
+default, because anything that can run an executable can delete a file.
+
+It reads `src` and writes `dst` —
 `~/cutroom-projects/<name>/derived/<stem>__<pass>.mp4` — which cutroom then
-adds to `media` and points the clip at. Your original is opened read-only and
-is not touched, moved or renamed, so there are no `_raw` backups to keep, no
-rule about never overwriting one, and no checksum ledger to prove one is
-complete. A pass that crashes halfway leaves a partial file in `derived/` and
-nothing of yours is different. cutroom ships no passes.
+adds to `media` and points the clip at. `dst` already exists when your script
+starts: cutroom creates it empty with `O_CREAT|O_EXCL` to claim the name before
+launching anything, so **your pass must overwrite it** (`ffmpeg -y`, not `-n`).
+
+Your original is opened read-only and is not touched, moved or renamed, so
+there are no `_raw` backups to keep, no rule about never overwriting one, and
+no checksum ledger to prove one is complete. A pass that crashes halfway leaves
+a partial file in `derived/` and nothing of yours is different. If you
+re-pointed the clip while the pass was running, the derivative is still written
+and still added to `media`, and you get a conflict naming both rather than a
+silent re-point over your edit. cutroom ships no passes.
 
 ## What it will never do
 
 - **Scan, index, or watch any directory.** It has no `os.walk`, no `rglob`, no
-  `scandir`. The only `glob` in the program lists its own snapshots.
+  `scandir`. The three `glob`s in the program list its own snapshots, its own
+  project files, and the `--passes-dir` you pointed it at. None of them can
+  reach media: media enters only when you hand over a path.
 - **Write to a path outside `~/cutroom-projects/`.** Every write goes through
   one guard that resolves the target and refuses anything that lands elsewhere.
-- **Delete anything, anywhere, ever — including its own derived files.** There
-  is no `unlink`, no `rmtree`, no `shutil.move`, no `rename` in the program,
-  and ffmpeg is always invoked with `-n`. Running the same pass twice writes a
-  second file rather than replacing the first. Deleting a clip removes the clip
-  from the timeline and nothing from the disk.
+- **Delete or overwrite media or a derived output.** There is no `unlink`, no
+  `rmtree`, no `shutil.move`, no `rename` in the program, and every file it
+  creates is created with `O_CREAT|O_EXCL` — a name already in use is refused,
+  not replaced, and ffmpeg is only ever pointed at a zero-byte file cutroom
+  claimed one syscall earlier. Running the same pass twice writes a second file
+  rather than replacing the first. Deleting a clip removes the clip from the
+  timeline and nothing from the disk.
 - **Follow a symlink out of the project directory.** The write guard compares
   realpaths, so a `derived` symlinked somewhere else resolves outside the root
-  and is refused before anything is opened. This is the exact shape of the
-  accident that destroyed the footage.
+  and is refused before anything is opened; a served render is resolved the
+  same way, whole, because checking only the last component follows a symlinked
+  parent straight out. This is the exact shape of the accident that destroyed
+  the footage.
 - **Accept a media path that is not already in `media`.** The gate is an
   exact-string membership test against the project's own list — not a prefix
   check, not resolve-and-compare. A path that merely resembles an allowed one
@@ -131,7 +157,11 @@ nothing of yours is different. cutroom ships no passes.
 
 The one file cutroom ever replaces is the project JSON itself, by an atomic
 rename onto a name it owns, and only after writing the state being replaced
-into `.snapshots/`.
+into `.snapshots/`. That rename does destroy what was at the destination — it
+is the atomic-write pattern, and it is why the guarantee above is written as
+*never deletes or overwrites media or derived outputs, and updates its own
+project file atomically via replace-after-snapshot* rather than as a “deletes
+nothing, ever” that the rename would make untrue.
 
 ## Tests
 

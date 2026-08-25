@@ -65,8 +65,21 @@ backup is complete, no checksum ledger to prove one is. The guarantee is structu
 A pass that crashes halfway leaves a partial file in `derived/` and touches nothing
 of yours.
 
-Passes are external scripts named in config, invoked as `script src dst [args]`.
-cutroom ships none. Point it at the film's `studio/tools/` and it uses those.
+Passes are external scripts, invoked as `script src dst [args]`. **The
+executable comes from `--passes-dir`, given to the server at startup, and never
+from project data** — the project names a *pass*, the name is resolved inside
+that directory, and a name carrying a separator, a `..` or a leading dot is
+refused. With no `--passes-dir` there are no passes at all. cutroom ships none.
+Point it at the film's `studio/tools/` and it uses those.
+
+`dst` already exists when the tool starts: cutroom creates it with
+`O_CREAT|O_EXCL` to claim the name atomically before launching anything, so two
+servers can never be handed the same free name. A pass therefore **overwrites**
+its destination (an ffmpeg pass needs `-y`, not `-n`) — the one file it may.
+
+A pass that finishes after the clip has been re-pointed by hand does **not**
+silently take the clip back: the derivative is written and added to `media`,
+and the answer is a conflict naming both.
 
 ## What it does
 
@@ -89,9 +102,21 @@ program monitor. Export an mp4.
 
 - Scan, index, or watch any directory.
 - Write to a path outside `~/cutroom-projects/`.
-- Delete anything, anywhere, ever — including its own derived files.
-- Follow a symlink out of its project directory.
+- **Delete or overwrite media or a derived output.** Every file cutroom creates
+  is created with `O_CREAT|O_EXCL`, so a name already in use is refused rather
+  than replaced, and there is no `unlink`, `rmtree` or `shutil.move` in the
+  program at all. Running the same pass twice writes a second file.
+- Follow a symlink out of its project directory — on the write side *or* the
+  read side, and by resolving the whole path rather than only its last
+  component.
 - Accept a media path that is not already in the project's `media` list.
+
+It **does** update one file in place: its own project JSON, by writing a temp
+file and renaming it over the old one, after the state being replaced has gone
+into `.snapshots/`. That rename destroys the previous destination inode — which
+is what makes “deletes nothing, ever” the wrong sentence and this the right
+one: *cutroom never deletes or overwrites media or derived outputs, and updates
+its own project file atomically via replace-after-snapshot.*
 
 ## Layout
 
