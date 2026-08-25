@@ -186,11 +186,15 @@ def test_a_drag_is_snapped_to_the_grid_on_save():
     save BEFORE validating, so the browser cannot write an off-grid value."""
     with project() as (name, root):
         src = synth(root / "src" / "x.mp4", dur=2.0)
+        # media is seeded through the fixture, never through the PUT body: a
+        # save may not touch the allowlist servable() consults.
+        server.project_path(name).write_text(json.dumps(dict(
+            json.loads(server.project_path(name).read_text()),
+            media=[media_entry("m01", src, dur=2.0)], version=3), indent=2))
         dragged = clip("c000", 0.3007, "m01", **{"in": 0.01})
         dragged["out"] = 0.4208333333
         status, payload = server.write_project(
-            name, {"version": 3, "media": [media_entry("m01", src, dur=2.0)],
-                   "clips": [dragged]})
+            name, {"version": 3, "clips": [dragged]})
         assert status == 200, payload
 
         saved = json.loads(server.project_path(name).read_text())["clips"][0]

@@ -326,6 +326,12 @@ def _guarded_write(name, body):
     return 200, landed
 
 
+# Set once at startup from --passes-dir. None means post passes are disabled
+# entirely, which is the correct default: a tool that can run an executable is
+# a tool that can delete a file, so it stays off until the operator opts in.
+PASSES_DIR = None
+
+
 def write_project(name, body):
     """Version-guarded write. Returns (http status, payload).
 
@@ -354,7 +360,16 @@ def write_project(name, body):
             return 409, current
 
         merged = dict(current)
-        merged.update({k: v for k, v in body.items() if k != "version"})
+        # ⚠️ `media` is the allowlist servable() consults, and a PUT may not
+        # touch it. It used to be mergeable, which meant a client could append
+        # {"mid": "leak", "path": "/etc/passwd"} and then GET it: a perfect
+        # gate on a list the caller could edit. Media enters ONLY through the
+        # deliberate add path, where it is validated. Same for `passes`, which
+        # no longer exists in project data at all.
+        merged.update({k: v for k, v in body.items()
+                       if k not in ("version", "media", "passes")})
+        merged["media"] = current.get("media", [])
+        merged.pop("passes", None)
         return _guarded_write(name, {"current": current, "seen": seen, "edited": merged})
 
 
@@ -544,20 +559,35 @@ def run_pass(name, uid, pass_name, args):
     is never opened for writing by anybody. A tool that crashes halfway leaves a
     partial file in derived/ and touches nothing of the director's.
 
-    Tools come from the project's own `passes` map, {name: absolute script},
-    and are invoked as `script src dst [args]`. A name from that map, never a
-    string from the request, and never shell=True.
+    ⚠️ THE EXECUTABLE NEVER COMES FROM PROJECT DATA. It used to: `passes` was a
+    {name: absolute script} map read out of the project JSON, which meant a PUT
+    adding {"passes": {"nuke": "/bin/rm"}} followed by POST /pass ran
+    `/bin/rm <source> <dst>` and DELETED THE DIRECTOR'S FOOTAGE. The one thing
+    this program exists to make impossible, reachable through a config field.
+
+    Now: the server is given a passes DIRECTORY at startup (--passes-dir, no
+    default), the project names a pass, and the name is resolved inside that
+    directory. A name carrying a separator, a `..`, or a leading dot is refused
+    before it touches the filesystem, and the resolved path must still sit
+    inside the directory. With no --passes-dir there are no passes at all.
     """
-    project = json.loads(project_path(name).read_text())
-    passes = project.get("passes") or {}
-    if pass_name not in passes:
+    if PASSES_DIR is None:
+        return 501, {"problems": [
+            "no passes directory configured — start the server with "
+            "--passes-dir <dir> to enable post passes"]}
+    if (not pass_name or "/" in pass_name or "\\" in pass_name
+            or pass_name.startswith(".") or ".." in pass_name):
+        return 400, {"problems": [f"{pass_name!r} is not a plain pass name"]}
+    script = (PASSES_DIR / pass_name).resolve()
+    # resolve() first, THEN confirm containment: a symlink inside the passes
+    # directory pointing at /bin/rm must not become a runnable pass.
+    if PASSES_DIR not in script.parents or not script.is_file():
+        available = sorted(p.name for p in PASSES_DIR.glob("*")
+                           if p.is_file()) if PASSES_DIR.is_dir() else []
         return 400, {"problems": [
-            f"{pass_name!r} is not one of this project's passes "
-            f"({', '.join(sorted(passes)) or 'none configured'}) — add it to "
-            f"\"passes\" in {project_path(name).name} as an absolute path"]}
-    script = pathlib.Path(passes[pass_name])
-    if not script.is_file():
-        return 500, {"problems": [f"{pass_name} points at {script}, which is not a file"]}
+            f"{pass_name!r} is not a pass in {PASSES_DIR} "
+            f"({', '.join(available) or 'none found'})"]}
+    project = json.loads(project_path(name).read_text())
 
     clip = next((c for c in project["clips"] if c["uid"] == uid), None)
     if clip is None:
@@ -863,8 +893,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 # ------------------------------------------------------------------- the CLI
+# No `passes` key: the executable a pass runs comes from --passes-dir at
+# startup, never from project data. See run_pass for what that cost to learn.
 BLANK = {"fps": 24, "resolution": [720, 1280], "version": 1,
-         "media": [], "clips": [], "passes": {}}
+         "media": [], "clips": []}
 
 
 def create(name, fps=24, resolution=(720, 1280)):
@@ -879,8 +911,13 @@ def create(name, fps=24, resolution=(720, 1280)):
     return doc
 
 
-def serve(name, port):
+def serve(name, port, passes_dir=None):
+    global PASSES_DIR
     check_name(name)
+    if passes_dir is not None:
+        PASSES_DIR = pathlib.Path(passes_dir).expanduser().resolve()
+        if not PASSES_DIR.is_dir():
+            sys.exit(f"--passes-dir {PASSES_DIR} is not a directory")
     if not project_path(name).is_file():
         sys.exit(f"No project at {project_path(name)} — make one with "
                  f"`cutroom new {name}`.")
@@ -894,6 +931,7 @@ def serve(name, port):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"cut room — {name} — {url}   (ctrl-c to stop)")
+    print(f"  passes: {PASSES_DIR if PASSES_DIR else 'disabled (no --passes-dir)'}")
     threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     srv.serve_forever()
 
@@ -914,6 +952,10 @@ def main(argv=None):
     p = sub.add_parser("serve", help="serve the timeline")
     p.add_argument("project")
     p.add_argument("--port", type=int, default=8420)
+    p.add_argument("--passes-dir", default=None,
+                   help="directory of post-pass scripts. Without it, passes are "
+                        "disabled entirely — the safe default, since anything "
+                        "that can run an executable can delete a file.")
 
     p = sub.add_parser("export", help="render the cut to mp4")
     p.add_argument("project")
@@ -937,7 +979,7 @@ def main(argv=None):
             for mid in payload["already"]:
                 print(f"  {mid}  already in the project")
         elif a.cmd == "serve":
-            serve(a.project, a.port)
+            serve(a.project, a.port, a.passes_dir)
         elif a.cmd == "export":
             status, payload = export(a.project)
             if status != 200:
