@@ -24,8 +24,18 @@ deletion primitive at all — no `unlink`, no `rmtree`, no `shutil.move`.
 ```sh
 ./cutroom new threshold                      # ~/cutroom-projects/threshold.json
 ./cutroom add threshold /abs/path/to/a.mp4 /abs/path/to/b.mp4
+./cutroom add threshold --copy /abs/path/*.mp4   # import copies, not references
 ./cutroom serve threshold                    # http://127.0.0.1:8420, opens a browser
 ```
+
+## Cut a clip in two
+
+Park the playhead and press **S**, or hit **✂ cut** in the header. Every clip
+the playhead is inside splits at the frame under it — the two halves cover
+exactly what the one covered, so nothing is thrown away and the cut is undone
+by dragging the right half back over the seam. The right half is selected, so
+`⌫` after `S` trims the tail. The seam lands on a *frame*, not on the
+quarter-second grid a drag snaps to.
 
 Other commands: `./cutroom export <project>`, `./cutroom ls`,
 `./cutroom check` (both test suites).
@@ -51,6 +61,20 @@ not go looking for it by name, because looking means scanning a directory —
 the exact habit that cost 226 clips. So when the path is withheld the drop
 target **says so** and points you at the other two routes. It never fails
 silently.
+
+### Reference, or copy
+
+By default the project *references* the file where it lies. With `--copy` — and
+from the page, with **copy the file into this project**, which is on by default
+— cutroom first copies it into `<project>/media/` and references the copy.
+
+The copy is not what keeps your original safe. Nothing here can write to a
+source: it is opened `"rb"` and there is no `unlink`, `rename` or `move`
+anywhere in the program, which a test enforces by reading the source. What the
+copy buys is **survival** — the cut stops depending on the folder it came from,
+so a film repo that is moved, re-organised or emptied by a merge leaves the cut
+room still holding everything it needs to render. 45 clips of Threshold is
+354 MB.
 
 Every added file is recorded in the project's `media` list with its path, a
 label, and its duration and size as ffprobe last reported them. That list is

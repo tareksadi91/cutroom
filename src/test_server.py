@@ -587,10 +587,14 @@ def test_the_program_contains_no_way_to_delete_a_file():
         # A file is written by fdopen()ing the descriptor _open_new() just
         # created — never by re-opening a path by name, which would be the
         # check-then-use window all over again.
-        assert code.count("fdopen(") == (1 if mod == "server.py" else 0), mod
+        assert code.count("fdopen(") == (2 if mod == "server.py" else 0), mod
         if mod == "server.py":
+            # two, and both on a descriptor O_CREAT|O_EXCL just made: the
+            # project JSON's atomic swap, and copy_in()'s import of a source.
             assert 'os.fdopen(_open_new(path), "w")' in code, \
-                "the only writing open is no longer on an _open_new descriptor"
+                "the project write is no longer on an _open_new descriptor"
+            assert 'os.fdopen(_open_new(dst), "wb")' in code, \
+                "the media copy is no longer on an _open_new descriptor"
         # Every file this program creates is created with O_EXCL, which is what
         # makes "never overwrites a derived output" true of ffmpeg's writes too:
         # the destination is claimed first, so -y can only land on our own
@@ -1560,6 +1564,207 @@ def test_what_an_external_pass_script_actually_receives():
         assert report["argv"][3:] == [">", str(root / "shelled.txt"), "&&", "rm"]
         code = (pathlib.Path(server.HERE) / "server.py").read_text()
         assert "shell=True" not in code, "server.py can spell shell=True"
+
+
+def test_copy_in_copies_and_never_touches_the_source():
+    """`--copy` puts the COPY on the allowlist and leaves the original alone.
+
+    This is the survival property, not the safety one: safety is that nothing
+    can write to a source at all. What the copy buys is a cut that still
+    renders after the folder it came from is gone — the failure that cost this
+    project 226 clips.
+    """
+    with project() as (name, root):
+        src = synth(root / "outside" / "take.mp4", dur=0.5)
+        before, mtime = src.read_bytes(), src.stat().st_mtime_ns
+
+        status, payload = server.copy_in(name, [str(src)])
+        assert status == 200, payload
+        added = payload["added"]
+        assert len(added) == 1
+        held = pathlib.Path(added[0]["path"])
+
+        assert held != src, "the allowlist still points at the original"
+        assert held.parent == server.project_dir(name) / "media", held
+        assert held.read_bytes() == before, "the copy is not the file"
+        assert src.read_bytes() == before and src.stat().st_mtime_ns == mtime, \
+            "the source was written to"
+        assert added[0].get("dur"), "the copy was not probed"
+
+        # a second import does not replace the first — O_EXCL, same as a pass
+        status, payload = server.copy_in(name, [str(src)])
+        assert status == 200, payload
+        second = pathlib.Path(payload["added"][0]["path"])
+        assert second != held and second.exists() and held.read_bytes() == before
+
+        # and the copy is servable, because it is genuinely on the allowlist
+        doc = json.loads(server.project_path(name).read_text())
+        assert server.servable(doc, str(held)) == held
+
+
+def test_copy_in_refuses_what_add_media_refuses():
+    with project() as (name, root):
+        status, payload = server.copy_in(name, ["relative/path.mp4"])
+        assert status == 400 and "absolute" in payload["problems"][0]
+        status, payload = server.copy_in(name, [str(root / "nope.mp4")])
+        assert status == 400 and "not a file" in payload["problems"][0]
+        assert not (server.project_dir(name) / "media").exists(), \
+            "a refused import still made the directory"
+
+
+def test_the_razor_cuts_on_a_frame_and_loses_nothing():
+    """Run the real razor out of ui.html.
+
+    The two halves must cover exactly what the one covered — a razor that
+    rounds the seam differently on each side leaves a gap or an overlap, and an
+    overlap in this tool is a crossfade, which would mean cutting a clip in
+    two silently dissolved it into itself.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> razor")
+    b = html.index("// <<< razor")
+    region = html[a:b]
+    assert "function razor()" in region, "the razor markers no longer wrap the razor"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the razor is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let SEL = null, DRAWS = 0, SAVES = 0, NOTES = [];
+const newUid = () => 'u' + (++DRAWS);
+function draw() {} function save() { SAVES++; } function inspect() {}
+function note(m) { NOTES.push(m); }
+let DOC = {fps: 24, clips: []}, CLOCK = 0;
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// one clip, cut off the frame grid: the seam must land on a frame
+DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:0, in:0.5, out:2.5, rate:1.0,
+              label:'a', note:''}];
+CLOCK = 0.7719;
+razor();
+if (DOC.clips.length !== 2) fail('did not split (' + DOC.clips.length + ')');
+const [L, R] = DOC.clips;
+if (Math.abs(R.t * 24 - Math.round(R.t * 24)) > 1e-9) fail('seam is not on a frame');
+if (Math.abs(endOf(L) - R.t) > 1e-9) fail('gap or overlap at the seam');
+if (Math.abs(L.out - R.in) > 1e-9) fail('the source is not continuous across the cut');
+if (Math.abs(dur(L) + dur(R) - 2.0) > 1e-9) fail('the halves do not cover the whole');
+if (R.mid !== L.mid || R.lane !== L.lane) fail('the right half changed source or lane');
+if (SEL !== R.uid) fail('the right half was not selected');
+if (SAVES !== 1) fail('saved ' + SAVES + ' times');
+
+// a retimed clip: the seam still lands where the playhead is
+DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:1.0, in:0, out:4.0, rate:2.0,
+              label:'a', note:''}];
+CLOCK = 1.5;
+razor();
+const [L2, R2] = DOC.clips;
+if (Math.abs(R2.t - 1.5) > 1e-9) fail('retimed seam moved: ' + R2.t);
+if (Math.abs(R2.in - 1.0) > 1e-9) fail('retimed source point wrong: ' + R2.in);
+if (Math.abs(endOf(R2) - 3.0) > 1e-9) fail('retimed tail ends wrong: ' + endOf(R2));
+
+// THE ONE THAT BITES: a slow retime, put through the SERVER'S OWN SNAPPING.
+// render.snap_project() rounds t, in and out to the frame grid on every save.
+// A seam picked at the playhead alone survives that at rate 1.0 and 2.0 and
+// NOT at 0.5 — `in` rounds one way, `t` stays put, and the halves end up
+// overlapping by a frame. An overlap here is a crossfade, so the clip would
+// dissolve into itself with nothing on screen to say so.
+const snapAll = () => DOC.clips.forEach(c => {
+  for (const k of ['t','in','out']) c[k] = Math.round(c[k]*24)/24;
+});
+for (const rate of [1.0, 0.5, 1.5, 2.0, 0.25]) {
+  for (const off of [1, 2, 3, 5, 7]) {            // frames in from the head
+    DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:0.5, in:0.25, out:2.25, rate,
+                  label:'a', note:''}];
+    CLOCK = 0.5 + off/24;
+    razor();
+    if (DOC.clips.length !== 2) continue;         // refused: nothing to check
+    snapAll();                                    // what the server writes back
+    const [a, b] = DOC.clips;
+    if (Math.abs(endOf(a) - b.t) > 1e-9)
+      fail('rate ' + rate + ' off ' + off + ': seam is ' +
+           (endOf(a) - b.t).toFixed(6) + 's out after the server snapped it');
+    if (Math.abs(a.out - b.in) > 1e-9)
+      fail('rate ' + rate + ' off ' + off + ': source discontinuous after snap');
+    if (dur(a) < 1e-9 || dur(b) < 1e-9)
+      fail('rate ' + rate + ' off ' + off + ': made a zero-length half');
+  }
+}
+
+// a rate with no frame-exact seam is REFUSED, not cut into an overlap
+DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:0, in:0, out:4.0, rate:0.93,
+              label:'a', note:''}];
+CLOCK = 1.0; SAVES = 0; NOTES = [];
+razor();
+if (DOC.clips.length !== 1) fail('cut at a rate with no exact seam');
+if (SAVES !== 0) fail('saved a refused cut');
+if (!/no frame-exact seam/.test(NOTES.join(' '))) fail('refusal was silent: ' + NOTES.join(' '));
+
+// the playhead outside every clip cuts nothing and saves nothing
+DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:0, in:0, out:1, rate:1.0,
+              label:'a', note:''}];
+CLOCK = 5; SAVES = 0;
+razor();
+if (DOC.clips.length !== 1) fail('cut a clip the playhead is not inside');
+if (SAVES !== 0) fail('saved for a cut that did not happen');
+
+// exactly on a clip's own edge is not a cut either — it would make a zero clip
+CLOCK = 0; razor();
+CLOCK = 1; razor();
+if (DOC.clips.length !== 1) fail('cut at an edge made an empty clip');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "razor.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_adopting_a_server_document_never_bins_a_local_edit():
+    """The save loop already states the rule: take the version NUMBER, never
+    the object graph. adopt() is the other door into the same hazard, and a
+    copy-in of 45 masters is a whole second of window in which the director can
+    drag, trim or cut while the request is away.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> adopt")
+    b = html.index("// <<< adopt")
+    region = html[a:b]
+    assert "function adopt" in region, "the adopt markers no longer wrap adopt()"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; adopt is JS)")
+        return
+
+    harness = r"""
+let DOC = null, MEDIA = [], OFFLINE = {};
+function markOffline() {} function drawBin() {} function draw() {} function reselect() {}
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// the director cuts a clip while a copy-in is in flight; the copy comes back
+DOC = {version: 4, media: [{mid:'m01'}], clips: [{uid:'c0', t:0, in:0, out:1}]};
+const mine = DOC.clips[0];
+DOC.clips.push({uid:'c1', t:1, in:1, out:2});          // the razor, mid-flight
+adopt({version: 5, media: [{mid:'m01'}, {mid:'m02'}],
+       clips: [{uid:'c0', t:0, in:0, out:1}]});         // server's older copy
+
+if (DOC.clips.length !== 2) fail('the edit made during the request was binned');
+if (DOC.clips[0] !== mine) fail('clip objects were swapped out from under the handlers');
+if (DOC.media.length !== 2) fail('the new media did not arrive');
+if (MEDIA.length !== 2) fail('the bin was not rebuilt from the new media');
+if (DOC.version !== 5) fail('the version was not taken (next save would 409)');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "adopt.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
 if __name__ == "__main__":

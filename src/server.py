@@ -237,8 +237,13 @@ def free_name(directory, stem, suffix):
     return candidate
 
 
-def claim_free(directory, stem, suffix, limit=10000):
+def claim_free(directory, stem, suffix, limit=10000, create=claim):
     """The first free name in `directory`, CREATED, so it is now this process's.
+
+    `create` is what takes the name. The default claims it as an empty file for
+    a subprocess to overwrite; copy_in() passes a creator that writes the whole
+    file through the same descriptor, so nothing re-opens the path by name.
+
 
     free_name() + create is check-then-use across processes: the job lock is a
     threading.Lock, which serialises one server's threads and knows nothing
@@ -254,7 +259,7 @@ def claim_free(directory, stem, suffix, limit=10000):
     for n in range(1, limit + 1):
         candidate = directory / (f"{stem}{suffix}" if n == 1 else f"{stem}-{n}{suffix}")
         try:
-            return claim(candidate)
+            return create(candidate)
         except Refused:
             if not os.path.lexists(candidate):
                 raise           # not a collision — a boundary said no
@@ -647,7 +652,83 @@ def add_media(name, paths, label=None):
     return 200, {"added": added, "already": already, "project": payload}
 
 
-def pick_media(name):
+def copy_into_new(src, dst):
+    """Copy `src` to `dst`, which must not exist — the second of exactly two
+    writing opens in this program, and like the first it writes through the
+    descriptor _open_new() just created rather than re-opening a path by name.
+
+    The source side is open_source(): read-only, the only relationship this
+    program has with footage.
+    """
+    with open_source(src) as fh, os.fdopen(_open_new(dst), "wb") as out:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+        # The project is about to reference this file as the master copy of a
+        # shot. Closing is not the same as landing: without the flush+fsync a
+        # power cut can leave the reference pointing at a truncated file, which
+        # is the exact failure the copy exists to prevent.
+        out.flush()
+        os.fsync(out.fileno())
+    return pathlib.Path(dst)
+
+
+def copy_in(name, paths):
+    """Copy sources INTO the project, then put the copies on the allowlist.
+
+    The read-only guarantee never needed this. A source is opened by
+    open_source() as "rb" and there is no unlink, rename, truncate or move
+    anywhere in this program — a test greps for all of them. What a copy buys
+    is SURVIVAL, which is a different property: the cut stops depending on a
+    film repo, and a git merge that empties one of 226 clips (2026-08-25)
+    leaves the cut room still holding everything it needs to render.
+
+    The copy lands on a name claimed with O_EXCL, so an existing file is never
+    replaced — importing the same source twice writes <stem>-2.mp4 and leaves
+    the first alone, which is the same rule a pass follows.
+    """
+    check_name(name)
+    if not project_path(name).is_file():
+        return 400, {"problems": [f"no project {name} — make one with "
+                                  f"`cutroom new {name}`"]}
+    bad = []
+    for pth in paths:
+        if not isinstance(pth, str) or not os.path.isabs(pth):
+            bad.append(f"{pth!r} is not an absolute path")
+        elif not pathlib.Path(pth).is_file():
+            bad.append(f"{pth} is not a file")
+    if bad:
+        return 400, {"problems": bad}
+    if not paths:
+        return 400, {"problems": ["no paths given"]}
+
+    media_dir = mkdirs(project_dir(name) / "media")
+    copies, failed = [], None
+    for pth in paths:
+        src = pathlib.Path(pth)
+        try:
+            dst = claim_free(media_dir, src.stem, src.suffix or ".mp4",
+                             create=lambda cand: copy_into_new(src, cand))
+        except (OSError, Refused) as e:
+            # Disk full on file 45 of 45 must not orphan the 44 that landed.
+            # They are real files inside the project; allowlist them, then say
+            # what stopped. Nothing is deleted — a partial copy stays on disk
+            # under its own claimed name and is simply not referenced.
+            failed = f"{pth}: {e}"
+            break
+        copies.append(str(dst))
+
+    if not copies:
+        return 500, {"problems": [failed or "nothing was copied"]}
+    status, payload = add_media(name, copies)
+    if failed and status == 200:
+        return 207, {**payload, "problems": [failed]}
+    return status, payload
+
+
+def pick_media(name, copy=False):
     """Open the operating system's own file picker, server-side.
 
     The browser cannot hand a page the absolute path of a dropped file — that
@@ -681,7 +762,7 @@ def pick_media(name):
     paths = [p for p in proc.stdout.splitlines() if p.strip()]
     if not paths:
         return 200, {"added": [], "already": [], "cancelled": True}
-    return add_media(name, paths)
+    return copy_in(name, paths) if copy else add_media(name, paths)
 
 
 def thumb(name, project, mid):
@@ -1089,10 +1170,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         and all(isinstance(p, str) for p in paths)):
                     return self._send(400, {"problems": [
                         "paths must be a non-empty list of absolute path strings"]})
+                if body.get("copy"):
+                    return self._send(*copy_in(name, paths))
                 return self._send(*add_media(name, paths))
 
             if route == "/media/pick":
-                return self._send(*pick_media(name))
+                return self._send(*pick_media(name, bool(body.get("copy"))))
 
             if route == "/pass":
                 uid, pass_name = body.get("uid"), body.get("pass")
@@ -1188,6 +1271,10 @@ def main(argv=None):
     p = sub.add_parser("add", help="add media files by absolute path")
     p.add_argument("project")
     p.add_argument("paths", nargs="+")
+    p.add_argument("--copy", action="store_true",
+                   help="copy each file into the project first and reference the "
+                        "copy, so the cut no longer depends on where it came from. "
+                        "The source is still only ever read.")
 
     p = sub.add_parser("serve", help="serve the timeline")
     p.add_argument("project")
@@ -1211,9 +1298,13 @@ def main(argv=None):
             print(f"{project_path(a.project)}  {doc['fps']}fps "
                   f"{doc['resolution'][0]}x{doc['resolution'][1]}")
         elif a.cmd == "add":
-            status, payload = add_media(a.project, [os.path.abspath(p) for p in a.paths])
-            if status != 200:
+            want = [os.path.abspath(p) for p in a.paths]
+            status, payload = (copy_in(a.project, want) if a.copy
+                               else add_media(a.project, want))
+            if status not in (200, 207):
                 sys.exit("\n".join(payload.get("problems", [str(payload)])))
+            for problem in payload.get("problems", []):
+                print(f"  STOPPED: {problem}")
             for m in payload["added"]:
                 print(f"  {m['mid']}  {m.get('dur', '?')}s  {m['path']}")
             for mid in payload["already"]:

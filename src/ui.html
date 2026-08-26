@@ -258,6 +258,7 @@
     </span></span>
   </div>
   <div class="zone">
+    <button id="cut" title="cut every clip under the playhead (S)">✂ cut</button>
     <button id="play" class="primary">▶ play</button>
     <button id="export">export</button>
     <select id="hist" title="restore an earlier state of the cut"><option>history…</option></select>
@@ -296,6 +297,7 @@ const LANE_H = 76;          // keep in step with .lane height
 let ZI = 1, PX = ZOOMS[ZI];
 const SNAP = 0.25;
 let DOC = null, MEDIA = [], PASSES = [], OFFLINE = {}, SEL = null, EXTRA = 0;
+let COPYIN = true;   // drawBin() rebuilds the box; the choice must outlive it
 let RAF = null, T0 = 0, CLOCK = 0;
 const MON = {};
 
@@ -306,6 +308,7 @@ const totalLen = () => DOC.clips.length ? Math.max(...DOC.clips.map(endOf)) : 0;
 const snap = (v,free) => free ? Math.max(0,v) : Math.max(0, Math.round(v/SNAP)*SNAP);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
   ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+const newUid = () => 'c' + Math.random().toString(36).slice(2,8);
 const mediaOf = mid => MEDIA.find(m => m.mid === mid) || null;
 // Media is addressed by mid over the wire too, so a path never travels in a
 // URL and there is nothing for a request to try to spell differently.
@@ -446,15 +449,35 @@ function pathsFromDrop(dt) {
   for (const f of dt.files || []) if (f.path) out.push(f.path);   // not a browser
   return [...new Set(out)];
 }
+// Copy-in is ON by default. It is not what keeps your originals safe — they
+// are only ever opened read-only, and nothing here can write to one — it is
+// what keeps this cut working after the folder they came from moves, empties
+// or is rewritten by a merge.
+const wantCopy = () => { const b = document.getElementById('docopy');
+                         return !b || b.checked; };
 async function addPaths(paths) {
   if (!paths.length) return null;
-  note('adding…', 'var(--warn)');
-  const r = await fetch('/media', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({paths})});
-  const b = await r.json();
+  const copy = wantCopy();
+  note(copy ? 'copying in…' : 'adding…', 'var(--warn)');
+  let r, b;
+  try {
+    r = await fetch('/media', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({paths, copy})});
+    b = await r.json();
+  } catch (e) {
+    // A copy that dies mid-flight (disk full, server gone) must not leave the
+    // page sitting on "copying in…" as if it were still working.
+    note('not added — the cut room is not answering (' + e.message + ')',
+         'var(--danger)');
+    return null;
+  }
   if (!r.ok) { note((b.problems || ['could not add'])[0], 'var(--danger)'); return null; }
   adopt(b.project);
+  if (b.problems && b.problems.length) {
+    // 207: some copies landed, one did not. What landed is on the list.
+    return note('stopped part-way — ' + b.problems[0], 'var(--danger)');
+  }
   const n = b.added.length;
   note(n ? `added ${n} file${n > 1 ? 's' : ''}`
          : 'already in this project', n ? 'var(--accent)' : null);
@@ -499,8 +522,11 @@ function drawBin() {
   const add = el('div'); add.id = 'add';
   add.innerHTML = `<button id="pick">Add media…</button>
     <input id="addpath" placeholder="or paste an absolute path" spellcheck="false">
+    <label id="copyin"><input type="checkbox" id="docopy" ${COPYIN ? 'checked' : ''}>
+      copy the file into this project</label>
     <div id="addhint"></div>`;
   box.append(add);
+  document.getElementById('docopy').onchange = e => { COPYIN = e.target.checked; };
   document.getElementById('pick').onclick = pickMedia;
   document.getElementById('addpath').onkeydown = async e => {
     if (e.key !== 'Enter') return;
@@ -534,19 +560,30 @@ function drawBin() {
 async function pickMedia() {
   note('picker open…', 'var(--warn)');
   const r = await fetch('/media/pick', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: '{}'});
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({copy: wantCopy()})});
   const b = await r.json();
   if (!r.ok) { addNote('bad'); return note((b.problems||['picker failed'])[0], 'var(--danger)'); }
   if (b.cancelled) return note('');
   adopt(b.project);
   note(`added ${b.added.length} file${b.added.length === 1 ? '' : 's'}`, 'var(--accent)');
 }
+// >>> adopt (extracted verbatim by test_server.py — keep both markers)
 // Take a whole new document from the server (add media, run a pass) and rebind.
 function adopt(project) {
   if (!project) return;
-  DOC = project; MEDIA = (DOC.media || []).map(m => ({...m}));
+  // The media list and the version NUMBER, never the object graph — the same
+  // rule the save loop states for a 200, and for the same reason. Every card's
+  // pointer handler and every inspector field closes over a clip object in
+  // DOC.clips; `DOC = project` swaps those out from under them. It also bins
+  // outright any drag, trim or cut made while the request was away, and a
+  // copy-in of 45 clips is a second or more of exactly that window.
+  DOC.media = project.media || [];
+  DOC.version = project.version;
+  MEDIA = DOC.media.map(m => ({...m}));
   markOffline(); drawBin(); draw(); reselect();
 }
+// <<< adopt
 // A media item reads as gone when some clip that names it came back OFFLINE.
 function markOffline() {
   for (const m of MEDIA)
@@ -635,9 +672,73 @@ function card(c) {
   return d;
 }
 
+// >>> razor
+// ── the razor ────────────────────────────────────────────────────────────
+// Cuts every clip the playhead crosses in two, at the frame under it.
+//
+// Nothing is removed and no file is opened: the two halves cover exactly the
+// span the one covered, so a cut is undone by dragging the right half back
+// over the seam. The cut lands on a FRAME, not on the quarter-second drag
+// grid — a razor that snapped to 0.25s would be a different tool.
+//
+// The right half is selected afterwards, because "cut, then delete the tail"
+// is the move this exists for.
+function frameSnap(t) { return Math.round(t * DOC.fps) / DOC.fps; }
+const onGrid = v => Math.abs(v * DOC.fps - Math.round(v * DOC.fps)) < 1e-6;
+
+// A seam has to satisfy TWO grids at once, because the server snaps `in` and
+// `out` to the source's frame grid and `t` to the timeline's. At rate 1.0
+// every frame satisfies both. At 0.5x only every second source frame does, at
+// 1.5x every third. Cutting at the playhead regardless and letting the server
+// round `in` afterwards is what puts the halves a frame out of step — and an
+// overlap in this tool is a CROSSFADE, so a clip cut in two would silently
+// dissolve into itself.
+//
+// So: search outward from the playhead for the first source frame whose
+// implied timeline seam is also on a frame. Four frames is the whole window —
+// a rate like 0.93 does have an exact seam (every 93rd source frame) and it is
+// three seconds from where the playhead was parked, which is not a cut anyone
+// asked for. Out of range is REFUSED rather than cut into an overlap.
+function seamFor(c, t) {
+  const fps = DOC.fps, eps = 1e-6;
+  const ideal = Math.round((c.in + (t - c.t) * c.rate) * fps);
+  for (let d = 0; d <= 4; d++) {
+    for (const k of (d ? [ideal - d, ideal + d] : [ideal])) {
+      const at = k / fps;
+      if (at <= c.in + eps || at >= c.out - eps) continue;
+      const seam = c.t + (at - c.in) / c.rate;
+      if (seam > c.t + eps && seam < endOf(c) - eps && onGrid(seam))
+        return {at, t: frameSnap(seam)};
+    }
+  }
+  return null;
+}
+function razor() {
+  const t = frameSnap(CLOCK), eps = 1e-6;
+  let last = null, n = 0, stuck = 0;
+  for (const c of [...DOC.clips]) {
+    if (t <= c.t + eps || t >= endOf(c) - eps) continue;   // playhead not inside it
+    const seam = seamFor(c, t);
+    if (!seam) { stuck++; continue; }
+    last = {...c, uid: newUid(), t: seam.t, in: seam.at};
+    DOC.clips.push(last);
+    c.out = seam.at;
+    n++;
+  }
+  if (!n) return note(stuck
+    ? 'no frame-exact seam near the playhead at that rate — nothing cut'
+    : 'nothing under the playhead to cut', 'var(--warn)');
+  SEL = last.uid;
+  draw(); save(); inspect(last);
+  note(`cut ${n} clip${n > 1 ? 's' : ''} at ${last.t.toFixed(2)}s`
+        + (stuck ? ` · ${stuck} skipped, no frame-exact seam at that rate` : ''),
+       'var(--accent)');
+}
+// <<< razor
+
 function place(mid, lane, t) {
   const m = mediaOf(mid); if (!m) return;
-  DOC.clips.push({uid:'c'+Math.random().toString(36).slice(2,8),
+  DOC.clips.push({uid:newUid(),
     mid, lane, t, in:0, out:m.dur || 1.0, rate:1.0,
     label:m.label, note:''});
   draw(); save();
@@ -798,6 +899,12 @@ function inspect(c) {
                    (b.problems||[]).join('\n');
                  return note('pass failed', 'var(--danger)'); }
     adopt(b.project);
+    // adopt() keeps the local clips, so the one clip change the server made —
+    // re-pointing this clip at the derivative — is applied here by hand. Not
+    // on the 409 path above: there the re-point is precisely what did NOT
+    // happen.
+    c.mid = b.media.mid;
+    draw(); inspect(c);
     note(`pass done · ${b.media.label} · ${(b.media.dur||0).toFixed(2)}s`, 'var(--accent)');
     scrubTo(CLOCK);
   };
@@ -834,6 +941,7 @@ async function doExport() {
   note(`${b.out} · ${b.seconds}s · ${b.frames} frames · ${b.mbps} Mbps`, 'var(--accent)');
   window.open('/renders/' + encodeURIComponent(b.out), '_blank');
 }
+document.getElementById('cut').onclick = razor;
 document.getElementById('export').onclick = doExport;
 
 // Restore. The list is filled on open rather than on load, so it is never
@@ -901,6 +1009,7 @@ document.addEventListener('keydown', e => {
   if (e.key==='-') zoom(-1);
   if (e.key==='ArrowLeft')  { e.preventDefault(); scrubTo(CLOCK - (e.shiftKey?1:1/DOC.fps)); }
   if (e.key==='ArrowRight') { e.preventDefault(); scrubTo(CLOCK + (e.shiftKey?1:1/DOC.fps)); }
+  if (e.key==='s'||e.key==='S') { e.preventDefault(); razor(); }
   if (e.key==='Home') scrubTo(0);
   if (e.key==='End')  scrubTo(totalLen());
   if ((e.key==='Backspace'||e.key==='Delete') && SEL) {

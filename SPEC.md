@@ -83,14 +83,23 @@ and the answer is a conflict naming both.
 
 ## What it does
 
-Drag files in. Arrange them in lanes. Trim. Overlap for a crossfade. Play it in a
-program monitor. Export an mp4.
+Drag files in. Arrange them in lanes. Trim. Cut a clip in two at the playhead.
+Overlap for a crossfade. Play it in a program monitor. Export an mp4.
 
 - **Lanes are a workspace, not layers.** Overlap in *time* is what blends, in one
   lane or across lanes. The renderer sorts by time and ignores lane.
 - **Edit points are frames, not floats.** `t`, `in` and `out` snap to the frame
   grid on save. At `rate 1.0` the frame count is exact by construction; a retimed
   clip carries up to one frame through the fps resample, and says so.
+- **The razor cuts on a frame and removes nothing.** `S` (or ✂) splits every
+  clip the playhead is inside; the halves cover exactly the span the one
+  covered, so the edit is reversible by dragging.
+- **Media may be referenced or copied in.** `add --copy` writes the file to
+  `<project>/media/` first and references the copy. This is not the safety
+  property — a source is opened `"rb"` and there is no way to write to one —
+  it is the *survival* property: the cut stops depending on the folder it came
+  from. The copy is written through the same `O_CREAT|O_EXCL` descriptor that
+  claimed its name, so it can never land on an existing file.
 - **Autosave with a version guard.** Every change writes the project file and
   snapshots the prior state. A stale write is refused with a conflict, never
   last-writer-wins.
