@@ -140,10 +140,27 @@
   .marquee { position:absolute; z-index:6; pointer-events:none;
              border:1px solid var(--accent); border-radius:2px;
              background:color-mix(in oklch, var(--accent) 14%, transparent); }
-  .clip .id { display:block; font:600 13px/1 var(--sans); color:var(--ink);
-              padding:9px 9px 0; white-space:nowrap; pointer-events:none; }
-  .clip .dur { display:block; font:400 11px/1 var(--mono); color:var(--ink-2);
-               padding:5px 9px 0; white-space:nowrap; pointer-events:none; }
+  /* The poster frame, tiled ACROSS the card rather than stretched to fill it.
+     This footage is 9:16; one frame stretched over a 60px-tall card crops to a
+     thin horizontal slice of the middle, which tells you nothing. Repeating it at
+     full height reads as a film strip and works at any clip width or zoom. */
+  .clip .poster { position:absolute; inset:0; z-index:0; pointer-events:none;
+                  background-repeat:repeat-x; background-position:left center;
+                  background-size:auto 100%; opacity:.9; }
+  /* A scrim, or the label is unreadable over a bright frame. Heaviest on the left
+     where the text sits, lifting to the right so the picture still shows. */
+  .clip .poster:after { content:''; position:absolute; inset:0;
+    background:linear-gradient(90deg, oklch(0.148 0.006 130 / 0.88) 0%,
+                                      oklch(0.148 0.006 130 / 0.62) 45%,
+                                      oklch(0.148 0.006 130 / 0.38) 100%); }
+  .clip .id { position:relative; z-index:1;
+              display:block; font:600 13px/1 var(--sans); color:var(--ink);
+              padding:9px 9px 0; white-space:nowrap; pointer-events:none;
+              text-shadow:0 1px 2px oklch(0.148 0.006 130 / 0.9); }
+  .clip .dur { position:relative; z-index:1;
+               display:block; font:400 11px/1 var(--mono); color:var(--ink-2);
+               padding:5px 9px 0; white-space:nowrap; pointer-events:none;
+               text-shadow:0 1px 2px oklch(0.148 0.006 130 / 0.9); }
   .clip .h { position:absolute; top:0; bottom:0; width:8px; z-index:2; cursor:ew-resize; }
   .clip .h.l { left:0; } .clip .h.r { right:0; }
   .clip.narrow .id, .clip.narrow .dur { display:none; }
@@ -678,7 +695,12 @@ function card(c) {
              +(w<46?' narrow':'')+(off?' offline':''));
   d.style.left = c.t*PX+'px'; d.style.width = w+'px';
   d.style.background = tint(c, 0.255);
-  d.innerHTML = `<span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
+  // The poster goes in as a background rather than an <img>: a 404 (an offline
+  // source, or a thumbnail that could not be made) then shows the clip's own tint
+  // instead of a broken-image icon.
+  d.innerHTML = `<div class="poster"${off ? '' :
+                   ` style="background-image:url(/thumb/${encodeURIComponent(c.mid)})"`}></div>
+                 <span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
                  <div class="h l"></div><div class="h r"></div>`;
   const m = mediaOf(c.mid);
   d.title = `${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
