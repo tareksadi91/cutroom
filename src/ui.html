@@ -793,28 +793,139 @@ function draw() {
 
 const activeAt = t => DOC.clips.filter(c=>t>=c.t && t<endOf(c) && !OFFLINE[c.uid])
                                .sort((a,b)=>a.t-b.t);
+const SLOTS = ['mA','mB'];
+// A <video> paints its own background — near-black — from the moment its src is
+// set until it can decode. So the rule the monitor lives by is: never SHOW an
+// element that is not ready, and never SET a src at the instant the picture is
+// due. Everything below is those two sentences.
+// HAVE_CURRENT_DATA is necessary but NOT sufficient: mid-seek the element still
+// holds the frame it had before, so showing it paints a stale picture.
+const ready = v => v.readyState >= 2 && !v.seeking;
+// A browser may refuse or clamp an extreme playbackRate. Swallowing that left the
+// element at its previous rate and quietly restored the drift-seek judder this
+// change exists to remove, so say it once per rate instead.
+const RATE_WARNED = new Set();
+function setRate(v, rate) {
+  if (v.playbackRate === rate) return;
+  try { v.playbackRate = rate; } catch (e) { /* reported below */ }
+  if (Math.abs(v.playbackRate - rate) > 1e-6 && !RATE_WARNED.has(rate)) {
+    RATE_WARNED.add(rate);
+    note(`preview cannot play rate ${rate} — showing ${v.playbackRate}×. The export is unaffected.`,
+         'var(--warn)');
+  }
+}
+// Park a hidden element: stopped, and sitting on the frame it will be asked for.
+// Hiding alone left it PLAYING behind the picture, so it drifted off its in-point
+// and the seek cost simply moved back to the cut.
+function park(v, at) {
+  if (!v.paused) v.pause();
+  if (at != null && Math.abs(v.currentTime - at) > 0.04) {
+    try { v.currentTime = at; } catch (e) {}
+  }
+}
+// Which source each slot holds. Kept across paints deliberately: the blink was a
+// slot re-loading a file the OTHER slot had already decoded.
+// Which CLIP each slot was last fed. ⚠️ A source is not an identity: the razor
+// makes two clips out of one file, so both halves of a self-crossfade share a mid
+// and MON cannot tell them apart. Matching on source alone sent the surviving half
+// to whichever slot came first in SLOTS — often the one parked on the OUTGOING
+// half's frame — which seeks, and shows black or a stale frame at the very seam
+// the razor just made.
+const SLOT_UID = {};
+function claim(c, taken) {
+  // Priority: this exact clip, then merely the right file (a preload), then free.
+  // Assigning by index (live[0] always mA) made the incoming half of a crossfade
+  // load TWICE — once into mB to fade up, then again into mA the moment it became
+  // primary — so every crossfade blinked at its end as well as its start.
+  const want = mediaURL(c.mid);
+  const free = SLOTS.filter(s => s !== taken);
+  // ⚠️ The uid must agree with the SOURCE too. A clip can be re-pointed at a
+  // different file (a post pass does exactly that), and then a slot still tagged
+  // with its uid is holding the OLD source — a match there forces the reload this
+  // whole function exists to avoid.
+  return free.find(s => SLOT_UID[s] === c.uid && MON[s] === want)
+      || free.find(s => MON[s] === want)
+      || free[0]
+      || (taken === 'mA' ? 'mB' : 'mA');
+}
 function feed(slot,c,t) {
   const v = document.getElementById(slot);
   const want = mediaURL(c.mid);
-  if (MON[slot]!==want) { v.src=want; MON[slot]=want; }
+  if (MON[slot]!==want) { v.preload='auto'; v.src=want; MON[slot]=want; }
+  SLOT_UID[slot] = c.uid;
+  // The model says a clip at rate r consumes r seconds of source per second of
+  // timeline. Without this the element ran at 1.0 and feed()'s 0.2s correction
+  // yanked currentTime backwards a few times a second, which read as judder and
+  // meant no retime could be judged in the monitor at all.
+  setRate(v, c.rate);
   const target = c.in + (t-c.t)*c.rate;
   if (Math.abs(v.currentTime-target)>0.2) v.currentTime = target;
   return v;
+}
+// Park the next clip's source in the idle slot BEFORE it is due, hidden, so the
+// cut arrives already decoded. Without it every source loaded at exactly the
+// moment it had to be on screen.
+const PRELOAD_LEAD = 2.0;
+function preloadNext(t, used) {
+  const idle = SLOTS.filter(s => !used.includes(s));
+  if (!idle.length) return;
+  const soon = DOC.clips.filter(c => c.t > t && c.t - t < PRELOAD_LEAD && !OFFLINE[c.uid])
+                        .sort((a,b)=>a.t-b.t)[0];
+  if (!soon) return;
+  const want = mediaURL(soon.mid);
+  // Reuse before evicting. Taking idle[0] blind could overwrite mA with a copy of
+  // what mB already held, throwing away a decode about to be needed.
+  const slot = idle.find(s => MON[s] === want) || idle[0];
+  const v = document.getElementById(slot);
+  if (MON[slot] !== want) {
+    v.style.opacity = 0;
+    v.preload = 'auto';
+    v.src = want; MON[slot] = want;
+  }
+  SLOT_UID[slot] = soon.uid;
+  // Runs on the reuse path too: holding the right FILE is not holding the right
+  // FRAME, and a slot that just went idle is still playing.
+  park(v, soon.in);
 }
 function paint(t) {
   const live = activeAt(t);
   const a=document.getElementById('mA'), b=document.getElementById('mB');
   document.getElementById('tc').textContent = t.toFixed(2)+'s';
   if (!live.length) { a.style.opacity=b.style.opacity=0;
-    document.getElementById('tc-what').textContent='black'; return []; }
-  const va = feed('mA',live[0],t); va.style.opacity=1;
-  let vb=null;
-  if (live[1]) { vb=feed('mB',live[1],t);
+    document.getElementById('tc-what').textContent='black';
+    preloadNext(t, []); return []; }
+  const sa = claim(live[0], null);
+  const va = feed(sa,live[0],t);
+  va.style.opacity = ready(va) ? 1 : 0;
+  let vb=null, sb=null;
+  if (live[1]) {
+    sb = claim(live[1], sa);
+    vb = feed(sb,live[1],t);
     const ov = endOf(live[0])-live[1].t;
-    vb.style.opacity = Math.min(1,Math.max(0,(t-live[1].t)/ov)); }
-  else { b.style.opacity=0; MON.mB=null; }
+    // A crossfade into an element that cannot paint yet fades up BLACK. Hold it
+    // at zero until it can, and the fade simply starts late rather than wrong.
+    vb.style.opacity = ready(vb)
+      ? Math.min(1,Math.max(0,(t-live[1].t)/ov)) : 0;
+  }
+  // ⚠️ STACKING IS NOT DOM ORDER ANY MORE. Both elements are position:absolute, so
+  // mB used to paint over mA and the fixed live[0]=mA / live[1]=mB roles made that
+  // correct by accident. Now that either slot can hold either half, the incoming
+  // clip must be told to sit on top or an opaque OUTGOING frame hides the whole
+  // fade and the crossfade plays as a hard cut.
+  va.style.zIndex = 1;
+  if (vb) vb.style.zIndex = 2;
+  // Hide whichever slot is not in use — by slot, not by hardcoding mB, now that
+  // either one can be the primary. Its src STAYS: dropping it is what forced the
+  // reload it was about to need. It is PARKED, not merely hidden.
+  for (const s of SLOTS) if (s !== sa && s !== sb) {
+    const idleV = document.getElementById(s);
+    idleV.style.opacity = 0;
+    park(idleV, null);
+  }
+  preloadNext(t, [sa, sb].filter(Boolean));
   document.getElementById('tc-what').textContent =
-    live.map(c=>c.label).join(' → ') + (live[1]?'  crossfade':'');
+    live.map(c=>c.label).join(' → ') + (live[1]?'  crossfade':'')
+    + (live.length > 2 ? `  ⚠ ${live.length-2} more stacked, not shown` : '');
   return [va,vb].filter(Boolean);
 }
 function scrubTo(t) { CLOCK=Math.max(0,t);
@@ -1019,6 +1130,17 @@ document.addEventListener('keydown', e => {
     document.getElementById('insp').innerHTML =
       '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>'; }
 });
+// ⚠️ THE READINESS GATE NEEDS A WAY BACK. paint() now refuses to show an element
+// that cannot paint a true frame, but scrubTo() paints ONCE — so a scrub into a
+// source that had not decoded yet went black and STAYED black until the director
+// moved again. When the frame finally lands, repaint that same instant. Only while
+// parked: during playback tick() is already repainting every frame.
+for (const s of SLOTS) {
+  const v = document.getElementById(s);
+  for (const ev of ['loadeddata','seeked','canplay'])
+    v.addEventListener(ev, () => { if (!RAF && DOC) scrubTo(CLOCK); });
+}
+
 // A file dropped anywhere else must not navigate the page away to it.
 window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('drop', e => e.preventDefault());
