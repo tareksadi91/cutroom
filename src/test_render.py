@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# cutroom — a local timeline that cannot harm your media.
+# Copyright (C) 2026 Tarek Sadi
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version. It is distributed WITHOUT ANY WARRANTY; without even the
+# implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+# the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/>.
 """Checks for render.py — the validator and the render graph.
 
     python3 test_render.py

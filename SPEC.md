@@ -29,12 +29,12 @@ except its derived outputs and renders.
 
 ```json
 {
-  "name": "threshold",
+  "name": "myfilm",
   "fps": 24,
   "resolution": [720, 1280],
   "version": 7,
   "media": [
-    {"mid": "m01", "path": "/Users/.../clips/selected/b01_11_street.mp4",
+    {"mid": "m01", "path": "/…/clips/street.mp4",
      "label": "1.1 street", "dur": 8.042, "w": 720, "h": 1280}
   ],
   "clips": [

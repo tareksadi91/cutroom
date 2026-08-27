@@ -229,11 +229,20 @@
              background:var(--bg); border:1px solid var(--rule);
              border-radius:3px; padding:2px 4px; }
   .tip em { color:var(--warn); font-style:normal; }
+  /* The licence notice: present and reachable, never in the way of the cut. */
+  .src { font-size:10px; letter-spacing:.04em; text-decoration:none; opacity:.35;
+         color:inherit; margin-left:10px; white-space:nowrap; }
+  .src:hover, .src:focus { opacity:.85; text-decoration:underline; }
 </style>
 
 <header>
   <div class="zone">
     <span class="film" id="film">—</span>
+    <!-- AGPL-3.0 section 13: anyone reaching this page over a network is entitled
+         to the source of the version they are using. Keep this link, and if you
+         modify cutroom and serve it to other people, point it at YOUR source. -->
+    <a class="src" href="https://github.com/tareksadi91/cutroom" target="_blank"
+       rel="noopener" title="cutroom is free software under the AGPL-3.0. Source code.">AGPL · source</a>
     <span class="info" tabindex="0">i<span class="tip">
       <b>The cut room</b>
       <p>The cut lives in one JSON file under <kbd>~/cutroom-projects/</kbd>, not in

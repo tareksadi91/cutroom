@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
+# cutroom — a local timeline that cannot harm your media.
+# Copyright (C) 2026 Tarek Sadi
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version. It is distributed WITHOUT ANY WARRANTY; without even the
+# implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+# the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/>.
 """The cut room: a local timeline the director drags and the agent edits.
 
-    ./cutroom serve threshold          # serve + open the browser
-    ./cutroom add threshold /abs/path/to/a.mp4 /abs/path/to/b.mp4
-    ./cutroom new threshold
+    ./cutroom serve myfilm          # serve + open the browser
+    ./cutroom add myfilm /abs/path/to/a.mp4 /abs/path/to/b.mp4
+    ./cutroom new myfilm
 
 A project is ONE JSON file at ~/cutroom-projects/<name>.json. This server is a
 thin shell around it — every rule about what a valid cut is lives in render.py,
@@ -540,7 +550,7 @@ def write_project(name, body):
 def edit_project(name, mutate):
     """THE way an agent edits the cut. Returns (status, payload), like a PUT.
 
-        server.edit_project("threshold", lambda p: p["clips"].pop(3))
+        server.edit_project("myfilm", lambda p: p["clips"].pop(3))
 
     `mutate` is handed the current project inside the lock and may change it in
     place or return a new one. The version bump, the validation, the snapshot

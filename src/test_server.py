@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# cutroom — a local timeline that cannot harm your media.
+# Copyright (C) 2026 Tarek Sadi
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version. It is distributed WITHOUT ANY WARRANTY; without even the
+# implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+# the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/>.
 """Checks for server.py — the boundaries, the version guard and the snapshots.
 
     python3 test_server.py
@@ -531,7 +541,7 @@ def test_a_project_name_is_a_filename_and_never_a_path():
                 assert False, f"{bad!r} was accepted as a project name"
             except server.Refused:
                 pass
-        assert server.check_name("threshold-2.final") == "threshold-2.final"
+        assert server.check_name("myfilm-2.final") == "myfilm-2.final"
 
 
 def test_an_existing_file_is_never_a_write_target():

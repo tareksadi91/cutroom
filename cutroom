@@ -1,7 +1,17 @@
 #!/bin/sh
+# cutroom — a local timeline that cannot harm your media.
+# Copyright (C) 2026 Tarek Sadi
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version. It is distributed WITHOUT ANY WARRANTY; without even the
+# implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+# the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/>.
 # cutroom — a standalone timeline. Python 3 stdlib + ffmpeg, nothing else.
 #
-#   ./cutroom new threshold
-#   ./cutroom add threshold /abs/path/to/a.mp4
-#   ./cutroom serve threshold
+#   ./cutroom new myfilm
+#   ./cutroom add myfilm /abs/path/to/a.mp4
+#   ./cutroom serve myfilm
 exec python3 "$(dirname "$0")/src/server.py" "$@"

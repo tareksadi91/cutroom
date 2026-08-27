@@ -186,24 +186,24 @@ directory listing beside every source are identical after a render.
 ## Verification actually run
 
 Against real footage at
-`~/Documents/projects/animation-studio/films/01-threshold/clips/selected/`,
+a real film's `clips/selected/` directory,
 read-only throughout — `stat` of size and mtime taken before and after every
 step and diffed, unchanged each time; the directory still holds its 41 files.
 
-1. `cutroom new threshold`, then `cutroom add` with three real clips by
+1. `cutroom new myfilm`, then `cutroom add` with three real clips by
    absolute path (8.04s, 4.04s, 4.96s; 720×1280 24fps).
 2. A cut with an overlap, written through `edit_project()`: `1.1` [0.0–2.0),
    `1.2` at t=1.5 trimmed 0.5–2.5 (**0.5s crossfade**), `1.3` at t=3.5 on
    **lane 1** (proving lanes do not gate the blend). Timeline predicts
    **5.0s = 120 frames**.
-3. `cutroom export threshold` → `renders/threshold_v003.mp4`:
+3. `cutroom export myfilm` → `renders/myfilm_v003.mp4`:
    **5.000000s, 120 frames counted**, 720×1280, 24/1, 10.24 Mbps. Prediction and
    file agree exactly.
 4. Live server: `/`, `/project` (3 clips, 3 media, 0 offline), a 206 Range
    response, `/thumb/m02` 200, `/renders/…` 200, and four traversal spellings
    all 404.
 5. A real post pass (`desat`, an ffmpeg `hue=s=0` script) on clip `c3`:
-   wrote `derived/b01_13_arrival_seedance20__desat.mp4`, added it as `m04`,
+   wrote `derived/arrival__desat.mp4`, added it as `m04`,
    re-pointed the clip, left `m03` on the list and the original byte-identical.
 6. Re-exported at v005: 5.000000s, 120 frames again.
 7. Both suites: **77 tests, all green** (35 render, 42 server), run repeatedly.

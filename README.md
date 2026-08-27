@@ -6,6 +6,20 @@ file. Python 3 standard library plus ffmpeg. No dependencies, no build step.
 **One rule above all others: cutroom never writes to, moves, or deletes your
 media.** It reads. Everything below follows from that.
 
+## Requirements
+
+Python 3 and ffmpeg. That is the whole list — there is nothing to install, no
+package to add, no build step, no lockfile.
+
+```sh
+python3 --version     # developed on 3.12; no version-specific syntax is used
+ffmpeg -version       # ffmpeg and ffprobe must both be on PATH
+git clone <this repo> cutroom && cd cutroom && ./cutroom check
+```
+
+macOS and Linux. The **Add media…** button uses the operating system's own file
+picker and is macOS-only; every other route works everywhere.
+
 ## Why it is standalone
 
 The first version of this tool lived inside a film repository and shared its
@@ -22,11 +36,43 @@ deletion primitive at all — no `unlink`, no `rmtree`, no `shutil.move`.
 ## Start it
 
 ```sh
-./cutroom new threshold                      # ~/cutroom-projects/threshold.json
-./cutroom add threshold /abs/path/to/a.mp4 /abs/path/to/b.mp4
-./cutroom add threshold --copy /abs/path/*.mp4   # import copies, not references
-./cutroom serve threshold                    # http://127.0.0.1:8420, opens a browser
+./cutroom new myfilm                      # ~/cutroom-projects/myfilm.json
+./cutroom add myfilm /abs/path/to/a.mp4 /abs/path/to/b.mp4
+./cutroom add myfilm --copy /abs/path/*.mp4   # import copies, not references
+./cutroom serve myfilm                    # http://127.0.0.1:8420, opens a browser
 ```
+
+## Editing
+
+**Drag from the media panel onto the timeline** and a marker shows the seam it
+will land on, lighting the clip on either side. Drop, and it is *inserted*
+there: everything from that instant onward moves right by exactly the new
+clip's length. Nothing lands on top of anything, and no gap is opened.
+
+**Drag a clip that is already in the cut** and it behaves the same way — it is
+lifted, the hole it leaves closes up, and it is set down at the seam you chose.
+
+Both are the same operation run in opposite directions, and both preserve the
+*relative* shape of the cut. Deliberate gaps and deliberate crossfades on either
+side are carried along, never rewritten.
+
+**Hold alt** while dropping to place a clip exactly where the cursor is, with no
+ripple and no snapping. That is the old behaviour, kept for when you want it.
+
+An edit that would produce a cut the renderer cannot express — a clip nested
+inside another, a crossfade longer than the shorter clip it joins, two clips
+starting on the same frame — is **refused before anything moves**, and the
+marker turns amber during the drag so you find out while the clip is still in
+your hand. The check mirrors the renderer's own rules expression for
+expression; a differential test agrees with it on four thousand random
+timelines.
+
+**Retime** a clip with the `rate` field in the inspector: below 1.0 is slower
+and occupies more timeline, above 1.0 is faster. Frames are duplicated or
+dropped, never interpolated, so the *pattern* matters more than the amount —
+rates of the form n/(n+1) (0.5, 0.667, 0.75, 0.8) hold frames evenly, and
+anything else beats irregularly. The monitor plays the retime truthfully, so
+what you see is what renders.
 
 ## Cut a clip in two
 
@@ -72,9 +118,9 @@ The copy is not what keeps your original safe. Nothing here can write to a
 source: it is opened `"rb"` and there is no `unlink`, `rename` or `move`
 anywhere in the program, which a test enforces by reading the source. What the
 copy buys is **survival** — the cut stops depending on the folder it came from,
-so a film repo that is moved, re-organised or emptied by a merge leaves the cut
-room still holding everything it needs to render. 45 clips of Threshold is
-354 MB.
+so a source folder that is moved, re-organised or emptied by a merge leaves the
+cut room still holding everything it needs to render. Forty-five 720x1280 clips
+come to roughly 350 MB.
 
 Every added file is recorded in the project's `media` list with its path, a
 label, and its duration and size as ffprobe last reported them. That list is
@@ -87,8 +133,8 @@ A project is **one JSON file** at `~/cutroom-projects/<name>.json`.
 
 ```json
 {
-  "name": "threshold", "fps": 24, "resolution": [720, 1280], "version": 7,
-  "media": [{"mid": "m01", "path": "/…/b01_11_street.mp4",
+  "name": "myfilm", "fps": 24, "resolution": [720, 1280], "version": 7,
+  "media": [{"mid": "m01", "path": "/…/street.mp4",
              "label": "1.1 street", "dur": 8.042, "w": 720, "h": 1280}],
   "clips": [{"uid": "c00", "mid": "m01", "lane": 0, "t": 0.0,
              "in": 0.0, "out": 1.5, "rate": 1.0, "label": "1.1", "note": ""}]
@@ -129,7 +175,7 @@ Everything else cutroom owns lives beside the project file:
 ## Post passes
 
 ```sh
-./cutroom serve threshold --passes-dir ~/film/studio/tools
+./cutroom serve myfilm --passes-dir ~/my-video-tools
 ```
 
 A pass is an external script **in the directory given at startup**, invoked as
@@ -195,3 +241,16 @@ nothing, ever” that the rename would make untrue.
 
 Bare asserts, no pytest. Every test builds its own fixtures in a temporary
 directory; none addresses real footage.
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE).
+
+cutroom is a server you point a browser at, so the fork that matters is a hosted
+one. Plain GPL would not reach it: nobody running a service *distributes* the
+program, so nobody would owe anyone their changes. AGPL closes that — if you run
+a modified cutroom and let other people use it over a network, they are entitled
+to your source.
+
+Use it, change it, run it, cut your film with it. If you hand a modified version
+to anyone, by copy or over a wire, hand them the source too.
