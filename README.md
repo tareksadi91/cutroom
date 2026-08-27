@@ -49,15 +49,17 @@ will land on, lighting the clip on either side. Drop, and it is *inserted*
 there: everything from that instant onward moves right by exactly the new
 clip's length. Nothing lands on top of anything, and no gap is opened.
 
-**Drag a clip that is already in the cut** and it behaves the same way — it is
-lifted, the hole it leaves closes up, and it is set down at the seam you chose.
+The ripple preserves the *relative* shape of the cut downstream: deliberate gaps
+and deliberate crossfades are carried along, never rewritten. **Hold alt** while
+dropping to place the clip exactly where the cursor is instead, with no ripple
+and no snapping.
 
-Both are the same operation run in opposite directions, and both preserve the
-*relative* shape of the cut. Deliberate gaps and deliberate crossfades on either
-side are carried along, never rewritten.
-
-**Hold alt** while dropping to place a clip exactly where the cursor is, with no
-ripple and no snapping. That is the old behaviour, kept for when you want it.
+**A clip already on the timeline drags freely** — no seam, no ripple. That is
+deliberate. Dragging one clip onto another is how you make a crossfade, and it
+is the common act; snapping every drag to the nearest seam fought the primary
+gesture in order to serve the rarer one. A clip arriving from the media panel is
+different: it has no position to respect, and landing it on top of the cut was
+never what anyone meant.
 
 An edit that would produce a cut the renderer cannot express — a clip nested
 inside another, a crossfade longer than the shorter clip it joins, two clips

@@ -662,6 +662,12 @@ function card(c) {
     const laneCount = document.querySelectorAll('.lane').length;
     let lane = lane0;
     SEL=c.uid; inspect(c); d.classList.add('sel');
+    // ⚠️ A CLIP ALREADY ON THE TIMELINE DRAGS FREELY — no seam, no ripple, on purpose.
+    // Rippling was tried and removed 2026-08-27: dragging one clip ONTO another is how
+    // a crossfade gets made here, and that is the common act. Snapping every drag to the
+    // nearest seam fought the primary gesture to serve the rarer one. Inserting from the
+    // MEDIA PANEL still ripples, because a clip arriving from outside has no position to
+    // respect and landing it on top of the cut was never what anyone meant.
     if (mode==='move') d.classList.add('dragging');
     d.setPointerCapture(e.pointerId); e.preventDefault();
 
@@ -679,37 +685,20 @@ function card(c) {
             L.classList.toggle('target', i===lane));
         }
         d.style.top = (8 + (lane-lane0)*LANE_H) + 'px';
-        // Same marker the bin drag uses, so a move reads exactly like an insert.
-        // Alt still means "put it precisely where I am pointing".
-        if (ev.altKey) clearSeam();
-        else {
-          const L = Math.round(dur(c)*DOC.fps)/DOC.fps;
-          const pt = nearestPoint(c.t, c.uid);
-          // Predict the anchor rule rippleMove will apply: the seam moves only if the
-          // clip it sits on is one the lift will pull left.
-          const anchor = pt.after || pt.before;
-          const base = pt.after ? pt.after.t : (pt.before ? endOf(pt.before) : 0);
-          showSeam(pt, L, anchor && anchor.t >= t0 - 1e-6 ? base - L : base);
-        }
       }
-      else if (mode==='l') { clearSeam(); const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
+      else if (mode==='l') { const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
         c.t = snap(t0+(w2-in0)/c.rate, ev.altKey); c.in = w2; }
-      else { clearSeam(); c.out = Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate)); }
+      else c.out = Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate));
       const nw = Math.max(3, dur(c)*PX);
       d.style.left=c.t*PX+'px'; d.style.width=nw+'px';
       d.classList.toggle('narrow', nw<46);
       d.querySelector('.dur').textContent = dur(c).toFixed(2)+'s';
     };
-    d.onpointerup = ev => {
+    d.onpointerup = () => {
       d.onpointermove=d.onpointerup=null;
       d.classList.remove('dragging');
       document.querySelectorAll('.lane').forEach(L=>L.classList.remove('target'));
-      const pt = SEAM; clearSeam();
-      // rippleMove owns the lane in both outcomes: it sets the target lane on success
-      // and puts the original back on a refusal. Assigning it here too would undo that.
-      const wantRipple = mode==='move' && pt && !(ev && ev.altKey);
-      if (wantRipple) rippleMove(c, pt, t0, lane, lane0);
-      else c.lane = lane;
+      c.lane = lane;
       // c.lane, not `lane` — a refused ripple puts the original lane back, and opening
       // a fresh lane for a move that did not happen leaves an empty one behind.
       if (c.lane >= laneCount) EXTRA = c.lane + 1;   // dropped past the last lane
@@ -801,8 +790,8 @@ function place(mid, lane, t) {
 // new clip on top of a neighbour that began before it. Inserting at a START is
 // coherent everywhere — the new clip takes that instant and inherits whatever
 // crossfade the clip there already had with the one before it.
-function insertPoints(skipUid) {
-  const byT = [...DOC.clips].filter(c=>c.uid!==skipUid).sort((a,b)=>a.t-b.t);
+function insertPoints() {
+  const byT = [...DOC.clips].sort((a,b)=>a.t-b.t);
   // Stacked clips share a start, which would otherwise offer the same instant
   // several times over with a different neighbour named each time.
   const seen = new Set();
@@ -857,8 +846,8 @@ function seamReach(pt) {
   const F = t => Math.round(t * DOC.fps) / DOC.fps;
   return Math.max(0, F(endOf(pt.before) - F(pt.t)));
 }
-function nearestPoint(t, skipUid) {
-  const pts = insertPoints(skipUid);
+function nearestPoint(t) {
+  const pts = insertPoints();
   return pts.reduce((a,b)=> Math.abs(b.t-t) < Math.abs(a.t-t) ? b : a);
 }
 function clearSeam() {
@@ -867,11 +856,7 @@ function clearSeam() {
   document.querySelectorAll('.clip.seam-l,.clip.seam-r')
           .forEach(n=>n.classList.remove('seam-l','seam-r'));
 }
-// `showAt` overrides where the bar is DRAWN. Moving a clip needs it: the seam is
-// found on the timeline as it stands, but the clip lands on the timeline after the
-// hole it leaves has closed — so the honest marker is up to one clip-length left of
-// the seam it names. Drawing the raw seam would point at the wrong cut.
-function showSeam(pt, len, showAt) {
+function showSeam(pt, len) {
   clearSeam(); SEAM = pt;
   // Would the clip in flight fit here? Saying so on the marker beats letting the
   // drop fail — the director finds out while still holding it.
@@ -882,7 +867,7 @@ function showSeam(pt, len, showAt) {
   const bad = len != null && reach > len + 1e-6;
   const bar = el('div', 'seam' + (bad ? ' bad' : ''));
   const lanes = document.querySelectorAll('.lane').length || 1;
-  bar.style.left = (showAt != null ? showAt : pt.t)*PX+'px';
+  bar.style.left = pt.t*PX+'px';
   bar.style.top = '0px';
   bar.style.height = (lanes*LANE_H) + 'px';
   if (bad) bar.dataset.why = `${reach.toFixed(2)}s crossfade — too short to fit`;
@@ -895,42 +880,6 @@ function showSeam(pt, len, showAt) {
       if (n.dataset.uid === c.uid) n.classList.add(cls); };
   mark(pt.before,'seam-l'); mark(pt.after,'seam-r');
 }
-// Move a clip that is ALREADY on the timeline to another seam, in two halves that
-// mirror each other: LIFT it and close the hole it leaves, then open a hole at the
-// target and set it down. Relative spacing on both sides survives, so deliberate
-// gaps and crossfades are translated rather than rewritten — the same contract the
-// bin insert keeps. Returns false and restores every position if it will not fit.
-function rippleMove(c, pt, from, lane, lane0) {
-  const F = t => Math.round(t * DOC.fps) / DOC.fps;
-  const len = F(dur(c));
-  const undo = DOC.clips.map(x => [x, x.t, x.lane]);
-  const restore = () => { for (const [x,t,l] of undo) { x.t = t; x.lane = l; } };
-
-  // LIFT — everything at or after where it sat closes up by its length.
-  for (const x of DOC.clips) if (x !== c && x.t >= F(from) - 1e-6) x.t = F(x.t - len);
-
-  // ⚠️ RE-READ THE TARGET FROM ITS ANCHOR, do not arithmetic it. A seam is a position
-  // ON a clip — the start of the one after it, or the end of the one before it at the
-  // tail — and whether it moved depends on whether THAT clip moved, not on whether the
-  // seam's old time happened to be past the origin. Anchors are live objects and the
-  // lift has already updated them, so simply reading them again is exact.
-  const to = pt.after ? F(pt.after.t) : (pt.before ? F(endOf(pt.before)) : 0);
-
-  // SET DOWN — open the hole and take the instant.
-  for (const x of DOC.clips) if (x !== c && x.t >= to - 1e-6) x.t = F(x.t + len);
-  c.t = to; c.lane = lane;
-
-  const fault = timelineFault();
-  if (fault) {
-    // `from` verbatim, NOT F(from): a project written by hand can hold an off-grid
-    // position, and "nothing moved" has to mean nothing moved.
-    restore(); c.t = from; c.lane = lane0;
-    note(`${fault}. Nothing moved — hold alt to place it there anyway.`, 'var(--warn)');
-    return false;
-  }
-  return true;
-}
-
 // Insert at `pt` and push everything from that instant onward to the right by
 // exactly the new clip's length. ⚠️ ALL LANES, not just the target one — rippling
 // a single lane would silently desync anything stacked against it.
