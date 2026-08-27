@@ -105,6 +105,19 @@
   /* A crossfade spans the lane stack, because overlap in TIME is what blends,
      not adjacency in a lane. Drawing it per-lane would imply layering. */
   #xfades { position:absolute; inset:0; pointer-events:none; z-index:2; }
+  /* Insert marker. Drawn into #xfades so it sits above the cards and eats no
+     pointer events — a drop target that swallows dragover would cancel the drag. */
+  .seam { position:absolute; width:3px; margin-left:-1px; border-radius:2px;
+          background:var(--accent, #7fd1ff); box-shadow:0 0 9px 2px var(--accent, #7fd1ff);
+          z-index:5; }
+  .seam.bad { background:var(--warn, #e8b339); box-shadow:0 0 9px 2px var(--warn, #e8b339); }
+  .seam.bad:after { content:attr(data-why); color:var(--warn, #e8b339); }
+  .seam:after { content:'insert here'; position:absolute; top:-19px; left:50%;
+                transform:translateX(-50%); font-size:10px; letter-spacing:.04em;
+                white-space:nowrap; color:var(--accent, #7fd1ff); }
+  /* The two clips the drop will land between. */
+  .clip.seam-l { box-shadow:inset -3px 0 0 0 var(--accent, #7fd1ff); }
+  .clip.seam-r { box-shadow:inset  3px 0 0 0 var(--accent, #7fd1ff); }
   .xf { position:absolute; border-radius:4px;
         background:repeating-linear-gradient(135deg,
           oklch(0.918 0.010 85 / 0.10) 0 3px,
@@ -300,6 +313,7 @@ let DOC = null, MEDIA = [], PASSES = [], OFFLINE = {}, SEL = null, EXTRA = 0;
 let COPYIN = true;   // drawBin() rebuilds the box; the choice must outlive it
 let RAF = null, T0 = 0, CLOCK = 0;
 const MON = {};
+let DRAG_MID = null, SEAM = null;   // media in flight from the bin, and where it would land
 
 const el=(t,c)=>{const e=document.createElement(t); if(c) e.className=c; return e;};
 const dur = c => (c.out - c.in) / c.rate;
@@ -492,14 +506,16 @@ function addNote(kind) {
       + '`cutroom add ' + (DOC ? DOC.name : '<project>') + ' <path>`.'
     : 'Media enters only when you put it here. Nothing is ever scanned.';
 }
-async function dropped(e, lane) {
+async function dropped(e, lane, atT) {
   const paths = pathsFromDrop(e.dataTransfer);
   if (!paths.length) { addNote('bad'); note('no path in that drop', 'var(--danger)'); return null; }
   addNote('ok');
   const b = await addPaths(paths);
   if (!b) return null;
   const first = b.added[0] || (b.already[0] && mediaOf(b.already[0]));
-  if (first && lane !== null) place(first.mid, lane, snap(e.offsetX / PX));
+  // Same lane-relative measure the bin path uses: e.offsetX is read from whatever
+  // sits under the cursor, which over a populated timeline is a clip card.
+  if (first && lane !== null) place(first.mid, lane, snap(atT != null ? atT : e.offsetX / PX));
   return b;
 }
 
@@ -548,7 +564,14 @@ function drawBin() {
         <div class="sub">${sub}</div>
       </div>`;
     r.title = m.path;
-    r.ondragstart = e => e.dataTransfer.setData('text/plain', 'mid:' + m.mid);
+    r.ondragstart = e => {
+      e.dataTransfer.setData('text/plain', 'mid:' + m.mid);
+      // dataTransfer payloads are unreadable during dragover — browsers only expose
+      // .types until the drop. So the in-flight mid is remembered here, which is the
+      // only way the timeline can show WHERE a bin drag will land while it is moving.
+      DRAG_MID = m.mid;
+    };
+    r.ondragend = () => { DRAG_MID = null; clearSeam(); };
     box.append(r);
   }
   const binEl = document.getElementById('bin');
@@ -744,14 +767,117 @@ function place(mid, lane, t) {
   draw(); save();
 }
 
-function drop(e, lane) {
-  e.preventDefault();
-  const text = e.dataTransfer.getData('text/plain') || '';
-  if (text.startsWith('mid:')) {
-    place(text.slice(4), lane, snap(e.offsetX/PX));
+// ── inserting between two clips ────────────────────────────────────────────
+// Every place a clip can be inserted. ⚠️ ONLY CLIP STARTS, never clip ends: at a
+// crossfade the two are different instants, and inserting at an END would drop the
+// new clip on top of a neighbour that began before it. Inserting at a START is
+// coherent everywhere — the new clip takes that instant and inherits whatever
+// crossfade the clip there already had with the one before it.
+function insertPoints() {
+  const byT = [...DOC.clips].sort((a,b)=>a.t-b.t);
+  // Stacked clips share a start, which would otherwise offer the same instant
+  // several times over with a different neighbour named each time.
+  const seen = new Set();
+  const pts = [];
+  byT.forEach((c,i) => {
+    const key = c.t.toFixed(6);
+    if (seen.has(key)) return;
+    seen.add(key);
+    pts.push({t:c.t, before:byT[i-1]||null, after:c});
+  });
+  if (byT.length) {
+    const last = byT.reduce((a,b)=> endOf(a)>=endOf(b)?a:b);
+    pts.push({t:endOf(last), before:last, after:null});   // append to the end
+  } else {
+    pts.push({t:0, before:null, after:null});
+  }
+  return pts;
+}
+// How far the clip before a seam reaches past it — i.e. the crossfade at that seam.
+function seamReach(pt) {
+  if (!pt.before) return 0;
+  const F = t => Math.round(t * DOC.fps) / DOC.fps;
+  return Math.max(0, F(endOf(pt.before) - F(pt.t)));
+}
+function nearestPoint(t) {
+  const pts = insertPoints();
+  return pts.reduce((a,b)=> Math.abs(b.t-t) < Math.abs(a.t-t) ? b : a);
+}
+function clearSeam() {
+  SEAM = null;
+  document.querySelectorAll('.seam').forEach(n=>n.remove());
+  document.querySelectorAll('.clip.seam-l,.clip.seam-r')
+          .forEach(n=>n.classList.remove('seam-l','seam-r'));
+}
+function showSeam(pt) {
+  clearSeam(); SEAM = pt;
+  // Would the clip in flight fit here? Saying so on the marker beats letting the
+  // drop fail — the director finds out while still holding it.
+  const m = DRAG_MID && mediaOf(DRAG_MID);
+  const F = t => Math.round(t * DOC.fps) / DOC.fps;
+  const reach = seamReach(pt);
+  const bad = !!m && reach > F(m.dur || 1.0) + 1e-6;
+  const bar = el('div', 'seam' + (bad ? ' bad' : ''));
+  const lanes = document.querySelectorAll('.lane').length || 1;
+  bar.style.left = pt.t*PX+'px';
+  bar.style.top = '0px';
+  bar.style.height = (lanes*LANE_H) + 'px';
+  if (bad) bar.dataset.why = `${reach.toFixed(2)}s crossfade — too short to fit`;
+  document.getElementById('xfades').append(bar);
+  // ⚠️ uid comes from the project document, which is a file a person can edit.
+  // Interpolating it into a selector is how a quote character becomes a crash
+  // mid-drag; match on the dataset instead so no uid is ever parsed as syntax.
+  const mark = (c,cls) => { if (!c) return;
+    for (const n of document.querySelectorAll('.clip'))
+      if (n.dataset.uid === c.uid) n.classList.add(cls); };
+  mark(pt.before,'seam-l'); mark(pt.after,'seam-r');
+}
+// Insert at `pt` and push everything from that instant onward to the right by
+// exactly the new clip's length. ⚠️ ALL LANES, not just the target one — rippling
+// a single lane would silently desync anything stacked against it.
+function insertAt(mid, lane, pt) {
+  const m = mediaOf(mid); if (!m) return;
+  // ⚠️ FRAME GRID, NOT PROBE SECONDS. m.dur is a float off ffprobe; the renderer
+  // frame-snaps every t and out. Rippling by the raw float walks the whole tail off
+  // the grid a fraction at a time and quietly changes gaps and crossfades by a frame.
+  const F = t => Math.round(t * DOC.fps) / DOC.fps;
+  const len = F(m.dur || 1.0);
+  const at  = F(pt.t);
+  // ⚠️ A clip shorter than the crossfade it lands in gets SWALLOWED — the clip before
+  // the seam would start before it and end after it, and the renderer says so in as
+  // many words: "a clip nested inside another cannot be expressed in a crossfade
+  // chain". Pushing the tail further does not save it, it just moves the nesting.
+  // Refuse, name the numbers, and leave the cut alone.
+  const reach = seamReach(pt);
+  if (reach > len + 1e-6) {
+    note(`${m.label} is ${len.toFixed(2)}s but this seam has a ${reach.toFixed(2)}s crossfade — `
+       + `it would sit entirely inside it and the cut would not export. `
+       + `Drop it at another seam, or hold alt to place it by hand.`, 'var(--warn)');
     return;
   }
-  dropped(e, lane);        // a file dragged straight from the desktop
+  for (const c of DOC.clips) if (c.t >= at - 1e-6) c.t = F(c.t + len);
+  DOC.clips.push({uid:newUid(), mid, lane, t:at, in:0, out:len, rate:1.0,
+                  label:m.label, note:''});
+  draw(); save();
+  note(`inserted ${m.label} — ${len.toFixed(2)}s, everything after it moved right`);
+}
+
+function drop(e, lane, atT) {
+  e.preventDefault();
+  const text = e.dataTransfer.getData('text/plain') || '';
+  const pt = SEAM;
+  if (atT == null) atT = e.offsetX/PX;     // desktop-file path keeps its old behaviour
+  clearSeam(); DRAG_MID = null;
+  if (text.startsWith('mid:')) {
+    // Hold alt to drop it exactly where the cursor is, the way it used to behave.
+    // Otherwise it INSERTS at the marked seam and ripples — landing a clip on top
+    // of the cut and making the director move every other clip by hand is not an
+    // edit, it is a chore.
+    if (pt && !e.altKey) insertAt(text.slice(4), lane, pt);
+    else place(text.slice(4), lane, snap(atT));
+    return;
+  }
+  dropped(e, lane, atT);   // a file dragged straight from the desktop
 }
 
 function draw() {
@@ -761,7 +887,13 @@ function draw() {
   const lanes = Math.max(1, EXTRA, ...DOC.clips.map(c=>c.lane+1));
   for (let i=0;i<lanes;i++) {
     const lane = el('div','lane'); lane.style.width=span*PX+'px';
-    lane.ondragover=e=>e.preventDefault(); lane.ondrop=e=>drop(e,i);
+    // ⚠️ NOT e.offsetX. The event bubbles up from whatever is under the cursor, and
+    // that is usually a CLIP CARD — offsetX would then be measured from the card's
+    // own left edge and the seam would jump. Measure against the lane itself.
+    const laneX = ev => (ev.clientX - lane.getBoundingClientRect().left) / PX;
+    lane.ondragover=e=>{ e.preventDefault();
+      if (DRAG_MID && !e.altKey) showSeam(nearestPoint(laneX(e))); else clearSeam(); };
+    lane.ondrop=e=>drop(e,i,laneX(e));
     lane.innerHTML = `<span class="tag">lane ${i+1}</span>`;
     for (const c of DOC.clips.filter(c=>c.lane===i)) lane.append(card(c));
     box.append(lane);
@@ -1142,7 +1274,14 @@ for (const s of SLOTS) {
 }
 
 // A file dropped anywhere else must not navigate the page away to it.
-window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('dragover', e => {
+  e.preventDefault();
+  // Hovering away from the timeline leaves a marker pointing at a seam the drop
+  // will not use. The lane handler cannot see that — it stops firing.
+  if (SEAM && !(e.target instanceof Element && e.target.closest('#lanes'))) clearSeam();
+});
+window.addEventListener('dragend', () => { DRAG_MID = null; clearSeam(); });
+window.addEventListener('drop',    () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop', e => e.preventDefault());
 
 // A boot that fails is fail-closed — draw() never runs, so nothing is lost —
