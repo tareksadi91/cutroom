@@ -394,12 +394,126 @@ function note(m, col) { const s=document.getElementById('status');
 // the whole document goes over the wire every time, so one more save after the
 // current one lands carries the latest state, however many edits it merged.
 let SAVING = false, SAVE_AGAIN = false, THEIRS = null;
+// The last document the server confirmed. It is the common ancestor of the two
+// edits in a conflict, and without it a 409 cannot tell "we changed different
+// clips" from "we changed the same one" — only that the numbers differ.
+let BASE = null;
+function baseline() { BASE = DOC ? JSON.parse(JSON.stringify(DOC)) : null; }
+// Do two versions of one clip differ MEANINGFULLY?
+//
+// ⚠️ NOT JSON.stringify, and this is the whole reason the comparison is written
+// out by hand. render.snap() returns round(round(s * fps) / fps, 6), so the file
+// carries 4.041667 where the page computed 4.041666666666667 from a drag. Two
+// numbers that name the same frame are the same edit point, and comparing them
+// as strings makes every clip the page has ever saved look permanently modified
+// by somebody else — the changed sets stop being disjoint, and the merge decays
+// silently back into the banner it exists to remove.
+//
+// EPS is half a millisecond: far above 6-decimal rounding (5e-7) and far below
+// one frame (0.0417s at 24fps), so it swallows the serialisation and nothing
+// a human could have meant.
+const EPS = 5e-4;
+function clipDiffers(a, b) {
+  const ks = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of ks) {
+    const x = a[k], y = b[k];
+    if (typeof x === 'number' && typeof y === 'number') {
+      if (Math.abs(x - y) > EPS) return true;
+    } else if (x !== y) return true;
+  }
+  return false;
+}
+// Which clips differ between two documents, by uid.
+function changedUids(from, to) {
+  const was = new Map((from.clips || []).map(c => [c.uid, c]));
+  const out = new Set();
+  for (const c of (to.clips || [])) {
+    const old = was.get(c.uid);
+    if (!old || clipDiffers(old, c)) out.add(c.uid);
+  }
+  return out;
+}
+function sameUidSet(a, b) {
+  const x = (a.clips || []).map(c => c.uid), y = (b.clips || []).map(c => c.uid);
+  return x.length === y.length && x.every((u, i) => u === y[i]);
+}
+// The fields that place a clip in TIME or SPACE. Everything else is a note on
+// it. `in`/`out`/`rate` are geometry too: they set how far a clip extends, and
+// a clip's extent is what the clip after it abuts.
+const GEOM = ['mid', 'lane', 't', 'in', 'out', 'rate'];
+function movesGeometry(from, to) {
+  const was = new Map((from.clips || []).map(c => [c.uid, c]));
+  return (to.clips || []).some(c => {
+    const old = was.get(c.uid);
+    if (!old) return true;
+    return GEOM.some(k => {
+      const x = old[k], y = c[k];
+      return (typeof x === 'number' && typeof y === 'number')
+        ? Math.abs(x - y) > EPS : x !== y;
+    });
+  });
+}
+// Can the page adopt the other writer's document without asking?
+//
+// ⚠️⚠️ DISJOINT CLIPS IS NOT ENOUGH, AND THIS IS THE WHOLE RULE. Timeline
+// geometry spans clips, so two edits to DIFFERENT clips can still compose into
+// a cut neither writer meant. The case that killed the first version of this
+// function: A ends at 10 and B starts at 10. The page extends A.out to 12,
+// meaning a two-second overlap. The agent moves B.t to 12, meaning a two-second
+// gap. The uids are disjoint, every field merges cleanly, and the result is a
+// clean abut at 12 — intended by NOBODY, and no validation can catch it,
+// because a gap and an overlap are both legal cuts.
+//
+// So: if BOTH writers moved geometry, there is no honest merge and the director
+// decides. If only one side moved geometry and the other only wrote a label or
+// a note, the two cannot interact and the merge is safe. That is a narrow
+// claim on purpose.
+function rebaseable(theirs) {
+  if (!BASE || !theirs || !Array.isArray(theirs.clips)) return false;
+  if (!sameUidSet(BASE, theirs) || !sameUidSet(BASE, DOC)) return false;
+  // A duplicate uid makes every by-uid lookup below ambiguous.
+  const uids = BASE.clips.map(c => c.uid);
+  if (new Set(uids).size !== uids.length) return false;
+  if (movesGeometry(BASE, DOC) && movesGeometry(BASE, theirs)) return false;
+  // Anything outside the clip list — fps, resolution, name — is a whole-cut
+  // property and there is no honest way to merge two of them.
+  const shell = d => JSON.stringify(
+    Object.fromEntries(Object.entries(d)
+      .filter(([k]) => k !== 'clips' && k !== 'version' && k !== 'media')));
+  if (shell(BASE) !== shell(theirs) || shell(BASE) !== shell(DOC)) return false;
+  const mine = changedUids(BASE, DOC), theirsChanged = changedUids(BASE, theirs);
+  for (const u of theirsChanged) if (mine.has(u)) return false;
+  return true;
+}
+// Apply the other writer's clip changes onto the live document IN PLACE.
+//
+// In place is not a detail — it is the same rule the 200 path states. Every
+// card's pointer handler and every inspector field closes over a clip object in
+// DOC.clips, so assigning DOC = theirs makes orphans of all of them and the
+// next drag mutates something no longer on screen.
+function rebaseOnto(theirs) {
+  const byUid = new Map(DOC.clips.map(c => [c.uid, c]));
+  for (const u of changedUids(BASE, theirs)) {
+    const live = byUid.get(u), incoming = theirs.clips.find(c => c.uid === u);
+    if (!live || !incoming) return false;
+    for (const k of Object.keys(live)) if (!(k in incoming)) delete live[k];
+    Object.assign(live, incoming);
+  }
+  DOC.version = theirs.version;
+  return true;
+}
 async function saveOnce() {
   let r, body;
+  // The EXACT bytes we are about to send. On a 200 this — not the live DOC — is
+  // what the server confirmed, and the difference is an edit: the director can
+  // drag while the PUT is away, and baselining the live document would record
+  // that unsaved drag as already-saved. `mine` would then come back empty on a
+  // later conflict and rebaseOnto() would quietly overwrite it from theirs.
+  const outbound = JSON.stringify(DOC);
   try {
     r = await fetch('/project', {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(DOC)
+      body: outbound
     });
     body = await r.json();
   } catch (e) {
@@ -421,6 +535,17 @@ async function saveOnce() {
     // So: hold the server's copy aside, keep the local timeline exactly as it
     // is, stop the loop, and make the director choose. Nothing is written
     // until they do.
+    //
+    // FIRST, though: most conflicts in practice are not conflicts at all. The
+    // agent retimes one clip while the director drags another, and the guard
+    // fires only because it compares one integer against the whole document.
+    // When the two edits name disjoint clips, take theirs onto ours and carry
+    // on — no banner, no button, nothing held off disk.
+    if (rebaseable(body) && rebaseOnto(body)) {
+      SAVE_AGAIN = true;         // re-fire carrying both edits
+      draw(); reselect();
+      return note('merged an edit from the cut room');
+    }
     THEIRS = body; SAVE_AGAIN = false;
     conflictNote();
   } else if (r.status === 422) {
@@ -436,6 +561,9 @@ async function saveOnce() {
     // 200 the server's document is our own body with version + 1, so the
     // number is the only thing that is actually new.
     DOC.version = body.version;
+    // The ancestor is the document that LANDED, at the version it landed as.
+    BASE = JSON.parse(outbound);
+    BASE.version = body.version;
     note('saved');
   }
 }
@@ -468,6 +596,7 @@ function takeTheirs() {
   // Adopting a whole new object graph orphans every card and inspector field
   // bound to the old one, so re-render and re-bind, selection and all.
   DOC = THEIRS; THEIRS = null;
+  baseline();
   draw(); reselect();
   note('reloaded from disk — your unsaved edits were discarded', 'var(--warn)');
 }
@@ -658,6 +787,7 @@ function adopt(project) {
   // copy-in of 45 clips is a second or more of exactly that window.
   DOC.media = project.media || [];
   DOC.version = project.version;
+  baseline();
   MEDIA = DOC.media.map(m => ({...m}));
   markOffline(); drawBin(); draw(); reselect();
 }
@@ -1532,6 +1662,7 @@ async function boot() {
   try {
     const b = await getJSON('/project');
     DOC = b.project;
+    baseline();
     MEDIA = (DOC.media || []).map(m => ({...m}));
     PASSES = b.passes || [];
     OFFLINE = {};

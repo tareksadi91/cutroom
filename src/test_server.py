@@ -1056,6 +1056,230 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+
+
+def test_the_page_rebases_itself_when_the_two_edits_touch_different_clips():
+    """The collaboration case: the agent retimes one clip while the director
+    drags another.
+
+    Nothing about those two edits is in conflict — they name different clips —
+    but the version guard is document-wide, so the director's next save 409s and
+    the banner blocks EVERY subsequent save until a button is clicked. The page
+    then holds work with no disk backing, which is the one thing this tool may
+    never do.
+
+    So the page re-bases itself when it safely can: same clip set on both sides,
+    and disjoint changed-uid sets. Anything else — an add, a delete, or two
+    edits naming the same clip — still stops and asks, because `t` is relational
+    and a blind merge yields a cut neither writer intended that LOOKS fine.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> save-loop")
+    b = html.index("// <<< save-loop")
+    region = html[a:b]
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the save loop is JS)")
+        return
+
+    harness = r"""
+const STATUS = {textContent: '', style: {}, clicks: {},
+  append(...xs) { for (const x of xs) {
+      if (typeof x === 'string') this.textContent += x;
+      else { this.textContent += x.textContent; this.clicks[x.textContent] = x.onclick; }
+  } }};
+const INSP = {innerHTML: ''};
+const document = {getElementById: id => id === 'status' ? STATUS : INSP};
+const el = (t, c) => ({tag: t, textContent: '', onclick: null});
+let DOC = null, SEL = null, DRAWS = 0;
+const MULTI = new Set();
+function draw() { DRAWS++; }
+function inspect() {}
+function clearSel() { SEL = null; }
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// ---- 1. disjoint edits re-base silently ------------------------------------
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, rate: 1}, {uid: 'c001', t: 9, rate: 1}]};
+baseline();                       // what the server last confirmed
+const HELD = DOC.clips[0];        // the object a card's handler closes over
+DOC.clips[0].t = 5;               // the director drags c000
+// the agent annotated c001 — a note cannot interact with a position
+const SERVER = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
+                                    {uid: 'c001', t: 9, rate: 1, note: 'ungraded'}]};
+let calls = 0, sentLast = null;
+globalThis.fetch = async (url, opts) => {
+  calls++;
+  sentLast = JSON.parse(opts.body);
+  if (calls === 1) return {status: 409, ok: false, json: async () => SERVER};
+  return {status: 200, ok: true, json: async () => ({version: sentLast.version + 1})};
+};
+await save();
+if (/NOT SAVED/.test(STATUS.textContent))
+  fail('blocked on a conflict it could have re-based: ' + STATUS.textContent);
+if (calls !== 2) fail('did not re-save after re-basing (' + calls + ' PUTs)');
+if (DOC.clips[0].t !== 5) fail('lost the director drag');
+if (DOC.clips[1].note !== 'ungraded') fail('lost the agent note');
+if (DOC.clips[0] !== HELD) fail('replaced the clip object graph — cards are now orphans');
+if (DOC.version !== 10) fail('did not land on the server version');
+if (STATUS.textContent !== 'saved') fail('did not report the save: ' + STATUS.textContent);
+
+// ---- 1b. BOTH sides move geometry on DIFFERENT clips: still stops and asks ---
+// This is the case the feature was originally built for — the agent retimes one
+// clip while the director drags another — and it is deliberately NOT merged.
+// Two geometry edits compose, so disjoint uids prove nothing. Recorded as a test
+// so nobody re-widens the rule without meeting the trap in section 4 first.
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, rate: 1}, {uid: 'c001', t: 9, rate: 1}]};
+baseline();
+DOC.clips[0].t = 5;
+const BOTHGEO = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
+                                     {uid: 'c001', t: 9, rate: 0.75}]};
+calls = 0;
+globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => BOTHGEO}; };
+await save();
+if (!/NOT SAVED/.test(STATUS.textContent))
+  fail('merged two geometry edits on different clips: ' + STATUS.textContent);
+if (DOC.clips[0].t !== 5) fail('lost the drag');
+
+// ---- 2. the SAME clip on both sides still stops and asks --------------------
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;   // a fresh page
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, rate: 1}]};
+baseline();
+DOC.clips[0].t = 5;
+const CLASH = {version: 9, clips: [{uid: 'c000', t: 0, rate: 0.5}]};
+calls = 0;
+globalThis.fetch = async () => {
+  calls++;
+  return {status: 409, ok: false, json: async () => CLASH};
+};
+await save();
+if (!/NOT SAVED/.test(STATUS.textContent))
+  fail('merged two edits naming the same clip: ' + STATUS.textContent);
+if (DOC.clips[0].t !== 5) fail('lost the drag on the clash path');
+
+// ---- 3b. 6-decimal server rounding is NOT a change -------------------------
+// render.snap() returns round(round(s*fps)/fps, 6), so the file carries
+// 4.041667 where the page computed 4.041666666666667 from a drag. Comparing
+// those as strings makes every clip the page has ever saved look like somebody
+// else's edit, the disjointness test fails more and more often, and the merge
+// decays silently back to the banner it was built to remove.
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;   // a fresh page
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, out: 4.041666666666667, rate: 1},
+                           {uid: 'c001', t: 9, out: 4.041666666666667, rate: 1}]};
+baseline();
+DOC.clips[0].t = 5;                       // the director drags c000
+// the agent labelled c001; the server hands back BOTH clips 6-dp rounded
+const ROUNDED = {version: 9, clips: [{uid: 'c000', t: 0, out: 4.041667, rate: 1},
+                                     {uid: 'c001', t: 9, out: 4.041667, rate: 1,
+                                      label: 'B'}]};
+calls = 0;
+globalThis.fetch = async (url, opts) => {
+  calls++; sentLast = JSON.parse(opts.body);
+  if (calls === 1) return {status: 409, ok: false, json: async () => ROUNDED};
+  return {status: 200, ok: true, json: async () => ({version: sentLast.version + 1})};
+};
+await save();
+if (/NOT SAVED/.test(STATUS.textContent))
+  fail('6-dp rounding read as a conflicting edit: ' + STATUS.textContent);
+if (DOC.clips[0].t !== 5) fail('lost the drag across the rounding case');
+if (DOC.clips[1].label !== 'B') fail('lost the agent label across the rounding case');
+
+// ---- 3c. a real sub-frame change is still a change -------------------------
+// The tolerance may not swallow an edit. Half a frame at 24fps is 0.0208s.
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;   // a fresh page
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, out: 4.0, rate: 1, label: 'x'}]};
+baseline();
+DOC.clips[0].label = 'renamed';        // page writes only a label
+const REAL = {version: 9, clips: [{uid: 'c000', t: 0, out: 4.03, rate: 1, label: 'x'}]};
+calls = 0;
+globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => REAL}; };
+await save();
+if (!/NOT SAVED/.test(STATUS.textContent))
+  fail('swallowed a real 0.03s trim as rounding noise: ' + STATUS.textContent);
+if (DOC.clips[0].label !== 'renamed') fail('lost the page label');
+
+// ---- 3. a clip added on either side still stops and asks -------------------
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;   // a fresh page
+DOC = {version: 3, clips: [{uid: 'c000', t: 0, rate: 1}]};
+baseline();
+DOC.clips[0].t = 5;
+const ADDED = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
+                                   {uid: 'c009', t: 40, rate: 1}]};
+calls = 0;
+globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => ADDED}; };
+await save();
+if (!/NOT SAVED/.test(STATUS.textContent))
+  fail('merged across a changed clip set: ' + STATUS.textContent);
+// ---- 4. THE GEOMETRY TRAP: disjoint clips, wrong cut ----------------------
+// Codex's case, and it is the reason the disjoint-uid rule alone is not enough.
+// A ends at 10, B starts at 10. The page extends A.out to 12 meaning an OVERLAP.
+// The agent moves B.t to 12 meaning a GAP. Different clips, clean merge, and the
+// result is an abut at 12 that neither writer asked for. No validation catches
+// it: a gap and an overlap are both legal.
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;
+DOC = {version: 3, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1},
+                           {uid: 'B', t: 10, in: 0, out: 4, lane: 0, rate: 1}]};
+baseline();
+DOC.clips[0].out = 12;                      // page: two seconds of overlap
+const GEOTRAP = {version: 9, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1},
+                                     {uid: 'B', t: 12, in: 0, out: 4, lane: 0, rate: 1}]};
+calls = 0;
+globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => GEOTRAP}; };
+await save();
+if (!/NOT SAVED/.test(STATUS.textContent))
+  fail('MERGED TWO GEOMETRY EDITS INTO A CUT NEITHER WRITER MEANT: ' + STATUS.textContent);
+if (DOC.clips[0].out !== 12) fail('lost the page trim on the geometry-trap path');
+
+// ---- 5. one side geometry, other side a label — still merges ---------------
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;
+DOC = {version: 3, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1},
+                           {uid: 'B', t: 10, in: 0, out: 4, lane: 0, rate: 1}]};
+baseline();
+DOC.clips[0].out = 12;                      // page moves geometry
+const NOTEONLY = {version: 9, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1},
+                                      {uid: 'B', t: 10, in: 0, out: 4, lane: 0, rate: 1,
+                                       label: '2.4'}]};
+calls = 0;
+globalThis.fetch = async (url, opts) => {
+  calls++; sentLast = JSON.parse(opts.body);
+  if (calls === 1) return {status: 409, ok: false, json: async () => NOTEONLY};
+  return {status: 200, ok: true, json: async () => ({version: sentLast.version + 1})};
+};
+await save();
+if (/NOT SAVED/.test(STATUS.textContent))
+  fail('refused a label-only edit that cannot interact with geometry: ' + STATUS.textContent);
+if (DOC.clips[0].out !== 12) fail('lost the page trim');
+if (DOC.clips[1].label !== '2.4') fail('lost the agent label');
+
+// ---- 6. a drag made WHILE the PUT is away is not blessed as saved -----------
+// baseline() used to clone the LIVE document on a 200. The server confirmed the
+// bytes we sent, not the drag that landed after we sent them — recording the
+// latter as the ancestor makes `mine` empty on the next conflict and lets
+// rebaseOnto() overwrite an edit the director can still see on screen.
+STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;
+DOC = {version: 3, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1}]};
+baseline();
+calls = 0;
+globalThis.fetch = async (url, opts) => {
+  calls++; sentLast = JSON.parse(opts.body);
+  if (calls === 1) DOC.clips[0].t = 4;      // the director drags mid-flight
+  return {status: 200, ok: true, json: async () => ({version: sentLast.version + 1})};
+};
+await save();
+if (BASE.clips[0].t === 4)
+  fail('BASE recorded an in-flight drag as already saved — it can now be overwritten');
+if (DOC.clips[0].t !== 4) fail('lost the in-flight drag outright');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "rebase.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_the_page_says_so_when_a_drop_carries_no_path():
     """A browser is not allowed to hand a page a dropped file's absolute path,
     and cutroom may not go looking for it by name. The drop target must
@@ -1770,8 +1994,11 @@ def test_adopting_a_server_document_never_bins_a_local_edit():
         return
 
     harness = r"""
-let DOC = null, MEDIA = [], OFFLINE = {};
+let DOC = null, MEDIA = [], OFFLINE = {}, BASE = null;
 function markOffline() {} function drawBin() {} function draw() {} function reselect() {}
+// adopt() re-baselines: after it, the page's ancestor for conflict detection is
+// the document the server just confirmed. Defined in the save-loop region.
+function baseline() { BASE = DOC ? JSON.parse(JSON.stringify(DOC)) : null; }
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 
