@@ -1644,6 +1644,11 @@ def test_the_razor_cuts_on_a_frame_and_loses_nothing():
 const dur = c => (c.out - c.in) / c.rate;
 const endOf = c => c.t + dur(c);
 let SEL = null, DRAWS = 0, SAVES = 0, NOTES = [];
+// The razor has to CLEAR the multi-selection, not just move the lead: leaving it
+// populated made "cut, then backspace the tail" delete every clip that happened to
+// be selected before the cut as well.
+let MULTI = new Set();
+function clearSel() { SEL = null; MULTI.clear(); }
 const newUid = () => 'u' + (++DRAWS);
 function draw() {} function save() { SAVES++; } function inspect() {}
 function note(m) { NOTES.push(m); }
@@ -1725,6 +1730,20 @@ if (SAVES !== 0) fail('saved for a cut that did not happen');
 CLOCK = 0; razor();
 CLOCK = 1; razor();
 if (DOC.clips.length !== 1) fail('cut at an edge made an empty clip');
+
+// A CUT ENDS THE OLD SELECTION. The right half is selected and nothing else is,
+// because the move this exists for is "cut, then delete the tail" — and delete
+// takes the whole selection.
+DOC.clips = [{uid:'c0', mid:'m01', lane:0, t:0, in:0, out:4, rate:1.0,
+              label:'a', note:''},
+             {uid:'c1', mid:'m01', lane:0, t:4, in:0, out:4, rate:1.0,
+              label:'b', note:''}];
+SEL = 'c1'; MULTI = new Set(['c0']);      // two clips selected before the cut
+CLOCK = 2; razor();
+if (MULTI.size !== 0)
+  fail('the razor left ' + MULTI.size + ' clip(s) selected from before the cut — ' +
+       'a following backspace would have deleted them too');
+if (!SEL) fail('the razor selected nothing');
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:

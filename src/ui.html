@@ -134,6 +134,12 @@
           transition:border-color .15s var(--ease), box-shadow .15s var(--ease); }
   .clip:hover { border-color:oklch(0.918 0.010 85 / 0.30); }
   .clip.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  /* The LEAD clip is the one the inspector is editing. Without this a multi-select
+     gives no clue which clip's fields are in the panel. */
+  .clip.sel.lead { box-shadow:0 0 0 2px var(--accent); }
+  .marquee { position:absolute; z-index:6; pointer-events:none;
+             border:1px solid var(--accent); border-radius:2px;
+             background:color-mix(in oklch, var(--accent) 14%, transparent); }
   .clip .id { display:block; font:600 13px/1 var(--sans); color:var(--ink);
               padding:9px 9px 0; white-space:nowrap; pointer-events:none; }
   .clip .dur { display:block; font:400 11px/1 var(--mono); color:var(--ink-2);
@@ -319,6 +325,23 @@ const LANE_H = 76;          // keep in step with .lane height
 let ZI = 1, PX = ZOOMS[ZI];
 const SNAP = 0.25;
 let DOC = null, MEDIA = [], PASSES = [], OFFLINE = {}, SEL = null, EXTRA = 0;
+// SEL is the clip the INSPECTOR is bound to; MULTI is everything else that is
+// selected with it. Kept apart on purpose: the inspector edits exactly one clip's
+// fields, and a set of one would have made every field ambiguous.
+let MULTI = new Set(), DRAGGING = false;
+const isSel = uid => uid === SEL || MULTI.has(uid);
+const selected = () => DOC.clips.filter(c => isSel(c.uid));
+function clearSel() { SEL = null; MULTI.clear(); }
+// ⚠️ Never call draw() to reflect a selection change that is about to be followed by
+// a drag: draw() replaces every card, and setPointerCapture on a card that has just
+// been detached from the document silently does nothing and the drag never starts.
+// Toggle the classes on the cards that are already there instead.
+function paintSelection() {
+  for (const n of document.querySelectorAll('.clip')) {
+    n.classList.toggle('sel',  isSel(n.dataset.uid));
+    n.classList.toggle('lead', n.dataset.uid === SEL);
+  }
+}
 let COPYIN = true;   // drawBin() rebuilds the box; the choice must outlive it
 let RAF = null, T0 = 0, CLOCK = 0;
 const MON = {};
@@ -433,9 +456,15 @@ function takeTheirs() {
 }
 // Re-bind the inspector after the clip objects have been replaced wholesale.
 function reselect() {
+  // Adopting the server's document (a conflict resolved with "take theirs") can
+  // remove clips the selection still names. A stale uid in MULTI is invisible
+  // until a shift-click promotes it to lead and the real selection vanishes.
+  const live = new Set(DOC ? DOC.clips.map(x => x.uid) : []);
+  for (const uid of [...MULTI]) if (!live.has(uid)) MULTI.delete(uid);
+  if (SEL && !live.has(SEL)) SEL = null;
   const c = SEL && DOC.clips.find(x => x.uid === SEL);
   if (c) return inspect(c);
-  SEL = null;
+  clearSel();
   document.getElementById('insp').innerHTML =
     '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>';
 }
@@ -645,7 +674,8 @@ function drawRuler() {
 function card(c) {
   const w = Math.max(3, dur(c)*PX);
   const off = !!OFFLINE[c.uid];
-  const d = el('div','clip'+(SEL===c.uid?' sel':'')+(w<46?' narrow':'')+(off?' offline':''));
+  const d = el('div','clip'+(isSel(c.uid)?' sel':'')+(SEL===c.uid?' lead':'')
+             +(w<46?' narrow':'')+(off?' offline':''));
   d.style.left = c.t*PX+'px'; d.style.width = w+'px';
   d.style.background = tint(c, 0.255);
   d.innerHTML = `<span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
@@ -661,7 +691,32 @@ function card(c) {
     const src = mediaOf(c.mid); const cap = src && src.dur ? src.dur : out0;
     const laneCount = document.querySelectorAll('.lane').length;
     let lane = lane0;
-    SEL=c.uid; inspect(c); d.classList.add('sel');
+    // Shift+click adds or removes this clip from the selection and starts no drag.
+    if (e.shiftKey) {
+      if (isSel(c.uid)) {
+        MULTI.delete(c.uid);
+        if (SEL === c.uid) { SEL = [...MULTI][0] || null; MULTI.delete(SEL); }
+      } else {
+        if (SEL && SEL !== c.uid) MULTI.add(SEL);
+        SEL = c.uid;
+      }
+      draw();
+      const lead = SEL && DOC.clips.find(x=>x.uid===SEL);
+      if (lead) inspect(lead); else reselect();
+      return;
+    }
+    // Grabbing a clip that is already part of a selection carries the whole
+    // selection. Grabbing anything else selects just that clip, as before.
+    if (!isSel(c.uid)) { MULTI.clear(); SEL = c.uid; }
+    else if (SEL !== c.uid) { MULTI.add(SEL); MULTI.delete(c.uid); SEL = c.uid; }
+    paintSelection(); inspect(c);
+    // The whole selection travels together, so every member's start and lane is
+    // recorded BEFORE anything moves. Deltas are applied to these snapshots, never
+    // accumulated onto live values, or the group would drift a frame per event.
+    const group = mode==='move' ? selected() : [c];
+    const g0 = group.map(x => [x, x.t, x.lane]);
+    const minLane = Math.min(...g0.map(([,,L]) => L));
+    const minT    = Math.min(...g0.map(([,T]) => T));
     // ⚠️ A CLIP ALREADY ON THE TIMELINE DRAGS FREELY — no seam, no ripple, on purpose.
     // Rippling was tried and removed 2026-08-27: dragging one clip ONTO another is how
     // a crossfade gets made here, and that is the common act. Snapping every drag to the
@@ -669,12 +724,22 @@ function card(c) {
     // MEDIA PANEL still ripples, because a clip arriving from outside has no position to
     // respect and landing it on top of the cut was never what anyone meant.
     if (mode==='move') d.classList.add('dragging');
-    d.setPointerCapture(e.pointerId); e.preventDefault();
+    DRAGGING = true;
+    // Capture is an optimisation — it keeps the drag alive when the cursor outruns
+    // the card. It is NOT load-bearing, and letting it throw here killed the whole
+    // gesture: the move and up handlers below never bound, so the clip just sat there.
+    try { d.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
 
     d.onpointermove = ev => {
       const ds=(ev.clientX-x0)/PX;
       if (mode==='move') {
-        c.t = snap(t0+ds, ev.altKey);
+        // The grabbed clip sets the delta; everyone else follows it, so the shape of
+        // the selection is rigid and only its position changes.
+        // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
+        // per-clip clamping folds the whole selection onto t=0, losing the shape AND
+        // stacking clips on one instant, which the renderer rejects as a full overlap.
+        const dt = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
         // Vertical: one lane per LANE_H of travel. Dropping one row past the
         // last lane creates a new one, so a clip never needs a button first.
         const want = lane0 + Math.round((ev.clientY-y0)/LANE_H);
@@ -684,7 +749,15 @@ function card(c) {
           document.querySelectorAll('.lane').forEach((L,i) =>
             L.classList.toggle('target', i===lane));
         }
-        d.style.top = (8 + (lane-lane0)*LANE_H) + 'px';
+        // Same clamp on the vertical: the group hits lane 0, not the grabbed clip.
+        const dl = Math.max(lane - lane0, -minLane);
+        for (const [x, xt, xl] of g0) {
+          x.t = xt + dt;
+          if (x === c) continue;                     // the grabbed card is redrawn below
+          const n = document.querySelector(`.clip[data-uid="${CSS.escape(x.uid)}"]`);
+          if (n) { n.style.left = x.t*PX+'px'; n.style.top = (8 + dl*LANE_H) + 'px'; }
+        }
+        d.style.top = (8 + dl*LANE_H) + 'px';
       }
       else if (mode==='l') { const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
         c.t = snap(t0+(w2-in0)/c.rate, ev.altKey); c.in = w2; }
@@ -694,15 +767,23 @@ function card(c) {
       d.classList.toggle('narrow', nw<46);
       d.querySelector('.dur').textContent = dur(c).toFixed(2)+'s';
     };
-    d.onpointerup = () => {
-      d.onpointermove=d.onpointerup=null;
+    // pointercancel gets the SAME handler. A gesture can be taken away — a touch
+    // becoming a scroll, the window losing focus, the OS claiming the pointer — and
+    // when that happened the drag never finished: the move was left uncommitted and
+    // DRAGGING stayed true, which silently disabled Escape, select-all and delete
+    // for the rest of the session.
+    d.onpointerup = d.onpointercancel = () => {
+      d.onpointermove=d.onpointerup=d.onpointercancel=null;
+      DRAGGING = false;
       d.classList.remove('dragging');
       document.querySelectorAll('.lane').forEach(L=>L.classList.remove('target'));
-      c.lane = lane;
-      // c.lane, not `lane` — a refused ripple puts the original lane back, and opening
-      // a fresh lane for a move that did not happen leaves an empty one behind.
-      if (c.lane >= laneCount) EXTRA = c.lane + 1;   // dropped past the last lane
-      for (const k of ['t','in','out']) c[k]=Math.round(c[k]*1000)/1000;
+      const dl = Math.max(lane - lane0, -minLane);
+      if (mode==='move') for (const [x,,xl] of g0) x.lane = xl + dl;
+      else c.lane = lane;
+      const top = DOC.clips.length ? Math.max(...DOC.clips.map(x=>x.lane)) : 0;
+      if (top >= laneCount) EXTRA = top + 1;         // dropped past the last lane
+      for (const x of (mode==='move' ? group : [c]))
+        for (const k of ['t','in','out']) x[k]=Math.round(x[k]*1000)/1000;
       // An emptied trailing lane disappears rather than lingering as a gap.
       const used = DOC.clips.length ? Math.max(...DOC.clips.map(x=>x.lane))+1 : 1;
       EXTRA = Math.min(EXTRA, used + 1);
@@ -710,6 +791,61 @@ function card(c) {
     };
   };
   return d;
+}
+
+// ── rubber-band selection ──────────────────────────────────────────────────
+// Drag across empty timeline and every clip the band TOUCHES is selected. Touch,
+// not enclose: a band you have to draw around a 22-second clip is a band you have
+// to scroll to draw, and the clip you meant was under the cursor the whole time.
+// Shift keeps what was already selected, so several sweeps build one selection.
+function marquee(ev, lane0) {
+  const box = document.getElementById('lanes');
+  const r0 = box.getBoundingClientRect();
+  const x0 = ev.clientX - r0.left, y0 = ev.clientY - r0.top + box.scrollTop;
+  const keep = ev.shiftKey ? new Set([...MULTI, SEL].filter(Boolean)) : new Set();
+  const band = el('div','marquee');
+  document.getElementById('xfades').append(band);
+  let moved = false;
+
+  const id = ev.pointerId;
+  const to = e => {
+    if (e.pointerId !== id) return;          // another pointer is not this gesture
+    const x1 = e.clientX - r0.left, y1 = e.clientY - r0.top + box.scrollTop;
+    if (Math.abs(x1-x0) > 3 || Math.abs(y1-y0) > 3) moved = true;
+    const L = Math.min(x0,x1), T = Math.min(y0,y1);
+    const W = Math.abs(x1-x0), H = Math.abs(y1-y0);
+    band.style.left=L+'px'; band.style.top=T+'px';
+    band.style.width=W+'px'; band.style.height=H+'px';
+    // Pixels to (seconds, lane) — the two axes of this timeline.
+    const tA = L/PX, tB = (L+W)/PX;
+    const lA = Math.floor(T/LANE_H), lB = Math.floor((T+H)/LANE_H);
+    const hit = new Set(keep);
+    for (const c of DOC.clips)
+      if (c.lane >= lA && c.lane <= lB && c.t < tB && endOf(c) > tA) hit.add(c.uid);
+    SEL = [...hit][0] || null;
+    MULTI = new Set([...hit].slice(1));
+    paintSelection();
+  };
+  const up = e => {
+    if (e.pointerId !== id) return;
+    window.removeEventListener('pointermove', to);
+    window.removeEventListener('pointerup', up);
+    // pointercancel fires when the gesture is taken away (a touch turning into a
+    // scroll, the window losing focus). Without it the band and both listeners
+    // stayed on the page for the rest of the session.
+    window.removeEventListener('pointercancel', up);
+    band.remove();
+    // A click with no drag on empty space means "deselect", which is the only way
+    // back to no selection at all.
+    if (!moved && !e.shiftKey) { clearSel(); paintSelection(); reselect(); return; }
+    const lead = SEL && DOC.clips.find(x=>x.uid===SEL);
+    if (lead) inspect(lead); else reselect();
+    if (MULTI.size) note(`${MULTI.size+1} clips selected — drag any one to move them together`);
+  };
+  window.addEventListener('pointermove', to);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+  ev.preventDefault();
 }
 
 // >>> razor
@@ -768,7 +904,10 @@ function razor() {
   if (!n) return note(stuck
     ? 'no frame-exact seam near the playhead at that rate — nothing cut'
     : 'nothing under the playhead to cut', 'var(--warn)');
-  SEL = last.uid;
+  // ⚠️ clearSel(), not just SEL=. Leaving MULTI populated meant the razor's own
+  // "cut, then ⌫ the tail" move deleted every clip that happened to be selected
+  // BEFORE the cut as well.
+  clearSel(); SEL = last.uid;
   draw(); save(); inspect(last);
   note(`cut ${n} clip${n > 1 ? 's' : ''} at ${last.t.toFixed(2)}s`
         + (stuck ? ` · ${stuck} skipped, no frame-exact seam at that rate` : ''),
@@ -945,6 +1084,13 @@ function draw() {
     lane.ondragover=e=>{ e.preventDefault();
       if (DRAG_MID && !e.altKey) showSeam(nearestPoint(laneX(e))); else clearSeam(); };
     lane.ondrop=e=>drop(e,i,laneX(e));
+    // Rubber band. Only from the lane's own background — a pointerdown that
+    // started on a clip is that clip's drag and must not also start a selection.
+    lane.onpointerdown = ev => {
+      if (ev.target !== lane && !ev.target.classList.contains('tag')) return;
+      if (ev.button !== 0) return;
+      marquee(ev, i);
+    };
     lane.innerHTML = `<span class="tag">lane ${i+1}</span>`;
     for (const c of DOC.clips.filter(c=>c.lane===i)) lane.append(card(c));
     box.append(lane);
@@ -1306,10 +1452,25 @@ document.addEventListener('keydown', e => {
   if (e.key==='s'||e.key==='S') { e.preventDefault(); razor(); }
   if (e.key==='Home') scrubTo(0);
   if (e.key==='End')  scrubTo(totalLen());
+  // ⚠️ Anything that calls draw() while a drag is live replaces the card the drag
+  // is bound to; the pointerup then never fires, so the move is neither committed
+  // nor undone. Selection keys wait until the hand is off the mouse.
+  if (DRAGGING && (e.key==='Escape' || e.key==='Backspace' || e.key==='Delete'
+                   || ((e.key==='a'||e.key==='A') && (e.metaKey||e.ctrlKey)))) return;
+  if (e.key==='Escape' && (SEL || MULTI.size)) { clearSel(); draw(); reselect(); return; }
+  if ((e.key==='a'||e.key==='A') && (e.metaKey||e.ctrlKey) && DOC) {
+    e.preventDefault();
+    const all = DOC.clips.map(c=>c.uid);
+    SEL = all[0] || null; MULTI = new Set(all.slice(1));
+    draw(); if (SEL) inspect(DOC.clips.find(c=>c.uid===SEL));
+    note(`${all.length} clips selected`); return;
+  }
   if ((e.key==='Backspace'||e.key==='Delete') && SEL) {
     // Removes the CLIP from the timeline. The file it names stays in the
     // media list and stays on disk — cutroom deletes nothing, anywhere.
-    DOC.clips=DOC.clips.filter(c=>c.uid!==SEL); SEL=null; draw(); save();
+    const gone = selected().length;
+    DOC.clips=DOC.clips.filter(c=>!isSel(c.uid)); clearSel(); draw(); save();
+    if (gone > 1) note(`${gone} clips removed from the timeline — the files are untouched`);
     document.getElementById('insp').innerHTML =
       '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>'; }
 });
@@ -1331,6 +1492,9 @@ window.addEventListener('dragover', e => {
   // will not use. The lane handler cannot see that — it stops firing.
   if (SEAM && !(e.target instanceof Element && e.target.closest('#lanes'))) clearSeam();
 });
+// Backstop: whatever happens to a gesture, losing the window ends it. Without this
+// a single missed pointerup leaves the keyboard half-dead until a reload.
+window.addEventListener('blur', () => { DRAGGING = false; });
 window.addEventListener('dragend', () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop',    () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop', e => e.preventDefault());
