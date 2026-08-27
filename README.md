@@ -54,6 +54,28 @@ and deliberate crossfades are carried along, never rewritten. **Hold alt** while
 dropping to place the clip exactly where the cursor is instead, with no ripple
 and no snapping.
 
+## Selecting several clips
+
+Three ways in, and they compose:
+
+- **Shift+click** a clip to add it to the selection, or to take it out again.
+- **Drag a rubber band** across empty timeline. Every clip the band *touches* is
+  selected — touch, not enclose, because a band you have to draw around a
+  22-second clip is a band you have to scroll to draw. Hold shift to keep what
+  was already selected and build a selection in several sweeps.
+- **Cmd/Ctrl+A** takes everything. **Escape** clears it. A plain click on empty
+  timeline clears it too.
+
+Drag any selected clip and the whole selection travels with it, rigidly: the
+clip under the cursor sets the distance and the rest follow, so a crossfade
+inside the selection is still the same crossfade when it lands. **Delete**
+removes every selected clip from the timeline, and as everywhere else in
+cutroom, removes nothing from disk.
+
+One clip is always the **lead** — drawn with a thicker outline — and that is the
+one the inspector is editing. Trim, retime and label act on the lead alone; only
+position acts on the group.
+
 **A clip already on the timeline drags freely** — no seam, no ripple. That is
 deliberate. Dragging one clip onto another is how you make a crossfade, and it
 is the common act; snapping every drag to the nearest seam fought the primary
