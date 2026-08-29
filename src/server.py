@@ -409,6 +409,38 @@ def _snapshot(name, text, stamp=None):
     return write_new(snapshot_dir(name) / f"{stamp or _stamp()}.json", text)
 
 
+def _swap_in(tmp, path):
+    """THE one place this program replaces a file. Both callers are below.
+
+    Kept as a single function because "cutroom overwrites exactly one kind of
+    thing, by rename onto a name it owns" is a property the test suite asserts
+    against the source text, and it is only meaningful if there is one call
+    site to point at. Widening it needs a reason written down here, not a
+    second replace() somewhere else in the file.
+
+    Callers: the project JSON (after snapshotting the state being replaced),
+    and the pending stash (which is a scratch file the page rewrites while a
+    conflict is open, and whose previous content is by definition older
+    unsaved work from the same episode).
+    """
+    writable(path, existing_ok=True)
+    tmp.replace(path)
+    return path
+
+
+def _write_over(path, text):
+    """Atomically rewrite `path`, which may or may not already exist.
+
+    write_new() refuses a file that exists, which is right for a snapshot —
+    history is append-only. The pending stash is the one thing that wants
+    replacing: ONE file per conflict, rewritten as the director keeps working,
+    rather than a new file per drag.
+    """
+    path = pathlib.Path(path)
+    tmp = write_new(path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}"), text)
+    return _swap_in(tmp, path)
+
+
 def _commit(name, merged, seen):
     """Serialise `merged`, snapshot the state it replaces, swap it into place.
 
@@ -443,8 +475,7 @@ def _commit(name, merged, seen):
         # and it is inside the root, named for the moment it was written.
         return None
     _snapshot(name, seen.decode(), stamp + "-prior")   # what we are replacing
-    writable(path, existing_ok=True)
-    tmp.replace(path)
+    _swap_in(tmp, path)
     # Snapshot only what actually landed, so a refused write leaves no history
     # entry claiming a state the file never held.
     _snapshot(name, text, stamp)
@@ -576,6 +607,68 @@ def edit_project(name, mutate):
 def history(name):
     d = snapshot_dir(name)
     return sorted(p.stem for p in d.glob("*.json"))
+
+
+# %Y%m%dT%H%M%S%f, then the suffix that marks it as a stash rather than history.
+PENDING_NAME = re.compile(r"[0-9]{8}T[0-9]{12}-pending")
+
+
+def pending_dir(name):
+    return mkdirs(project_dir(name) / ".pending")
+
+
+def pending_list(name):
+    """The stashes waiting for this project, newest first."""
+    d = pending_dir(name)
+    return [{"stamp": p.stem, "bytes": p.stat().st_size}
+            for p in sorted(d.glob("*.json"), reverse=True)]
+
+
+def save_pending(name, body):
+    """Put the page's unsaved cut on disk while a conflict is open.
+
+    THE HOLE THIS FILLS: a 409 stops the page saving until the director picks
+    keep-mine or take-theirs, and every drag made in between lived only in the
+    tab. That is the one place the tool's own promise — nothing is silently
+    lost — was not true, and a closed tab was enough to break it.
+
+    ⚠️⚠️ IT WRITES TO `.pending/`, NOT `.snapshots/`, AND THAT SEPARATION IS THE
+    WHOLE SAFETY ARGUMENT. Filing stashes as snapshots was the first design and
+    it was wrong: /history/<stamp> restores ANY snapshot, and this route takes a
+    document from ANY caller with no version and no proof a conflict ever
+    happened. Together they made an unversioned authoritative write path — plant
+    a stash, restore it, and the cut becomes something it never was. Worse, it
+    turned `.snapshots/` from "every state this file actually held" into "every
+    state somebody asserted", and on this project the history is the thing you
+    fall back on when something eats your work.
+
+    So a stash is NOT history. history() globs `.snapshots/` and restore() can
+    only name a file there, so nothing written here is reachable by either.
+    Recovery is a deliberate act that goes back out through the normal validated,
+    version-guarded project write — see pending_list().
+
+    ONE file per conflict, not one per drag: the page keeps the stamp it was
+    given and sends it back, and the file is replaced in place.
+
+    `media` is dropped and pinned empty. A stash is restorable, and media is
+    the allowlist servable() consults — a route that let a POST body put a path
+    into a document the server will later hand back is exactly the gate that
+    was closed once already. write_project pins media from the file too, so
+    this is the second of two independent locks, not the only one.
+    """
+    doc = body.get("doc")
+    if not isinstance(doc, dict):
+        return 400, {"problems": ["doc must be an object"]}
+    malformed = render_mod.shape_problems(doc)
+    if malformed:
+        return 400, {"problems": malformed}
+    stamp = body.get("stamp") or (_stamp() + "-pending")
+    if not PENDING_NAME.fullmatch(str(stamp)):
+        return 400, {"problems": [f"bad pending name {stamp!r}"]}
+    keep = {k: v for k, v in doc.items() if k not in ("media", "passes")}
+    keep["media"] = []
+    _write_over(pending_dir(name) / f"{stamp}.json", json.dumps(keep, indent=2))
+    return 200, {"stamp": stamp}
 
 
 def restore(name, stamp):
@@ -1104,6 +1197,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "passes": pass_names()})
             if route == "/history":
                 return self._send(200, {"snapshots": history(name)})
+            if route == "/pending":
+                return self._send(200, {"pending": pending_list(name)})
             if route.startswith("/media/"):
                 # By mid, never by path. The mid is looked up in the project and
                 # the path it names still has to satisfy servable() — the two
@@ -1213,6 +1308,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self._send(*export(name, body.get("from"), body.get("to")))
                 finally:
                     lock.release()
+
+            if route == "/pending":
+                return self._send(*save_pending(name, body))
 
             if route.startswith("/history/"):
                 return self._send(*restore(name, route.split("/", 2)[2]))

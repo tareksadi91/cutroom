@@ -681,9 +681,14 @@ def test_nothing_is_indexed_and_nothing_is_scanned():
         code = (pathlib.Path(server.HERE) / "server.py").read_text()
         for forbidden in ("os.walk", "iterdir(", "scandir(", "rglob("):
             assert forbidden not in code, f"server.py can spell {forbidden}"
-        # Three globs, none of them over media: this project's own snapshots,
-        # the project files in the root, and the operator's --passes-dir.
-        assert code.count(".glob(") == 3, "a new glob appeared — check what it walks"
+        # Four globs, none of them over media, and each one walks a directory
+        # cutroom itself created and only cutroom ever writes to: this project's
+        # own snapshots, its own conflict stashes, the project files in the root,
+        # and the operator's --passes-dir. A glob over anything a person put
+        # there by hand is the thing this test exists to stop.
+        assert code.count(".glob(") == 4, "a new glob appeared — check what it walks"
+        assert 'pending_dir(name)' in code and '.pending' in code, \
+            "the stash directory moved — re-audit what the fourth glob walks"
 
 
 def test_add_media_takes_absolute_paths_and_nothing_else():
@@ -1025,6 +1030,10 @@ DOC = {version: 3, clips: [{uid: 'c000', t: 0}]};
 const SERVER = {version: 9, clips: [{uid: 'c000', t: 0}], who: 'agent'};
 let calls = 0;
 globalThis.fetch = async (url, opts) => {
+  // A conflict also stashes the local cut to /pending. That is a POST to a
+  // different route, not another attempt to write the project, so it must not
+  // be counted as one.
+  if (url === '/pending') return {status: 200, ok: true, json: async () => ({stamp: 'S-pending'})};
   calls++;
   const sent = JSON.parse(opts.body);
   if (calls === 1) {
@@ -1040,6 +1049,8 @@ if (DOC.clips[0].t !== 5) fail('the queued drag was discarded (t=' + DOC.clips[0
 if (STATUS.textContent === 'saved') fail('reported "saved" for a save that lost an edit');
 if (!/NOT SAVED/.test(STATUS.textContent)) fail('no conflict warning: ' + STATUS.textContent);
 if (calls !== 1) fail('kept saving into an unresolved conflict (' + calls + ' PUTs)');
+if (!/safe on disk/.test(STATUS.textContent))
+  fail('conflict did not stash the local cut: ' + STATUS.textContent);
 // and the way out: "keep mine" re-bases the local cut and saves it
 STATUS.clicks['keep mine']();
 await new Promise(r => setTimeout(r, 0));
@@ -1278,6 +1289,80 @@ console.log('js ok');
         js.write_text(harness.replace("__REGION__", region))
         r = subprocess.run([node, str(js)], capture_output=True, text=True)
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_a_conflict_puts_the_unsaved_cut_on_disk():
+    """The half of "never lose progress" the merge does not cover.
+
+    When two edits genuinely conflict the page stops saving and asks. Until
+    now the work made in between lived only in the tab. /pending stashes it,
+    and the properties that matter are: it lands in history where the existing
+    restore route can reach it, it does NOT grow a file per drag, and it cannot
+    be used to put a media path into a document the server will hand back.
+    """
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            doc = {"fps": 24, "resolution": [720, 1280], "version": 3,
+                   "clips": [{"uid": "c0", "mid": "m01", "lane": 0, "t": 0.0,
+                              "in": 0.0, "out": 1.0, "rate": 1}]}
+            status, first = post(port, "/pending", {"doc": doc})
+            assert status == 200, (status, first)
+            stamp = first["stamp"]
+            assert stamp.endswith("-pending"), stamp
+
+            # ⚠️⚠️ A STASH IS NOT HISTORY. /history/<stamp> restores anything it
+            # can name, and this route takes a document from any caller with no
+            # version and no proof a conflict happened. Filed together they are
+            # an unversioned authoritative write: plant a stash, restore it, and
+            # the cut becomes a state it never held — and `.snapshots/` stops
+            # meaning "what this file actually was".
+            _, raw, _h = request(port, "GET", "/history")
+            hist = json.loads(raw)
+            assert stamp not in hist["snapshots"], \
+                "a caller-supplied document was filed as project history"
+            status, out = post(port, "/history/" + stamp)
+            assert status == 404, ("a stash was restorable as a snapshot", status, out)
+
+            # It is listed on its own route, so the work is findable.
+            _, praw, _ph = request(port, "GET", "/pending")
+            assert stamp in [x["stamp"] for x in json.loads(praw)["pending"]]
+
+            # ONE file per conflict. The director goes on dragging; the same
+            # stamp comes back and the same file is replaced.
+            doc["clips"][0]["t"] = 2.0
+            status, again = post(port, "/pending", {"stamp": stamp, "doc": doc})
+            assert status == 200 and again["stamp"] == stamp, again
+            _, praw2, _p2 = request(port, "GET", "/pending")
+            stamps = [x["stamp"] for x in json.loads(praw2)["pending"]]
+            assert stamps.count(stamp) == 1 and len(stamps) == 1, \
+                ("a second stash grew the pile instead of replacing the stash", stamps)
+            landed = json.loads(
+                (server.pending_dir(name) / f"{stamp}.json").read_text())
+            assert landed["clips"][0]["t"] == 2.0, landed
+
+            # MEDIA MAY NOT RIDE IN ON A STASH. It is the allowlist servable()
+            # consults, and a stash is restorable.
+            poisoned = dict(doc, media=[{"mid": "leak", "path": "/etc/passwd"}])
+            status, out = post(port, "/pending", {"doc": poisoned})
+            assert status == 200, (status, out)
+            stashed = json.loads(
+                (server.pending_dir(name) / f"{out['stamp']}.json").read_text())
+            assert stashed["media"] == [], stashed["media"]
+
+            # A name the page did not get from us is refused.
+            for bad in ("../../etc/passwd", "20260101T000000000000", "x-pending"):
+                status, _ = post(port, "/pending", {"stamp": bad, "doc": doc})
+                assert status == 400, f"accepted pending name {bad!r}"
+
+            # A body that is not a project is refused rather than stored as a
+            # restorable snapshot.
+            status, _ = post(port, "/pending", {"doc": {"clips": [{}]}})
+            assert status == 400
+            status, _ = post(port, "/pending", {"doc": "nope"})
+            assert status == 400
+        finally:
+            stop_server(srv)
 
 
 def test_the_page_says_so_when_a_drop_carries_no_path():

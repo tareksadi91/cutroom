@@ -398,6 +398,43 @@ let SAVING = false, SAVE_AGAIN = false, THEIRS = null;
 // edits in a conflict, and without it a 409 cannot tell "we changed different
 // clips" from "we changed the same one" — only that the numbers differ.
 let BASE = null;
+// The stamp of the stash for the conflict currently open, or null. Held so the
+// director can go on working and it stays ONE file, replaced, not one per drag.
+let PENDING = null;
+let STASHING = false, STASH_AGAIN = false, STASH_OK = null;
+// Put the local cut on disk. Called the moment a conflict opens and after every
+// edit made while it is open, because that is precisely the window in which the
+// page cannot save and the work exists nowhere else.
+//
+// ⚠️ SINGLE-FLIGHT, for the same reason saveOnce() is. Firing one of these per
+// drag raced three ways: two requests could both read PENDING === null and make
+// two stash files, requests sharing a stamp could land OUT OF ORDER so an older
+// cut overwrote a newer one, and the banner could then say "safe on disk" about
+// content that was already stale. Coalesce instead — the whole document goes
+// over the wire every time, so one more stash after the current one carries the
+// latest state however many edits it merged.
+async function stash() {
+  if (STASHING) { STASH_AGAIN = true; return STASH_OK; }
+  STASHING = true;
+  try {
+    do {
+      STASH_AGAIN = false;
+      STASH_OK = await stashOnce();
+    } while (STASH_AGAIN);
+  } finally { STASHING = false; }
+  return STASH_OK;
+}
+async function stashOnce() {
+  try {
+    const r = await fetch('/pending', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({stamp: PENDING, doc: DOC})
+    });
+    if (!r.ok) return false;
+    PENDING = (await r.json()).stamp;
+    return true;
+  } catch (e) { return false; }   // reported by the banner, never thrown away
+}
 function baseline() { BASE = DOC ? JSON.parse(JSON.stringify(DOC)) : null; }
 // Do two versions of one clip differ MEANINGFULLY?
 //
@@ -547,7 +584,9 @@ async function saveOnce() {
       return note('merged an edit from the cut room');
     }
     THEIRS = body; SAVE_AGAIN = false;
-    conflictNote();
+    PENDING = null;                  // a new conflict gets its own stash
+    conflictNote();                  // up immediately, and honest as it stands
+    conflictNote(await stash());     // settled once we know the cut is on disk
   } else if (r.status === 422) {
     note((body.problems || ['refused'])[0], 'var(--danger)');
   } else if (!r.ok) {
@@ -569,11 +608,17 @@ async function saveOnce() {
 }
 // The conflict banner: the state of the cut in one line, plus the only two
 // honest ways out of it. It stays up until one of them is clicked.
-function conflictNote() {
+function conflictNote(stashed) {
   const s = document.getElementById('status');
   s.textContent = '';
   s.style.color = 'var(--warn)';
-  s.append('NOT SAVED — the file changed under you. Your edits are still here: ');
+  // "still here" used to mean "in this tab, and nowhere else". Say which it is,
+  // because the honest answer changes what closing the tab costs.
+  s.append(stashed === false
+    ? 'NOT SAVED, AND THE STASH FAILED — keep this tab open. Your edits: '
+    : PENDING
+      ? 'NOT SAVED — the file changed under you. Your edits are safe on disk: '
+      : 'NOT SAVED — the file changed under you. Your edits are still here: ');
   const mine = el('button'); mine.textContent = 'keep mine';
   mine.onclick = keepMine;
   const theirs = el('button'); theirs.textContent = 'take theirs';
@@ -596,6 +641,10 @@ function takeTheirs() {
   // Adopting a whole new object graph orphans every card and inspector field
   // bound to the old one, so re-render and re-bind, selection and all.
   DOC = THEIRS; THEIRS = null;
+  // The stash stays on disk under its stamp. "Take theirs" is the one button
+  // that discards the director's work, and it is now recoverable rather than
+  // gone the instant it is clicked.
+  PENDING = null; STASH_OK = null;
   baseline();
   draw(); reselect();
   note('reloaded from disk — your unsaved edits were discarded', 'var(--warn)');
@@ -618,7 +667,7 @@ async function save() {
   // An unresolved conflict blocks every save: the director can go on dragging
   // and nothing is lost, but the page will not write over a file it knows it
   // has not seen until "keep mine" says so.
-  if (THEIRS) { conflictNote(); return; }
+  if (THEIRS) { conflictNote(await stash()); return; }
   if (SAVING) { SAVE_AGAIN = true; return; }   // the running save will re-fire
   SAVING = true;
   try {
