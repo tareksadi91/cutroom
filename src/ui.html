@@ -885,8 +885,8 @@ function card(c) {
     // accumulated onto live values, or the group would drift a frame per event.
     const group = mode==='move' ? selected() : [c];
     const g0 = group.map(x => [x, x.t, x.lane]);
-    // The cut the gesture started from, and the last position that stayed legal.
-    const wasClean = !timelineFault();
+    // The last position that stayed legal, and whether the clamp is armed yet.
+    const gate = {armed: !timelineFault()};
     let goodDt = 0, goodEdge = {t: c.t, in: c.in, out: c.out};
     const minLane = Math.min(...g0.map(([,,L]) => L));
     const minT    = Math.min(...g0.map(([,T]) => T));
@@ -914,7 +914,7 @@ function card(c) {
         // stacking clips on one instant, which the renderer rejects as a full overlap.
         const want = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
         const dt = goodDt = keepIfLegal(want, goodDt,
-          v => { for (const [x, xt] of g0) x.t = xt + v; }, wasClean);
+          v => { for (const [x, xt] of g0) x.t = xt + v; }, gate);
         // Vertical: one lane per LANE_H of travel. Dropping one row past the
         // last lane creates a new one, so a clip never needs a button first.
         const wantLane = lane0 + Math.round((ev.clientY-y0)/LANE_H);
@@ -937,11 +937,11 @@ function card(c) {
       else if (mode==='l') {
         const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
         goodEdge = keepIfLegal({t: snap(t0+(w2-in0)/c.rate, ev.altKey), in: w2, out: c.out},
-          goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, wasClean);
+          goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, gate);
       }
       else goodEdge = keepIfLegal(
         {t: c.t, in: c.in, out: Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate))},
-        goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, wasClean);
+        goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, gate);
       const nw = Math.max(3, dur(c)*PX);
       d.style.left=c.t*PX+'px'; d.style.width=nw+'px';
       d.classList.toggle('narrow', nw<46);
@@ -1145,15 +1145,26 @@ function insertPoints() {
 // linear chain of pairwise xfades, and a nested clip has no second track to be
 // on. That used to be discovered at save time, as a refusal quoting two numbers
 // the director never asked to think about. Now the clip simply stops at the last
-// legal frame, which is exactly the full overlap.
+// legal position it sampled. ⚠️ THE LAST SAMPLED ONE, not the boundary itself:
+// pointer events arrive discretely, so a fast drag can step over the exact
+// full-overlap point and settle short of it. Dragging slowly finds it.
 //
-// `wasClean` matters: if the cut was ALREADY faulty when the gesture started,
-// clamping would pin every drag to its first position and the timeline could
-// never be dragged back out of trouble.
-function keepIfLegal(want, last, apply, wasClean) {
+// `gate.armed` matters: if the cut is ALREADY faulty, clamping would pin every
+// drag to its first position and the timeline could never be dragged back out of
+// trouble. So the clamp holds off until the cut is legal, and arms the moment it
+// is.
+//
+// ⚠️ IT RE-ARMS MID-GESTURE, and a plain "was it clean at pointerdown" boolean
+// did not. A drag that started on a faulty cut stayed unclamped for its whole
+// life, so it could repair the fault and then sail straight on into a fresh one
+// with nothing stopping it — the very case this exists for, reachable just by
+// starting the drag one clip earlier.
+function keepIfLegal(want, last, apply, gate) {
   apply(want);
-  if (wasClean && timelineFault()) { apply(last); return last; }
-  return want;
+  if (!timelineFault()) { gate.armed = true; return want; }
+  if (!gate.armed) return want;      // started dirty, still dirty: let it move
+  apply(last);
+  return last;
 }
 // <<< drag-clamp
 function timelineFault() {
@@ -1419,7 +1430,7 @@ const SLOT_UID = {};
 // The clip whose OWN first frame is being shown, or null when the monitor is
 // showing the timeline. paint() clears it, because painting is what "show the cut
 // at time t" means; showClipHead() sets it.
-let HEAD_UID = null;
+let HEAD_UID = null, HEAD_TRIES = 0;
 function claim(c, taken) {
   // Priority: this exact clip, then merely the right file (a preload), then free.
   // Assigning by index (live[0] always mA) made the incoming half of a crossfade
@@ -1447,9 +1458,16 @@ function claim(c, taken) {
 // clicking a clip showed you the clip BEFORE it. On this cut 21 of 36 clips
 // crossfade, so it was wrong more often than right.
 function showClipHead(c) {
+  // ⚠️ BOUNDED, because this function is called BY the event its own seek fires.
+  // park() no-ops inside 0.04s, so a source that seeks accurately settles after
+  // two events — measured, on a clip with in=3.083s. A source that could NOT land
+  // within that tolerance would ask for the same seek forever, so after a few
+  // attempts the frame is revealed as it lies rather than chased.
+  HEAD_TRIES = (HEAD_UID === c.uid) ? HEAD_TRIES + 1 : 0;
   const slot = claim(c, null);
   const v = feed(slot, c, c.t);      // feed seeks to c.in + (t - c.t) * rate
-  park(v, c.in);                     // and park lands it exactly, not within 0.2s
+  if (HEAD_TRIES < 3) park(v, c.in); // and park lands it exactly, not within 0.2s
+  else v.pause();
   v.style.opacity = 1;
   v.style.zIndex = 3;
   for (const s of SLOTS) if (s !== slot) {
@@ -1502,6 +1520,12 @@ function preloadNext(t, used) {
   park(v, soon.in);
 }
 function paint(t) {
+  // ⚠️ CLEARED FIRST, NOT AFTER THE EARLY RETURN. Painting is what "show the cut
+  // at time t" means, so it always ends a clip-head view — including the path
+  // where nothing is live. Clearing it further down left the head stuck whenever
+  // the playhead sat in a gap or past the end, and the readiness listener then
+  // kept restoring a clip that was not under the playhead at all.
+  HEAD_UID = null;
   const live = activeAt(t);
   const a=document.getElementById('mA'), b=document.getElementById('mB');
   document.getElementById('tc').textContent = t.toFixed(2)+'s';
@@ -1528,9 +1552,6 @@ function paint(t) {
   // fade and the crossfade plays as a hard cut.
   va.style.zIndex = 1;
   if (vb) vb.style.zIndex = 2;
-  // The monitor is showing the CUT again, so it is no longer showing one clip's
-  // head. Cleared here rather than in scrubTo() so playback clears it too.
-  HEAD_UID = null;
   // Hide whichever slot is not in use — by slot, not by hardcoding mB, now that
   // either one can be the primary. Its src STAYS: dropping it is what forced the
   // reload it was about to need. It is PARKED, not merely hidden.
@@ -1762,6 +1783,9 @@ document.addEventListener('keydown', e => {
     // media list and stays on disk — cutroom deletes nothing, anywhere.
     const gone = selected().length;
     DOC.clips=DOC.clips.filter(c=>!isSel(c.uid)); clearSel(); draw(); save();
+    // The monitor may be holding the first frame of a clip that no longer
+    // exists. Nothing else on this path repaints, so it would sit there.
+    scrubTo(CLOCK);
     if (gone > 1) note(`${gone} clips removed from the timeline — the files are untouched`);
     document.getElementById('insp').innerHTML =
       '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>'; }

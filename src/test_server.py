@@ -1498,8 +1498,8 @@ let DOC = {fps: 24, clips: [
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 const A = DOC.clips[0], B = DOC.clips[1], t0 = B.t;
-const wasClean = !timelineFault();
-if (!wasClean) fail('the fixture is not a legal cut to begin with');
+const gate = {armed: !timelineFault()};
+if (!gate.armed) fail('the fixture is not a legal cut to begin with');
 
 // Drag B leftward one frame at a time, straight through where it cannot legally
 // sit, and keep going. Two things are being asserted at once: the cut is NEVER
@@ -1507,7 +1507,7 @@ if (!wasClean) fail('the fixture is not a legal cut to begin with');
 // the way.
 let good = 0, maxOverlap = 0;
 for (let f = 1; f <= 24 * 6; f++) {
-  good = keepIfLegal(-f / 24, good, v => { B.t = t0 + v; }, wasClean);
+  good = keepIfLegal(-f / 24, good, v => { B.t = t0 + v; }, gate);
   const fault = timelineFault();
   if (fault) fail('frame ' + f + ' left the cut illegal: ' + fault);
   if (B.t > A.t) maxOverlap = Math.max(maxOverlap, endOf(A) - B.t);
@@ -1530,8 +1530,21 @@ DOC.clips = [{uid:'A', t:0, in:0, out:4, rate:1, lane:0, label:'A'},
              {uid:'B', t:1, in:0, out:1, rate:1, lane:0, label:'B'}];
 if (!timelineFault()) fail('the second fixture was supposed to be illegal');
 const B2 = DOC.clips[1];
-keepIfLegal(9, 0, v => { B2.t = 1 + v; }, false);
+const gate2 = {armed: !timelineFault()};
+if (gate2.armed) fail('gate armed on a cut that is already faulty');
+keepIfLegal(9, 0, v => { B2.t = 1 + v; }, gate2);
 if (B2.t !== 10) fail('a faulty cut could not be dragged out of trouble');
+
+// ⚠️ AND THE CLAMP MUST ARM THE MOMENT THE CUT IS LEGAL AGAIN. A gesture that
+// began on a faulty cut used to stay unclamped for its whole life, so it could
+// repair the fault and then walk straight into a fresh one — the very thing the
+// clamp exists to stop, reachable by starting the drag one clip earlier.
+if (!gate2.armed) fail('the gate did not arm once the cut came good');
+let g2 = 9;
+for (let f = 1; f <= 24 * 4; f++)
+  g2 = keepIfLegal(9 - f / 24, g2, v => { B2.t = 1 + v; }, gate2);
+if (timelineFault())
+  fail('dragged back into an illegal cut after repairing one: ' + timelineFault());
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
@@ -1539,6 +1552,31 @@ console.log('js ok');
         js.write_text(harness.replace("__REGION__", region))
         r = subprocess.run([node, str(js)], capture_output=True, text=True)
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_painting_the_cut_always_ends_a_clip_head_view():
+    """Selecting a clip shows that clip's own first frame instead of the cut's
+    blend at that instant, and HEAD_UID records that the monitor is answering a
+    question about a CLIP.
+
+    Every path through paint() means "show the cut at time t", so every one of
+    them has to end that view. The clear started life below paint()'s early
+    return for "nothing is live", which left the head stuck whenever the playhead
+    sat in a gap or past the end of the cut — and because the readiness listener
+    restores whichever view is up, the monitor then kept re-showing a clip that
+    was not under the playhead at all.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    body = html[html.index("function paint(t) {"):html.index("function scrubTo(t)")]
+    assert body.count("HEAD_UID = null") == 1, \
+        "the clip-head view is cleared more than once, or not at all, inside paint()"
+    # It must come BEFORE the first return, or the empty-timeline path skips it.
+    assert body.index("HEAD_UID = null") < body.index("return"), \
+        "paint() can return without ending a clip-head view — a scrub into a gap " \
+        "or past the end of the cut would leave the monitor on the wrong clip"
+    head = html[html.index("// >>> clip-head"):html.index("// <<< clip-head")]
+    assert "HEAD_UID = c.uid" in head, "showClipHead no longer records what it is showing"
+    assert "park(v, c.in)" in head, "the head is no longer parked on the clip's in-point"
 
 
 def test_the_page_never_offers_a_drop_it_cannot_honour():
