@@ -1365,6 +1365,106 @@ def test_a_conflict_puts_the_unsaved_cut_on_disk():
             stop_server(srv)
 
 
+def test_a_bin_drop_only_snaps_to_a_seam_you_are_pointing_at():
+    """Run the real seam picker out of ui.html.
+
+    There is an insert point at every clip start plus one past the end, so on
+    any real cut SOME seam is always the nearest. Picking it unconditionally
+    meant every drop from the media panel became an insert-and-ripple: the film
+    after the drop moved right and the clip did not land where it was let go.
+    There has to be a way to say "here".
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> seam-pick")
+    b = html.index("// <<< seam-pick")
+    region = html[a:b]
+    assert "function nearestPoint" in region, "the seam-pick markers moved"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the seam picker is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 6;                       // pixels per second, the zoom in the real page
+let DOC = {fps: 24, clips: [
+  {uid:'a', t:0,  in:0, out:4, rate:1, lane:0},
+  {uid:'b', t:4,  in:0, out:4, rate:1, lane:0},
+  {uid:'c', t:12, in:0, out:4, rate:1, lane:0}]};
+function insertPoints() {
+  const byT = [...DOC.clips].sort((a,b)=>a.t-b.t);
+  const seen = new Set(); const pts = [];
+  byT.forEach((c,i) => {
+    const key = c.t.toFixed(6);
+    if (seen.has(key)) return;
+    seen.add(key);
+    pts.push({t:c.t, before:byT[i-1]||null, after:c});
+  });
+  // Mirrors ui.html: an empty cut still offers the one point at 0, and without
+  // this branch the reduce below throws on an empty array.
+  if (byT.length) {
+    const last = byT.reduce((a,b)=> endOf(a)>=endOf(b)?a:b);
+    pts.push({t:endOf(last), before:last, after:null});
+  } else pts.push({t:0, before:null, after:null});
+  return pts;
+}
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Right on a seam: insert.
+if (nearestPoint(4.0) === null) fail('refused a seam the cursor is exactly on');
+if (nearestPoint(4.0).t !== 4) fail('picked the wrong seam');
+
+// Just inside the grab radius. At 6px/s with seams 4s apart the radius is the
+// share cap, 0.25 * 24px = 6px, so one second out (6px) still grabs.
+if (nearestPoint(4 + 1.0) === null) fail('refused a seam 6px away');
+if (nearestPoint(4 + 1.0).t !== 4) fail('grabbed the wrong seam');
+
+// Between the seams at 4 and 12 the midpoint is 8. That is the "put it here"
+// the old code could not express at all.
+if (nearestPoint(8.0) !== null)
+  fail('still snapped from the midpoint between two seams — nowhere to drop freely');
+
+// THE PROPERTY THAT ACTUALLY MATTERS: at EVERY zoom there is somewhere between
+// two seams that does not snap. A fixed pixel radius fails this zoomed out,
+// which is exactly the state the director works in.
+for (const px of [1, 2, 6, 20, 60, 200]) {
+  const free = [];
+  for (let t = 0; t <= 16; t += 0.05) if (nearestPoint(t, px) === null) free.push(t);
+  if (!free.length) fail('at ' + px + 'px/s every point on the timeline snaps to a seam');
+}
+
+// Zoom is the whole reason the threshold is in pixels. Zoomed in, the same two
+// seconds is far away; zoomed out, the same gap is within reach.
+if (nearestPoint(4 + 2.0, 60) !== null) fail('2s away at 60px/s is 120px — should be free');
+if (nearestPoint(4.5, 1) === null) fail('at 1px/s a seam half a second away is unreachable');
+
+// A seam past the end of the cut is still offered, so appending works.
+if (nearestPoint(16.0) === null) fail('lost the append point at the end of the cut');
+
+// ⚠️ TWO STARTS ONE FRAME APART. Capping the radius by the distance to the next
+// seam drove BOTH radii to a fraction of a pixel and made the seam untargetable
+// at any normal zoom — the share cap eating itself. Points inside one rendered
+// pixel are merged, so the place stays reachable.
+DOC.clips = [{uid:'a', t:0, in:0, out:4, rate:1, lane:0},
+             {uid:'b', t:1/24, in:0, out:4, rate:1, lane:1}];
+if (nearestPoint(0) === null) fail('a seam between clips one frame apart cannot be hit');
+if (nearestPoint(0).t !== 0) fail('merged seams did not resolve to the earlier one');
+
+// An empty timeline still offers its one insert point (the min over an empty
+// comparison set is Infinity, so the radius falls back to the pixel cap).
+DOC.clips = [];
+if (nearestPoint(0) === null) fail('lost the only insert point on an empty timeline');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "seam.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_the_page_says_so_when_a_drop_carries_no_path():
     """A browser is not allowed to hand a page a dropped file's absolute path,
     and cutroom may not go looking for it by name. The drop target must

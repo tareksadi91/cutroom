@@ -1186,10 +1186,51 @@ function seamReach(pt) {
   const F = t => Math.round(t * DOC.fps) / DOC.fps;
   return Math.max(0, F(endOf(pt.before) - F(pt.t)));
 }
-function nearestPoint(t) {
-  const pts = insertPoints();
-  return pts.reduce((a,b)=> Math.abs(b.t-t) < Math.abs(a.t-t) ? b : a);
+// >>> seam-pick (extracted verbatim by test_server.py — keep both markers)
+// How close the cursor must come to a seam before the drop is an INSERT.
+// In PIXELS, not seconds: it is a question about what the hand is pointing at,
+// and a threshold in seconds means the seam reaches further the further you
+// zoom out — at 6px/s a two-second grab is twelve pixels, at 60px/s it is a
+// hundred and twenty.
+const SEAM_GRAB_PX = 14;
+// The seam the cursor is asking for, or NULL for "nowhere near one".
+//
+// ⚠️ RETURNING THE NEAREST SEAM UNCONDITIONALLY IS WHAT MADE THIS WRONG. There
+// are a seam per clip and one past the end, so on any real cut SOME seam is
+// always the nearest one — there was no way to express "put it here". Every
+// drop from the bin became an insert-and-ripple, the whole film after the drop
+// moved right, and the clip did not land where it was let go. Dropping where
+// you point is the common act; inserting at a seam is the rarer one, and the
+// rarer one does not get to be the default. Same call as a clip already on the
+// timeline, which drags freely for exactly this reason.
+// At most this share of the space around a seam may belong to it, so two
+// neighbours can never tile the gap between them shut. At 0.25 the two seams
+// bounding a gap claim half of it between them and the middle half is free —
+// the rule stated in one sentence, and it holds at every zoom.
+const SEAM_GRAB_SHARE = 0.25;
+function nearestPoint(t, pxPerSecond) {
+  const px = pxPerSecond || PX;
+  // Two insert points closer together than one rendered pixel are the same
+  // place as far as a cursor is concerned. Left separate they drive each
+  // other's radius toward zero and BOTH become untargetable — a cut with two
+  // clips a single frame apart had a seam that could not be hit at all. The
+  // earlier of the two wins, so the choice is deterministic.
+  const pts = insertPoints()
+    .sort((a,b)=>a.t-b.t)
+    .filter((p,i,all) => i === 0 || (p.t - all[i-1].t) * px > 1);
+  if (!pts.length) return null;
+  const near = pts.reduce((a,b)=> Math.abs(b.t-t) < Math.abs(a.t-t) ? b : a);
+  // ⚠️ A FIXED PIXEL RADIUS IS NOT ENOUGH ON ITS OWN. Zoomed out to 6px/s the
+  // cut's seams sit about 28px apart, so two 14px radii meet in the middle and
+  // every point on the timeline still belongs to some seam — the same bug in a
+  // narrower coat. Cap the radius at a share of the distance to the next seam
+  // so a free zone always exists, however far out the zoom goes.
+  const gapPx = pts.reduce((m, p) =>
+    p === near ? m : Math.min(m, Math.abs(p.t - near.t) * px), Infinity);
+  const radius = Math.min(SEAM_GRAB_PX, gapPx * SEAM_GRAB_SHARE);
+  return Math.abs(near.t - t) * px <= radius ? near : null;
 }
+// <<< seam-pick
 function clearSeam() {
   SEAM = null;
   document.querySelectorAll('.seam').forEach(n=>n.remove());
@@ -1245,7 +1286,7 @@ function insertAt(mid, lane, pt) {
   if (fault) {
     DOC.clips.pop();
     for (const [x,t] of undo) x.t = t;
-    note(`${fault}. Nothing was added — drop it at another seam, or hold alt to place it by hand.`,
+    note(`${fault}. Nothing was added — drop it away from the seam to place it as it lies.`,
          'var(--warn)');
     return;
   }
@@ -1256,15 +1297,20 @@ function insertAt(mid, lane, pt) {
 function drop(e, lane, atT) {
   e.preventDefault();
   const text = e.dataTransfer.getData('text/plain') || '';
-  const pt = SEAM;
   if (atT == null) atT = e.offsetX/PX;     // desktop-file path keeps its old behaviour
+  // ⚠️ ASK THE DROP COORDINATE, DO NOT TRUST THE LAST dragover. SEAM is module
+  // state written by whichever dragover fired last, and the pointer can move,
+  // change lane, or gain a modifier between that event and this one — which
+  // would ripple the cut at a seam the director was no longer pointing at. SEAM
+  // is for DRAWING; where the clip lands is decided here, from the coordinate
+  // the drop itself carries.
+  const pt = e.altKey ? null : nearestPoint(atT);
   clearSeam(); DRAG_MID = null;
   if (text.startsWith('mid:')) {
-    // Hold alt to drop it exactly where the cursor is, the way it used to behave.
-    // Otherwise it INSERTS at the marked seam and ripples — landing a clip on top
-    // of the cut and making the director move every other clip by hand is not an
-    // edit, it is a chore.
-    if (pt && !e.altKey) insertAt(text.slice(4), lane, pt);
+    // A seam is only marked when the cursor is within SEAM_GRAB_PX of one, so
+    // the ordinary drop lands where it was let go. Over a marked seam it INSERTS
+    // and ripples instead; alt suppresses that and places by hand even there.
+    if (pt) insertAt(text.slice(4), lane, pt);
     else place(text.slice(4), lane, snap(atT));
     return;
   }
@@ -1282,8 +1328,15 @@ function draw() {
     // that is usually a CLIP CARD — offsetX would then be measured from the card's
     // own left edge and the seam would jump. Measure against the lane itself.
     const laneX = ev => (ev.clientX - lane.getBoundingClientRect().left) / PX;
-    lane.ondragover=e=>{ e.preventDefault();
-      if (DRAG_MID && !e.altKey) showSeam(nearestPoint(laneX(e))); else clearSeam(); };
+    lane.ondragover=e=>{
+      // Only an internal drag from the bin is a drop this page can honour. A
+      // file coming from the desktop carries no path, so refusing to
+      // preventDefault here is what makes the cursor say "no" instead of
+      // promising a drop that would end in an error message.
+      if (!DRAG_MID) return;
+      e.preventDefault();
+      const pt = e.altKey ? null : nearestPoint(laneX(e));
+      if (pt) showSeam(pt); else clearSeam(); };
     lane.ondrop=e=>drop(e,i,laneX(e));
     // Rubber band. Only from the lane's own background — a pointerdown that
     // started on a clip is that clip's drag and must not also start a selection.

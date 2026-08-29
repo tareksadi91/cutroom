@@ -44,10 +44,18 @@ deletion primitive at all — no `unlink`, no `rmtree`, no `shutil.move`.
 
 ## Editing
 
-**Drag from the media panel onto the timeline** and a marker shows the seam it
-will land on, lighting the clip on either side. Drop, and it is *inserted*
-there: everything from that instant onward moves right by exactly the new
-clip's length. Nothing lands on top of anything, and no gap is opened.
+**Drag from the media panel onto the timeline** and it lands where you let go
+of it. Bring the cursor close to a seam and a marker appears, lighting the clip
+on either side; drop *there* and it is **inserted** instead — everything from
+that instant onward moves right by exactly the new clip's length, so nothing
+lands on top of anything and no gap is opened. Hold `alt` to place by hand even
+over a marked seam.
+
+A seam only claims the pixels right around it — at most a quarter of the
+distance to its neighbour on each side, so the middle of every gap is always
+free. Snapping *every* drop to the nearest seam is what this replaced: there is
+an insert point at every clip start, so some seam was always the nearest one,
+and there was no way left to say "put it here".
 
 The ripple preserves the *relative* shape of the cut downstream: deliberate gaps
 and deliberate crossfades are carried along, never rewritten. **Hold alt** while
