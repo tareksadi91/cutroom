@@ -1465,15 +1465,31 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
-def test_the_page_says_so_when_a_drop_carries_no_path():
-    """A browser is not allowed to hand a page a dropped file's absolute path,
-    and cutroom may not go looking for it by name. The drop target must
-    therefore FAIL LOUDLY and point at the two routes that do work, rather than
-    doing nothing and looking broken."""
+def test_the_page_never_offers_a_drop_it_cannot_honour():
+    """A browser is not allowed to hand a page a dropped file's absolute path —
+    Chrome and Safari both withhold it, permanently — and cutroom may not go
+    looking for it by name, because looking means scanning.
+
+    So the page does not ASK for one. It used to: the media panel had a
+    "drop to add to this project" hover state, and every attempt ended in an
+    error explaining why it could not work. A control that cannot work should
+    not look like it can. The routes that deal in real paths are the picker,
+    the path field and the CLI, and they are all in the same panel.
+    """
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
-    assert "pathsFromDrop" in html and "addNote('bad')" in html, "the drop target is gone"
-    assert "did not hand over that file’s path" in html, "the loud failure is gone"
-    assert "cutroom add " in html, "the fallback the director can actually use is gone"
+    assert "drop to add to this project" not in html, \
+        "the media panel still advertises a drop the browser cannot deliver"
+    assert "#bin.dragover" not in html, "the bin still has a drop-hover state"
+    assert "binEl.ondrop" not in html and "binEl.ondragover" not in html, \
+        "the bin is still a drop target"
+    assert "pathsFromDrop" not in html, \
+        "the path-from-drop reader is unreachable now — it should be gone, not dead"
+    # The cursor has to say no as well: preventing the window from navigating to
+    # a dropped file is what makes the whole page look droppable, so the effect
+    # is set to none for anything that is not an internal drag from the bin.
+    assert "dropEffect = 'none'" in html, "the window still looks like a drop target"
+    # And the three routes that DO work are still offered.
+    assert "cutroom add " in html, "the CLI fallback is gone"
     assert "/media/pick" in html and "Add media…" in html, "the picker is gone"
     assert "paste an absolute path" in html, "the universal fallback is gone"
 

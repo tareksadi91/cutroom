@@ -81,11 +81,6 @@
              font:400 11px/1.3 var(--mono); padding:7px 8px; }
   #addpath:focus { outline:none; border-color:var(--accent); }
   #addhint { font:400 11px/1.45 var(--sans); color:var(--ink-3); }
-  #bin.dragover:after { content:'drop to add to this project';
-    position:absolute; inset:6px; border:2px dashed var(--accent); border-radius:8px;
-    display:flex; align-items:center; justify-content:center; text-align:center;
-    padding:0 24px; font:500 12px/1.4 var(--sans); color:var(--accent);
-    background:oklch(0.196 0.006 130 / 0.86); z-index:9; pointer-events:none; }
 
   /* ── timeline ─────────────────────────────────────────────────────── */
   #stage { overflow:auto; position:relative; background:var(--bg); }
@@ -632,6 +627,7 @@ function keepMine() {
   if (!THEIRS) return;
   DOC.version = THEIRS.version;
   THEIRS = null;
+  PENDING = null; STASH_OK = null;
   save();
 }
 // Drop the local edits and adopt the file. What the old code did on its own,
@@ -642,8 +638,8 @@ function takeTheirs() {
   // bound to the old one, so re-render and re-bind, selection and all.
   DOC = THEIRS; THEIRS = null;
   // The stash stays on disk under its stamp. "Take theirs" is the one button
-  // that discards the director's work, and it is now recoverable rather than
-  // gone the instant it is clicked.
+  // that discards the director's work, and it is now recoverable from history
+  // rather than gone the instant it is clicked.
   PENDING = null; STASH_OK = null;
   baseline();
   draw(); reselect();
@@ -677,25 +673,6 @@ async function save() {
 // <<< save-loop
 
 // ── adding media ─────────────────────────────────────────────────────────
-// A browser is not allowed to tell a page where a dropped file lives on disk.
-// Chrome and Safari both withhold it, deliberately and permanently. And cutroom
-// may not go looking for a file by name, because looking means scanning a
-// directory and scanning a directory is exactly the habit that cost 226 clips.
-// So the drop target reads a path when the browser offers one (some do, in
-// text/uri-list) and SAYS SO OUT LOUD when it does not, rather than failing
-// silently. The picker button and the path field always work.
-function pathsFromDrop(dt) {
-  const out = [];
-  const uris = (dt.getData('text/uri-list') || '') + '\n' + (dt.getData('text/plain') || '');
-  for (const line of uris.split(/[\r\n]+/)) {
-    const s = line.trim();
-    if (s.startsWith('file://')) {
-      try { out.push(decodeURIComponent(new URL(s).pathname)); } catch (e) {}
-    } else if (s.startsWith('/')) out.push(s);
-  }
-  for (const f of dt.files || []) if (f.path) out.push(f.path);   // not a browser
-  return [...new Set(out)];
-}
 // Copy-in is ON by default. It is not what keeps your originals safe — they
 // are only ever opened read-only, and nothing here can write to one — it is
 // what keeps this cut working after the folder they came from moves, empties
@@ -730,28 +707,16 @@ async function addPaths(paths) {
          : 'already in this project', n ? 'var(--accent)' : null);
   return b;
 }
-function addNote(kind) {
+// The standing hint under the add controls. There is no failure branch any
+// more: the page no longer offers a drop that can fail for want of a path.
+function addNote() {
   const box = document.getElementById('addhint');
-  box.style.color = kind === 'bad' ? 'var(--danger)' : 'var(--ink-3)';
-  box.textContent = kind === 'bad'
-    ? 'Your browser did not hand over that file’s path — it is not allowed to. '
-      + 'Use “Add media…”, paste the absolute path below, or run '
-      + '`cutroom add ' + (DOC ? DOC.name : '<project>') + ' <path>`.'
-    : 'Media enters only when you put it here. Nothing is ever scanned.';
+  box.style.color = 'var(--ink-3)';
+  box.textContent = 'Media enters only when you put it here — a browser cannot '
+    + 'give a page a file’s path, so use “Add media…”, paste an absolute path, '
+    + 'or run `cutroom add ' + (DOC ? DOC.name : '<project>') + ' <path>`. '
+    + 'Nothing is ever scanned.';
 }
-async function dropped(e, lane, atT) {
-  const paths = pathsFromDrop(e.dataTransfer);
-  if (!paths.length) { addNote('bad'); note('no path in that drop', 'var(--danger)'); return null; }
-  addNote('ok');
-  const b = await addPaths(paths);
-  if (!b) return null;
-  const first = b.added[0] || (b.already[0] && mediaOf(b.already[0]));
-  // Same lane-relative measure the bin path uses: e.offsetX is read from whatever
-  // sits under the cursor, which over a populated timeline is a clip card.
-  if (first && lane !== null) place(first.mid, lane, snap(atT != null ? atT : e.offsetX / PX));
-  return b;
-}
-
 function drawBin() {
   const box = document.getElementById('bin'); box.innerHTML='';
   const h = el('h4');
@@ -783,7 +748,7 @@ function drawBin() {
     if (!p) return;
     if (await addPaths([p])) e.target.value = '';
   };
-  addNote('ok');
+  addNote();
 
   for (const m of MEDIA) {
     const odd = DOC && (m.w !== DOC.resolution[0] || m.h !== DOC.resolution[1]);
@@ -808,10 +773,14 @@ function drawBin() {
     box.append(r);
   }
   const binEl = document.getElementById('bin');
-  binEl.ondragover = e => { e.preventDefault(); binEl.classList.add('dragover'); };
-  binEl.ondragleave = () => binEl.classList.remove('dragover');
-  binEl.ondrop = e => { e.preventDefault(); binEl.classList.remove('dragover');
-                        dropped(e, null); };
+  // ⚠️ THE BIN IS DELIBERATELY NOT A DROP TARGET, and the dashed hover state
+  // that used to invite a file onto it is gone with it. A browser is not
+  // allowed to tell a page where a dropped file lives on disk — Chrome and
+  // Safari both withhold it, permanently — so that affordance advertised
+  // something it could never do and every attempt ended in an error. A control
+  // that cannot work should not look like it can. Media comes in by the picker,
+  // the path field, or the CLI, all of which are right there and all of which
+  // deal in real paths.
 }
 async function pickMedia() {
   note('picker open…', 'var(--warn)');
@@ -819,7 +788,7 @@ async function pickMedia() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({copy: wantCopy()})});
   const b = await r.json();
-  if (!r.ok) { addNote('bad'); return note((b.problems||['picker failed'])[0], 'var(--danger)'); }
+  if (!r.ok) return note((b.problems||['picker failed'])[0], 'var(--danger)');
   if (b.cancelled) return note('');
   adopt(b.project);
   note(`added ${b.added.length} file${b.added.length === 1 ? '' : 's'}`, 'var(--accent)');
@@ -1314,7 +1283,6 @@ function drop(e, lane, atT) {
     else place(text.slice(4), lane, snap(atT));
     return;
   }
-  dropped(e, lane, atT);   // a file dragged straight from the desktop
 }
 
 function draw() {
@@ -1741,7 +1709,12 @@ for (const s of SLOTS) {
 
 // A file dropped anywhere else must not navigate the page away to it.
 window.addEventListener('dragover', e => {
-  e.preventDefault();
+  e.preventDefault();                 // never navigate the window to a dropped file
+  // ...but preventing the navigation is what makes the whole window LOOK like a
+  // drop target. Only a drag out of the bin is a drop this page can honour, so
+  // everything else gets the cursor that says no. The lane handler sets its own
+  // effect for a bin drag and is not overridden here.
+  if (!DRAG_MID && e.dataTransfer) e.dataTransfer.dropEffect = 'none';
   // Hovering away from the timeline leaves a marker pointing at a seam the drop
   // will not use. The lane handler cannot see that — it stops firing.
   if (SEAM && !(e.target instanceof Element && e.target.closest('#lanes'))) clearSeam();
