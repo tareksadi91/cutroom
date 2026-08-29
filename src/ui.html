@@ -1416,6 +1416,10 @@ function park(v, at) {
 // half's frame — which seeks, and shows black or a stale frame at the very seam
 // the razor just made.
 const SLOT_UID = {};
+// The clip whose OWN first frame is being shown, or null when the monitor is
+// showing the timeline. paint() clears it, because painting is what "show the cut
+// at time t" means; showClipHead() sets it.
+let HEAD_UID = null;
 function claim(c, taken) {
   // Priority: this exact clip, then merely the right file (a preload), then free.
   // Assigning by index (live[0] always mA) made the incoming half of a crossfade
@@ -1432,6 +1436,32 @@ function claim(c, taken) {
       || free[0]
       || (taken === 'mA' ? 'mB' : 'mA');
 }
+// >>> clip-head (extracted verbatim by test_server.py — keep both markers)
+// Show the first frame of ONE clip, whatever the cut is doing at that instant.
+//
+// ⚠️ SELECTING A CLIP IS A QUESTION ABOUT THE CLIP, NOT ABOUT THE TIMELINE.
+// inspect() used to scrub to c.t + 0.01 and let paint() decide what was on
+// screen. That is right for a hard cut and wrong for every clip that fades in:
+// the incoming half of a crossfade is at opacity (t - c.t) / ov, so ten
+// milliseconds into a 1.29s dissolve it is under one percent visible and
+// clicking a clip showed you the clip BEFORE it. On this cut 21 of 36 clips
+// crossfade, so it was wrong more often than right.
+function showClipHead(c) {
+  const slot = claim(c, null);
+  const v = feed(slot, c, c.t);      // feed seeks to c.in + (t - c.t) * rate
+  park(v, c.in);                     // and park lands it exactly, not within 0.2s
+  v.style.opacity = 1;
+  v.style.zIndex = 3;
+  for (const s of SLOTS) if (s !== slot) {
+    const idle = document.getElementById(s);
+    idle.style.opacity = 0;
+    park(idle, null);
+  }
+  document.getElementById('tc-what').textContent = c.label + '  first frame';
+  HEAD_UID = c.uid;
+  return v;
+}
+// <<< clip-head
 function feed(slot,c,t) {
   const v = document.getElementById(slot);
   const want = mediaURL(c.mid);
@@ -1498,6 +1528,9 @@ function paint(t) {
   // fade and the crossfade plays as a hard cut.
   va.style.zIndex = 1;
   if (vb) vb.style.zIndex = 2;
+  // The monitor is showing the CUT again, so it is no longer showing one clip's
+  // head. Cleared here rather than in scrubTo() so playback clears it too.
+  HEAD_UID = null;
   // Hide whichever slot is not in use — by slot, not by hardcoding mB, now that
   // either one can be the primary. Its src STAYS: dropping it is what forced the
   // reload it was about to need. It is PARKED, not merely hidden.
@@ -1565,7 +1598,11 @@ function inspect(c) {
       : `<p class="empty">No passes configured. Restart the server with
          <kbd>--passes-dir &lt;dir&gt;</kbd> to enable post passes.</p>`}
     <div id="problems"></div>`;
-  scrubTo(c.t + 0.01);
+  // Move the playhead to the clip, but show the CLIP's first frame rather than
+  // the timeline's blend at that instant.
+  CLOCK = Math.max(0, c.t);
+  document.getElementById('playhead').style.left = CLOCK*PX+'px';
+  showClipHead(c);
   for (const [f,k] of [['in','in'],['out','out'],['t','t'],['rate','rate'],
                        ['label','label'],['note','note']])
     document.getElementById('f-'+f).onchange = e => {
@@ -1737,7 +1774,16 @@ document.addEventListener('keydown', e => {
 for (const s of SLOTS) {
   const v = document.getElementById(s);
   for (const ev of ['loadeddata','seeked','canplay'])
-    v.addEventListener(ev, () => { if (!RAF && DOC) scrubTo(CLOCK); });
+    v.addEventListener(ev, () => {
+      if (RAF || !DOC) return;
+      // ⚠️ COME BACK TO THE VIEW THAT IS UP, not always to the timeline. This
+      // repaint exists so a frame that decodes late still lands, but firing
+      // scrubTo() unconditionally repainted the CUT over a clip head the
+      // director had just asked for — and since the seek that shows a head is
+      // itself what fires 'seeked', it undid the fix every single time.
+      const head = HEAD_UID && DOC.clips.find(x => x.uid === HEAD_UID);
+      if (head) showClipHead(head); else scrubTo(CLOCK);
+    });
 }
 
 // A file dropped anywhere else must not navigate the page away to it.
