@@ -1465,6 +1465,82 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
+    """Run the real clamp out of ui.html, against the real fault check.
+
+    His report: "why do I always get this? sometimes a clip should fully overlap
+    and that's fine." He was right that a full overlap is fine — it is how a clip
+    that exists only as a dissolve gets made, and beat 7 is built out of them. The
+    refusal he kept hitting was for going PAST full, into a clip nested inside its
+    neighbour, which the renderer genuinely cannot express: it folds the cut into
+    one linear chain of pairwise xfades and there is no second track.
+
+    So the drag has to reach a full overlap and stop, rather than sail past it and
+    fail at save time quoting two numbers.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> drag-clamp")
+    b = html.index("// <<< drag-clamp")
+    region = html[a:b] + html[html.index("function timelineFault() {"):
+                              html.index("// How far the clip before a seam reaches")]
+    assert "function keepIfLegal" in region and "function timelineFault" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the clamp is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:4,   rate:1, lane:0, label:'A'},
+  {uid:'B', t:4, in:0, out:2.5, rate:1, lane:0, label:'B'}]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+const A = DOC.clips[0], B = DOC.clips[1], t0 = B.t;
+const wasClean = !timelineFault();
+if (!wasClean) fail('the fixture is not a legal cut to begin with');
+
+// Drag B leftward one frame at a time, straight through where it cannot legally
+// sit, and keep going. Two things are being asserted at once: the cut is NEVER
+// left in a state the renderer would refuse, and a full overlap is reachable on
+// the way.
+let good = 0, maxOverlap = 0;
+for (let f = 1; f <= 24 * 6; f++) {
+  good = keepIfLegal(-f / 24, good, v => { B.t = t0 + v; }, wasClean);
+  const fault = timelineFault();
+  if (fault) fail('frame ' + f + ' left the cut illegal: ' + fault);
+  if (B.t > A.t) maxOverlap = Math.max(maxOverlap, endOf(A) - B.t);
+}
+// A FULL overlap — B entirely inside the dissolve — has to be reachable, because
+// a clip that is nothing but a dissolve is a real shot on this film.
+if (Math.abs(maxOverlap - dur(B)) > 1e-9)
+  fail('a full overlap was never reachable — best was ' + maxOverlap.toFixed(3) +
+       ' against a ' + dur(B).toFixed(3) + 's clip');
+
+// ⚠️ AND THE CLAMP IS NOT A WALL. It holds the last LEGAL value, so a clip can
+// still be dragged the whole way across a neighbour to reorder the cut — it just
+// never comes to rest inside it. A hard barrier here would have quietly removed
+// the ability to move a clip past another at all.
+if (!(B.t < A.t)) fail('could not drag a clip past its neighbour to reorder');
+
+// A cut that is ALREADY faulty must still be draggable, or the timeline could
+// never be dragged back out of trouble.
+DOC.clips = [{uid:'A', t:0, in:0, out:4, rate:1, lane:0, label:'A'},
+             {uid:'B', t:1, in:0, out:1, rate:1, lane:0, label:'B'}];
+if (!timelineFault()) fail('the second fixture was supposed to be illegal');
+const B2 = DOC.clips[1];
+keepIfLegal(9, 0, v => { B2.t = 1 + v; }, false);
+if (B2.t !== 10) fail('a faulty cut could not be dragged out of trouble');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "clamp.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_the_page_never_offers_a_drop_it_cannot_honour():
     """A browser is not allowed to hand a page a dropped file's absolute path —
     Chrome and Safari both withhold it, permanently — and cutroom may not go

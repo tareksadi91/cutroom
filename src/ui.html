@@ -885,6 +885,9 @@ function card(c) {
     // accumulated onto live values, or the group would drift a frame per event.
     const group = mode==='move' ? selected() : [c];
     const g0 = group.map(x => [x, x.t, x.lane]);
+    // The cut the gesture started from, and the last position that stayed legal.
+    const wasClean = !timelineFault();
+    let goodDt = 0, goodEdge = {t: c.t, in: c.in, out: c.out};
     const minLane = Math.min(...g0.map(([,,L]) => L));
     const minT    = Math.min(...g0.map(([,T]) => T));
     // ⚠️ A CLIP ALREADY ON THE TIMELINE DRAGS FREELY — no seam, no ripple, on purpose.
@@ -909,11 +912,13 @@ function card(c) {
         // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
         // per-clip clamping folds the whole selection onto t=0, losing the shape AND
         // stacking clips on one instant, which the renderer rejects as a full overlap.
-        const dt = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
+        const want = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
+        const dt = goodDt = keepIfLegal(want, goodDt,
+          v => { for (const [x, xt] of g0) x.t = xt + v; }, wasClean);
         // Vertical: one lane per LANE_H of travel. Dropping one row past the
         // last lane creates a new one, so a clip never needs a button first.
-        const want = lane0 + Math.round((ev.clientY-y0)/LANE_H);
-        const next = Math.max(0, Math.min(laneCount, want));
+        const wantLane = lane0 + Math.round((ev.clientY-y0)/LANE_H);
+        const next = Math.max(0, Math.min(laneCount, wantLane));
         if (next !== lane) {
           lane = next;
           document.querySelectorAll('.lane').forEach((L,i) =>
@@ -929,9 +934,14 @@ function card(c) {
         }
         d.style.top = (8 + dl*LANE_H) + 'px';
       }
-      else if (mode==='l') { const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
-        c.t = snap(t0+(w2-in0)/c.rate, ev.altKey); c.in = w2; }
-      else c.out = Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate));
+      else if (mode==='l') {
+        const w2=Math.min(Math.max(0,in0+ds*c.rate), out0-1/DOC.fps);
+        goodEdge = keepIfLegal({t: snap(t0+(w2-in0)/c.rate, ev.altKey), in: w2, out: c.out},
+          goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, wasClean);
+      }
+      else goodEdge = keepIfLegal(
+        {t: c.t, in: c.in, out: Math.min(cap, Math.max(c.in+1/DOC.fps, out0+ds*c.rate))},
+        goodEdge, v => { c.t = v.t; c.in = v.in; c.out = v.out; }, wasClean);
       const nw = Math.max(3, dur(c)*PX);
       d.style.left=c.t*PX+'px'; d.style.width=nw+'px';
       d.classList.toggle('narrow', nw<46);
@@ -1123,6 +1133,29 @@ function insertPoints() {
 // back before it is written rather than discovered at export. Checking the finished
 // state beats reasoning about one side of a move: lifting a clip out can make its two
 // old neighbours illegal with each other, which no target-side test would ever see.
+// >>> drag-clamp (extracted verbatim by test_server.py — keep both markers)
+// Take the value the pointer is asking for, and keep it only if the cut is still
+// one the renderer would accept. Otherwise stay at the last value that was.
+//
+// ⚠️ THIS IS WHY A DRAG STOPS INSTEAD OF FAILING. Dragging one clip onto another
+// is how a crossfade is made here, so the gesture has to run all the way to a
+// FULL overlap — a clip that is nothing but a dissolve is a real shot on this
+// film. What it must not do is sail PAST that into a clip nested inside its
+// neighbour, which the renderer cannot express at all: it folds the cut into one
+// linear chain of pairwise xfades, and a nested clip has no second track to be
+// on. That used to be discovered at save time, as a refusal quoting two numbers
+// the director never asked to think about. Now the clip simply stops at the last
+// legal frame, which is exactly the full overlap.
+//
+// `wasClean` matters: if the cut was ALREADY faulty when the gesture started,
+// clamping would pin every drag to its first position and the timeline could
+// never be dragged back out of trouble.
+function keepIfLegal(want, last, apply, wasClean) {
+  apply(want);
+  if (wasClean && timelineFault()) { apply(last); return last; }
+  return want;
+}
+// <<< drag-clamp
 function timelineFault() {
   // ⚠️ MIRRORS render.py's validate() EXPRESSION FOR EXPRESSION. Written loosely once
   // and it was BOTH too weak and too strict: it missed the renderer's same-start rule
