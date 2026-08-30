@@ -2338,6 +2338,51 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_probe_takes_its_duration_from_decoded_frames_not_the_container():
+    """A container can claim more time than it holds pictures.
+
+    b02_22_claim_short reported duration 3.194987s and nb_frames 77 while
+    decoding 76 frames. Storing the container number put a clip on the timeline
+    that owned a frame nobody could show: the browser monitor ran past the last
+    frame, the decoder dropped to readyState 1, and the preview went BLACK at
+    the end of that clip. validate() refused the very same clip at export, so
+    `cutroom add` was recording a length this program would not render.
+
+    The stub is the point. If probe() ever goes back to trusting the container,
+    a source_frames() that says 12 changes nothing and this fails.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src = synth(pathlib.Path(d) / "a.mp4", dur=1.0)   # 24 frames at 24fps
+        honest = server.probe(str(src))
+        assert abs(honest["dur"] * 24 - round(honest["dur"] * 24)) < 1e-9, \
+            f"duration {honest['dur']} is not a whole number of frames"
+
+        real = server.render_mod.source_frames
+        server.render_mod.source_frames = lambda _p: 12
+        try:
+            lied = server.probe(str(src))
+        finally:
+            server.render_mod.source_frames = real
+        assert lied["dur"] == 12 / 24, (
+            f"probe() ignored the decoded frame count: got {lied['dur']}, "
+            f"expected {12/24}. It is reading the container again.")
+
+
+def test_probe_falls_back_to_flooring_when_the_decode_cannot_answer():
+    """A source that will not count frames still must not claim a phantom one."""
+    with tempfile.TemporaryDirectory() as d:
+        src = synth(pathlib.Path(d) / "b.mp4", dur=1.0)
+        real = server.render_mod.source_frames
+        server.render_mod.source_frames = lambda _p: None
+        try:
+            got = server.probe(str(src))
+        finally:
+            server.render_mod.source_frames = real
+        assert got["dur"] is not None
+        assert abs(got["dur"] * 24 - round(got["dur"] * 24)) < 1e-6, \
+            f"fallback produced an off-grid duration: {got['dur']}"
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

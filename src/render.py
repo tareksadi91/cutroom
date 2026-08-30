@@ -226,6 +226,31 @@ def _probe_source(path):
     return {"dur": seconds, "fps": r_fps, "avg_fps": avg_fps, "w": w, "h": h}
 
 
+def source_frames(path):
+    """How many video frames `path` ACTUALLY decodes, or None.
+
+    Nothing else here is allowed to answer this question. A container's
+    `duration` and its `nb_frames` are both CLAIMS, and both overstate: one file
+    in the courier reports duration 3.194987s (76.7 frames) and nb_frames 77,
+    while it decodes 76. A timeline built on either number owns a frame that
+    does not exist — the preview plays past the end and goes black, and
+    validate() refuses the same clip at export. Decoding is the only proof, and
+    it costs ~0.8s for an 8s clip on a path that runs once per file.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    try:
+        n = int(out.split(",")[0])
+    except (ValueError, IndexError):
+        return None
+    return n if n > 0 else None
+
+
 def source_duration(path):
     """Seconds of video in `path`, or None. Kept as its own name because that
     is what most callers want to ask."""

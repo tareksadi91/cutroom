@@ -71,6 +71,7 @@ import datetime
 import fcntl
 import http.server
 import json
+import math
 import mimetypes
 import os
 import pathlib
@@ -694,7 +695,28 @@ def probe(path):
     info = render_mod.source_info(path)
     if not info:
         return {}
-    return {"dur": info["dur"], "w": info["w"], "h": info["h"]}
+    # ⚠️ FLOORED TO WHOLE FRAMES, NOT THE CONTAINER'S DURATION. A container can
+    # claim more time than it holds pictures: b02_22_claim_short reported
+    # 3.194987s but decodes 76 frames, which at 24fps is 3.166667s. Recording the
+    # container number put a clip on the timeline whose last 0.028s has no frame,
+    # and TWO things went wrong with it. The monitor played the element past its
+    # final frame, the decoder dropped to readyState 1 and seeked, and paint()
+    # — correctly — hid a video with no picture, so the preview flashed BLACK at
+    # the end of that clip. And validate() then REFUSED the same clip at export
+    # (render.py: want 77 frames > have 76, "retrim it"), so `cutroom add` was
+    # handing the renderer a length it would not accept.
+    # COUNTED, not computed. nb_frames is no safer than duration — this same
+    # file claims 77 there and decodes 76. Falling back to floor(dur * rate)
+    # only when the decode cannot answer, which is still nearer the truth than
+    # the container's own number.
+    dur, fps = info["dur"], info.get("fps")
+    if fps:
+        frames = render_mod.source_frames(path)
+        if frames:
+            dur = frames / fps
+        elif dur is not None:
+            dur = math.floor(dur * fps + 1e-6) / fps
+    return {"dur": dur, "w": info["w"], "h": info["h"]}
 
 
 def _next_mid(project):
