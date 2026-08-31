@@ -1364,7 +1364,7 @@ def create(name, fps=24, resolution=(720, 1280)):
     return doc
 
 
-def serve(name, port, passes_dir=None):
+def serve(name, port, passes_dir=None, open_browser=True):
     global PASSES_DIR
     check_name(name)
     if passes_dir is not None:
@@ -1385,7 +1385,11 @@ def serve(name, port, passes_dir=None):
     url = f"http://127.0.0.1:{port}/"
     print(f"cut room — {name} — {url}   (ctrl-c to stop)")
     print(f"  passes: {PASSES_DIR if PASSES_DIR else 'disabled (no --passes-dir)'}")
-    threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    # Opening is a convenience for the first start, not a rule. A restart is the
+    # common case while editing this file, and each one used to spawn another tab
+    # — fifteen of them in one session before anybody counted.
+    if open_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     srv.serve_forever()
 
 
@@ -1413,6 +1417,9 @@ def main(argv=None):
                    help="directory of post-pass scripts. Without it, passes are "
                         "disabled entirely — the safe default, since anything "
                         "that can run an executable can delete a file.")
+    p.add_argument("--no-open", action="store_true",
+                   help="do not open a browser tab. The tab is a convenience on "
+                        "the first start; on a restart it is another tab.")
 
     p = sub.add_parser("export", help="render the cut to mp4")
     p.add_argument("project")
@@ -1440,7 +1447,7 @@ def main(argv=None):
             for mid in payload["already"]:
                 print(f"  {mid}  already in the project")
         elif a.cmd == "serve":
-            serve(a.project, a.port, a.passes_dir)
+            serve(a.project, a.port, a.passes_dir, not a.no_open)
         elif a.cmd == "export":
             status, payload = export(a.project)
             if status != 200:
