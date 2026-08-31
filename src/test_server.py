@@ -1618,6 +1618,15 @@ def test_the_page_never_offers_a_drop_it_cannot_honour():
         "a failed picker request leaves the page stuck on picker open"
 
 
+def test_license_copy_is_not_top_nav_clutter_but_source_stays_reachable():
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    assert "AGPL · source" not in html, "the licence label came back into the nav"
+    assert 'href="https://github.com/tareksadi91/cutroom"' in html, \
+        "network users lost the source link"
+    tip = html[html.index('<span class="tip">'):html.index('</span></span>')]
+    assert ">Source code</a>" in tip, "the source link is not in the info popover"
+
+
 def test_native_picker_non_macos_points_at_cli_not_a_removed_control():
     old = server.sys.platform
     server.sys.platform = "linux"
