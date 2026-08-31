@@ -1787,7 +1787,11 @@ document.addEventListener('keydown', e => {
   if (e.key==='ArrowLeft')  { e.preventDefault(); scrubTo(CLOCK - (e.shiftKey?1:1/DOC.fps)); }
   if (e.key==='ArrowRight') { e.preventDefault(); scrubTo(CLOCK + (e.shiftKey?1:1/DOC.fps)); }
   if (e.key==='s'||e.key==='S') { e.preventDefault(); razor(); }
-  if (e.key==='l'||e.key==='L') { e.preventDefault(); setLayout(LAYOUT==='top'?'side':'top'); }
+  // Not while a clip is in hand: setLayout() redraws the lanes, which detaches
+  // the card holding pointer capture and strands the edit uncommitted.
+  if ((e.key==='l'||e.key==='L') && !DRAGGING) {
+    e.preventDefault(); setLayout(LAYOUT==='top'?'side':'top');
+  }
   if (e.key==='Home') scrubTo(0);
   if (e.key==='End')  scrubTo(totalLen());
   // ⚠️ Anything that calls draw() while a drag is live replaces the card the drag
@@ -1878,7 +1882,7 @@ async function boot() {
     fitZoom();
     drawBin(); draw(); scrubTo(0);
     let storedLay = null;
-    try { storedLay = localStorage.getItem(LAY_KEY); } catch (e) {}
+    try { storedLay = localStorage.getItem(layKey()); } catch (e) {}
     setLayout(storedLay === 'top' ? 'top' : 'side');
     if (Object.keys(OFFLINE).length)
       note(Object.keys(OFFLINE).length + ' clip(s) OFFLINE — the cut is intact, '
@@ -1899,7 +1903,10 @@ async function boot() {
 // the spec's "removed from a Document" steps await a stable state and then
 // abort if the element is back in a document, which it is. Two <video>s in two
 // docks would be the thing that actually broke playback.
-const LAY_KEY = 'cutroom:layout', LAYH_KEY = 'cutroom:previewH';
+// Keyed per project: the same port serves different films at different times,
+// and portrait and landscape cuts want different layouts.
+const layKey  = () => 'cutroom:layout:'   + (DOC && DOC.name ? DOC.name : '_');
+const layhKey = () => 'cutroom:previewH:' + (DOC && DOC.name ? DOC.name : '_');
 const MIN_PREVIEW = 120, MIN_LANES = 160;
 let LAYOUT = 'side';
 
@@ -1913,7 +1920,7 @@ function clampPreview(px) {
 function setPreviewH(px) {
   const v = clampPreview(px);
   document.body.style.setProperty('--previewH', v + 'px');
-  try { localStorage.setItem(LAYH_KEY, String(v)); } catch (e) {}
+  try { localStorage.setItem(layhKey(), String(v)); } catch (e) {}
 }
 
 function setLayout(mode) {
@@ -1934,11 +1941,11 @@ function setLayout(mode) {
   b.classList.toggle('primary', LAYOUT === 'top');
   if (LAYOUT === 'top') {
     let stored = null;
-    try { stored = localStorage.getItem(LAYH_KEY); } catch (e) {}
+    try { stored = localStorage.getItem(layhKey()); } catch (e) {}
     setPreviewH(parseInt(stored, 10) || 300);
   }
-  try { localStorage.setItem(LAY_KEY, LAYOUT); } catch (e) {}
-  fitZoom(); draw();
+  try { localStorage.setItem(layKey(), LAYOUT); } catch (e) {}
+  draw();
 }
 
 // The monitor's box is the PROJECT's shape, not a constant. A 16:9 cut in a
@@ -1981,7 +1988,6 @@ document.getElementById('layout').onclick =
     try { sp.releasePointerCapture(e.pointerId); } catch (err) {}
     sp.classList.remove('drag');
     document.body.classList.remove('split-drag');
-    fitZoom(); draw();
   };
   sp.addEventListener('pointerup', end);
   sp.addEventListener('pointercancel', end);
