@@ -702,6 +702,51 @@ def test_the_renderer_refuses_to_overwrite_an_existing_output():
         assert out.read_bytes() == b"SOMETHING THAT IS ALREADY HERE"
 
 
+def test_validate_counts_frames_the_way_probe_does():
+    """A container can say less time than it holds pictures, and then the two
+    halves of this program disagree about one frame.
+
+    exit-reel decoded 248 frames but its container said 10.333008s, which floors
+    to 247 at 24fps. probe() had already recorded 248, so a clip using the whole
+    file was legal on the save path and REFUSED at export — a cut that renders
+    perfectly, rejected. A validator that refuses a legal edit is as bad as one
+    that passes an illegal one.
+
+    The stub is the point: if validate() goes back to flooring the duration, the
+    counted 30 is ignored and this fails.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src = _lavfi(pathlib.Path(d) / "a.mp4", "black", seconds=1.0, size="160x120")
+        project = {"fps": 24, "resolution": [160, 120],
+                   "media": [{"mid": "m01", "path": str(src), "dur": 30 / 24,
+                              "w": 160, "h": 120}],
+                   "clips": [{"uid": "c01", "mid": "m01", "lane": 0, "t": 0.0,
+                              "in": 0.0, "out": 30 / 24, "rate": 1.0}]}
+
+        real = render.source_frames
+        render.source_frames = lambda _p: 30
+        try:
+            problems = render.validate(project, check_files=True)
+        finally:
+            render.source_frames = real
+        assert not [p for p in problems if "claims" in p], (
+            f"validate refused a clip the decode says is legal: {problems}")
+
+
+def test_validate_still_refuses_a_trim_past_a_countable_end():
+    """The counted number must still be able to say no."""
+    with tempfile.TemporaryDirectory() as d:
+        src = _lavfi(pathlib.Path(d) / "b.mp4", "black", seconds=1.0, size="160x120")
+        project = {"fps": 24, "resolution": [160, 120],
+                   "media": [{"mid": "m01", "path": str(src), "dur": 2.0,
+                              "w": 160, "h": 120}],
+                   "clips": [{"uid": "c01", "mid": "m01", "lane": 0, "t": 0.0,
+                              "in": 0.0, "out": 2.0, "rate": 1.0}]}
+        problems = render.validate(project, check_files=True)
+        assert any("claims" in p for p in problems), (
+            f"a 2.0s trim of a 1.0s source should be refused, got {problems}")
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

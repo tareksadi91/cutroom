@@ -431,7 +431,15 @@ def validate(project, check_files=True):
                     # 1.000s source and duration() then modelled 25 frames where
                     # ffmpeg emits 24. The trim may claim no more frames than
                     # the file actually holds.
-                    have = math.floor(info["dur"] * fps + 1e-6)
+                    # COUNTED, falling back to the duration. probe() records a
+                    # media's length from a decode, so a project can legally
+                    # hold a clip whose out is the 248th frame of a file whose
+                    # CONTAINER says 10.333008s — which floors to 247 and
+                    # refused a cut that renders perfectly. The two halves of
+                    # this program have to count frames the same way.
+                    have = source_frames(src)
+                    if have is None:
+                        have = math.floor(info["dur"] * fps + 1e-6)
                     want = math.ceil(cc["out"] * fps - 1e-9)
                     if want > have:
                         problems.append(
