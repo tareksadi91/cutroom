@@ -1641,6 +1641,36 @@ def test_tooltips_belong_to_the_elements_they_explain():
         "keyboard focus no longer opens tooltips"
 
 
+def test_every_call_to_action_explains_itself_on_hover():
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    titled = {
+        "zout": "zoom timeline out",
+        "zin": "zoom timeline in",
+        "layout": "move the preview",
+        "cut": "cut every clip",
+        "play": "play or stop",
+        "export": "render this cut",
+        "hist": "restore an earlier state",
+        "pick": "choose files and copy",
+        "tool": "choose a configured post-processing pass",
+        "runpass": "create a derived file",
+        "ruler": "click or drag to move",
+        "ph-grab": "drag to scrub",
+    }
+    for control, explanation in titled.items():
+        at = html.index(f'id="{control}"')
+        tag_end = html.index(">", at)
+        assert explanation in html[at:tag_end], \
+            f"{control} has no useful hover explanation"
+    assert "mine.title = 'save your local cut" in html
+    assert "theirs.title = 'discard your local cut" in html
+    assert "drag onto a lane to add to the cut" in html
+    assert "drag to move · drag edges to trim" in html
+    # Add lane has the richer custom tooltip instead of duplicating it in title.
+    addlane = html.index('id="addlane"')
+    assert 'class="has-tip"' in html[addlane - 80:addlane]
+
+
 def test_native_picker_non_macos_points_at_cli_not_a_removed_control():
     old = server.sys.platform
     server.sys.platform = "linux"

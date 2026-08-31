@@ -285,7 +285,7 @@
   </div>
   <div class="zone">
     <div class="zoom">
-      <button id="zout">−</button><span id="zlab">10 px/s</span><button id="zin">+</button>
+      <button id="zout" title="zoom timeline out (-)">−</button><span id="zlab">10 px/s</span><button id="zin" title="zoom timeline in (=)">+</button>
     </div>
     <span class="has-tip"><button id="addlane">+ lane</button><span class="tip r">
       <b>Lanes are a workspace, not layers</b>
@@ -302,17 +302,17 @@
   </div>
   <div class="zone">
     <button id="cut" title="cut every clip under the playhead (S)">✂ cut</button>
-    <button id="play" class="primary">▶ play</button>
-    <button id="export">export</button>
+    <button id="play" class="primary" title="play or stop from the playhead (Space)">▶ play</button>
+    <button id="export" title="render this cut to a new versioned video">export</button>
     <select id="hist" title="restore an earlier state of the cut"><option>history…</option></select>
   </div>
   <div class="zone"><span id="status"></span></div>
 </header>
 
 <div id="bin"></div>
-<div id="stage"><div id="ruler"></div>
+<div id="stage"><div id="ruler" title="click or drag to move the playhead"></div>
   <div style="position:relative"><div id="lanes"></div><div id="xfades"></div></div>
-  <div id="playhead"><div id="ph-grab"></div></div></div>
+  <div id="playhead"><div id="ph-grab" title="drag to scrub the playhead"></div></div></div>
 <div id="dock"></div>
 <div id="split"></div>
 <div id="side">
@@ -618,8 +618,10 @@ function conflictNote(stashed) {
       ? 'NOT SAVED — the file changed under you. Your edits are safe on disk: '
       : 'NOT SAVED — the file changed under you. Your edits are still here: ');
   const mine = el('button'); mine.textContent = 'keep mine';
+  mine.title = 'save your local cut over the newer file';
   mine.onclick = keepMine;
   const theirs = el('button'); theirs.textContent = 'take theirs';
+  theirs.title = 'discard your local cut and load the newer file';
   theirs.onclick = takeTheirs;
   s.append(mine, ' ', theirs);
 }
@@ -692,7 +694,7 @@ function drawBin() {
   box.append(h);
 
   const add = el('div'); add.id = 'add';
-  add.innerHTML = `<button id="pick">Add media…</button>`;
+  add.innerHTML = `<button id="pick" title="choose files and copy them into this project">Add media…</button>`;
   box.append(add);
   document.getElementById('pick').onclick = pickMedia;
 
@@ -707,7 +709,7 @@ function drawBin() {
         <div class="stem">${esc(m.label)}</div>
         <div class="sub">${sub}</div>
       </div>`;
-    r.title = m.path;
+    r.title = `drag onto a lane to add to the cut · ${m.path}`;
     r.ondragstart = e => {
       e.dataTransfer.setData('text/plain', 'mid:' + m.mid);
       // dataTransfer payloads are unreadable during dragover — browsers only expose
@@ -805,7 +807,7 @@ function card(c) {
                  <span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
                  <div class="h l"></div><div class="h r"></div>`;
   const m = mediaOf(c.mid);
-  d.title = `${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
+  d.title = `drag to move · drag edges to trim · ${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
                                                        : (m ? m.path : c.mid)}`;
   d.dataset.uid = c.uid;
   d.onpointerdown = e => {
@@ -1568,9 +1570,11 @@ function inspect(c) {
            name is claimed; your pass overwrites it.</p>
       </span></span></h4>
     ${PASSES.length
-      ? `<select id="tool">${PASSES.map(t=>`<option>${esc(t)}</option>`).join('')}</select>
-         <input class="args" id="targs" placeholder="extra arguments">
-         <button class="run" id="runpass">Run pass</button>`
+      ? `<select id="tool" title="choose a configured post-processing pass">${PASSES.map(t=>`<option>${esc(t)}</option>`).join('')}</select>
+         <input class="args" id="targs" placeholder="extra arguments"
+                title="optional arguments passed to the selected post pass">
+         <button class="run" id="runpass"
+                 title="create a derived file and point this clip at it">Run pass</button>`
       : `<p class="empty">No passes configured. Restart the server with
          <kbd>--passes-dir &lt;dir&gt;</kbd> to enable post passes.</p>`}
     <div id="problems"></div>`;
