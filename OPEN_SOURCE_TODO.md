@@ -1,0 +1,179 @@
+# Open-source readiness checklist
+
+Context handoff for work identified during holistic review on 2026-08-31.
+
+Baseline at review time:
+
+- Branch: `main`
+- Commit: `e265645`
+- Worktree clean and synced with `origin/main`
+- `./cutroom check`: 104 tests passed
+- No tracked media, large blobs, or live credentials found
+- Repository still private
+
+## 1. Release blocker: protect local HTTP mutations
+
+- [ ] Add protection against malicious websites sending requests to Cutroom on
+      `127.0.0.1`.
+- [ ] Require a server-generated capability token for every state-changing HTTP
+      request: `PUT /project` and all `POST` routes.
+- [ ] Validate `Host` against the bound loopback host and port.
+- [ ] Reject browser mutation requests whose `Origin` is not Cutroom's own origin.
+      Keep a documented path for local agents that do not send an `Origin` header.
+- [ ] Require `Content-Type: application/json` for JSON mutation routes.
+- [ ] Cap request-body size and return `413` when exceeded.
+- [ ] Add regression tests covering hostile `Origin`, hostile `Host`, missing or
+      wrong token, non-JSON content, oversized bodies, and valid browser/agent calls.
+
+Evidence: `src/server.py:_body`, `do_PUT`, and `do_POST` currently accept a
+cross-origin `text/plain` POST. A request carrying
+`Origin: https://attacker.example` reached `/render` during review instead of
+being rejected.
+
+Done when: hostile requests fail before any route action; browser UI, CLI, and
+documented agent workflow still work; all tests pass.
+
+## 2. Validate projects at their boundaries
+
+- [ ] Validate `cutroom new` arguments before creating any file.
+- [ ] Require positive fps.
+- [ ] Require `WIDTHxHEIGHT` with positive integer dimensions compatible with
+      `yuv420p` output; use even dimensions unless renderer format changes.
+- [ ] Return concise argparse-style errors instead of Python tracebacks.
+- [ ] On `serve`, run project shape validation before binding or opening browser.
+- [ ] On `export`, fail cleanly for malformed hand-edited project documents.
+- [ ] Tighten `shape_problems()` so resolution values match renderer's real
+      integer/even-dimension requirements.
+- [ ] Add tests for zero/negative fps, malformed resolution strings, float/odd/
+      negative dimensions, `{}`, and partially malformed project documents.
+
+Evidence: `src/server.py:create()` writes unchecked settings; `serve()` checks
+JSON syntax only. `src/render.py:offline()` then indexes `project["clips"]`.
+
+Done when: invalid project cannot be created or served, and every refusal names
+the bad field without a traceback or partial project.
+
+## 3. Reject unreadable media during import
+
+- [ ] Make `add_media()` reject new files that `ffprobe` cannot identify as usable
+      video.
+- [ ] Show one friendly problem per rejected path.
+- [ ] Preserve current behavior for media already in a project that later goes
+      missing or offline.
+- [ ] Test mixed batches containing valid, invalid, and already-added media.
+
+Evidence: `src/server.py:add_media()` currently stores an entry even when
+`probe()` returns no duration or dimensions; failure appears much later at export.
+
+Done when: broken input fails at import, while moved/missing existing footage
+still appears as OFFLINE without rewriting the project.
+
+## 4. Document safe agent integration
+
+- [ ] Add `AGENTS.md` or `docs/agent-integration.md`.
+- [ ] State hard rule: agents use `PUT /project` or `edit_project()`, never write
+      `<project>.json` directly.
+- [ ] Explain version guard, conflict response, snapshots, media allowlist, and
+      retry/rebase behavior.
+- [ ] Include copy-paste examples for reading a project, adding media, making a
+      safe edit, and handling `409`.
+- [ ] Explain capability-token flow introduced by task 1.
+- [ ] Link guide from README within two clicks.
+
+Evidence: locking contract exists in `src/server.py` module comments and one line
+of `SPEC.md`, but README's agent promises do not give agents enough operational
+instructions to honor it.
+
+Done when: a fresh coding agent can install Cutroom and edit one project safely
+without reverse-engineering server code.
+
+## 5. Make platform support honest
+
+- [ ] State clearly in README: macOS and Linux supported; Windows not yet
+      supported.
+- [ ] Explain macOS has native `Add media...` picker; Linux uses CLI import.
+- [ ] Ensure installation prerequisites name Python 3, `ffmpeg`, and `ffprobe`.
+- [ ] Verify manual setup commands on both supported platforms through CI or a
+      documented manual check.
+
+Evidence: server imports `fcntl`; README currently says "On any system" for CLI
+import, which can imply Windows support.
+
+## 6. Add minimum public-repository infrastructure
+
+- [ ] Add GitHub Actions workflow running `./cutroom check` on macOS and Linux.
+- [ ] Add concise `CONTRIBUTING.md` with setup, test command, safety invariants,
+      and pull-request expectations.
+- [ ] Add `SECURITY.md` with private vulnerability-reporting route and supported
+      versions.
+- [ ] Update GitHub description to match new README positioning.
+- [ ] Add useful topics such as `video-editing`, `local-first`, `ffmpeg`,
+      `agent-tools`, and `open-source`.
+- [ ] Decide whether homepage field should remain empty or point to demo/docs.
+- [ ] Keep repository private until release blockers and final QA are complete.
+
+Done when: every pushed commit gets tested and a visitor can understand how to
+contribute or report a security issue.
+
+## 7. Add screenshot to README
+
+- [x] Preserve supplied screenshot inside repository at
+      `docs/assets/cutroom-the-courier.png`.
+- [ ] Insert screenshot near top of README after opening description.
+- [ ] Add useful alt text describing media bin, program monitor, and timeline.
+- [ ] Check GitHub rendering at desktop and narrow widths.
+- [ ] Consider whether project name or film imagery exposes anything unwanted
+      before repository becomes public.
+
+## 8. Keep AGPL source access visible without restoring nav clutter
+
+- [ ] Move or duplicate `Source code` link into a small, discoverable help/about
+      surface or footer.
+- [ ] Keep AGPL label out of top navigation.
+- [ ] Confirm keyboard and touch users can reach source link without discovering
+      an unmarked hover target.
+- [ ] Preserve `rel="noopener"` on external link.
+
+Evidence: link currently lives inside project-name tooltip in `src/ui.html`.
+AGPL section 13 says modified network versions must "prominently offer" source.
+This checklist is product hygiene, not legal advice.
+
+## 9. Clean public-facing repository history and documents
+
+- [ ] Decide whether personal email in commit `0f18e55` may remain public.
+- [ ] If privacy matters, rewrite that author metadata before making repository
+      public, then verify all refs. This is destructive and requires an explicit
+      decision before execution.
+- [ ] Reframe `NOTES.md` as historical engineering notes, move it under `docs/`,
+      or omit it from public root.
+- [ ] Remove or label stale claims in `NOTES.md`, including info-icon tooltips and
+      old 77-test count.
+- [ ] Run full-history credential scan with a dedicated scanner before public
+      release. Regex review found no live secret, but no dedicated scanner was
+      installed during review.
+
+## 10. Final release gate
+
+- [ ] Run `./cutroom check`; require all tests green.
+- [ ] Run secret scan across current tree and git history.
+- [ ] Confirm worktree contains no media, project JSON, renders, derived outputs,
+      local paths, or private film notes.
+- [ ] Test fresh ZIP download instructions from a temporary directory.
+- [ ] Test fresh clone instructions from a temporary directory.
+- [ ] Launch sample project and manually verify import, trim, move, cut, playback,
+      history, conflict handling, and export.
+- [ ] Verify README links, screenshot, license, platform note, security policy,
+      contribution guide, and agent guide on GitHub.
+- [ ] Confirm GitHub Actions passes on macOS and Linux.
+- [ ] Only then change repository visibility to public.
+
+## Explicit non-goals before first public release
+
+- [ ] Do not split `server.py` or `ui.html` only because they are large.
+- [ ] Do not optimize rendering without a measured bottleneck.
+- [ ] Do not build installers, packaging, or hosted services before public usage
+      shows demand.
+
+Pressure test: broad cleanup can delay learning while increasing regression risk.
+Security, truthful onboarding, agent safety, and reproducible CI survive that test;
+architecture churn does not.
