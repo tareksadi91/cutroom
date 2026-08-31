@@ -1881,6 +1881,7 @@ async function boot() {
     document.getElementById('tip-fps').textContent = DOC.fps;
     fitZoom();
     drawBin(); draw(); scrubTo(0);
+    migrateLayoutKeys();
     let storedLay = null;
     try { storedLay = localStorage.getItem(layKey()); } catch (e) {}
     setLayout(storedLay === 'top' ? 'top' : 'side');
@@ -1921,6 +1922,24 @@ function setPreviewH(px) {
   const v = clampPreview(px);
   document.body.style.setProperty('--previewH', v + 'px');
   try { localStorage.setItem(layhKey(), String(v)); } catch (e) {}
+}
+
+// One-time migration. These keys used to be global, which is what let a
+// portrait cut inherit a landscape cut's layout. Whichever project opens first
+// adopts the old value; the global keys then go, so this runs once and never
+// fires again.
+function migrateLayoutKeys() {
+  try {
+    const lay = localStorage.getItem('cutroom:layout');
+    const h   = localStorage.getItem('cutroom:previewH');
+    if (lay === null && h === null) return;
+    if (lay !== null && localStorage.getItem(layKey())  === null)
+      localStorage.setItem(layKey(), lay);
+    if (h   !== null && localStorage.getItem(layhKey()) === null)
+      localStorage.setItem(layhKey(), h);
+    localStorage.removeItem('cutroom:layout');
+    localStorage.removeItem('cutroom:previewH');
+  } catch (e) {}
 }
 
 function setLayout(mode) {
