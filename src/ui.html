@@ -20,7 +20,7 @@
   }
   * { box-sizing:border-box; }
   body, #ruler, .lane, .clip, header, #bin { user-select:none; -webkit-user-select:none; }
-  #insp input, .args, #addpath { user-select:text; -webkit-user-select:text; }
+  #insp input, .args { user-select:text; -webkit-user-select:text; }
   body {
     margin:0; background:var(--bg); color:var(--ink);
     font:400 13px/1.45 var(--sans); font-variant-numeric:tabular-nums;
@@ -92,15 +92,8 @@
   #bin .sub { font:400 11px/1.4 var(--mono); color:var(--ink-3); }
   #bin .odd { color:var(--warn); }
   #bin .gone { color:var(--danger); }
-  /* The add block: a real drop target, a picker, and a path field. All three
-     are here because only the last two can be relied on — see addNote(). */
-  #add { margin:14px 16px 8px; display:flex; flex-direction:column; gap:8px; }
+  #add { margin:14px 16px 8px; }
   #add button { width:100%; }
-  #addpath { width:100%; background:var(--bg); color:var(--ink);
-             border:1px solid var(--rule); border-radius:4px;
-             font:400 11px/1.3 var(--mono); padding:7px 8px; }
-  #addpath:focus { outline:none; border-color:var(--accent); }
-  #addhint { font:400 11px/1.45 var(--sans); color:var(--ink-3); }
 
   /* ── timeline ─────────────────────────────────────────────────────── */
   #stage { overflow:auto; position:relative; background:var(--bg); }
@@ -377,7 +370,6 @@ function paintSelection() {
     n.classList.toggle('lead', n.dataset.uid === SEL);
   }
 }
-let COPYIN = true;   // drawBin() rebuilds the box; the choice must outlive it
 let RAF = null, T0 = 0, CLOCK = 0;
 const MON = {};
 let DRAG_MID = null, SEAM = null;   // media in flight from the bin, and where it would land
@@ -696,50 +688,6 @@ async function save() {
 // <<< save-loop
 
 // ── adding media ─────────────────────────────────────────────────────────
-// Copy-in is ON by default. It is not what keeps your originals safe — they
-// are only ever opened read-only, and nothing here can write to one — it is
-// what keeps this cut working after the folder they came from moves, empties
-// or is rewritten by a merge.
-const wantCopy = () => { const b = document.getElementById('docopy');
-                         return !b || b.checked; };
-async function addPaths(paths) {
-  if (!paths.length) return null;
-  const copy = wantCopy();
-  note(copy ? 'copying in…' : 'adding…', 'var(--warn)');
-  let r, b;
-  try {
-    r = await fetch('/media', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({paths, copy})});
-    b = await r.json();
-  } catch (e) {
-    // A copy that dies mid-flight (disk full, server gone) must not leave the
-    // page sitting on "copying in…" as if it were still working.
-    note('not added — the cut room is not answering (' + e.message + ')',
-         'var(--danger)');
-    return null;
-  }
-  if (!r.ok) { note((b.problems || ['could not add'])[0], 'var(--danger)'); return null; }
-  adopt(b.project);
-  if (b.problems && b.problems.length) {
-    // 207: some copies landed, one did not. What landed is on the list.
-    return note('stopped part-way — ' + b.problems[0], 'var(--danger)');
-  }
-  const n = b.added.length;
-  note(n ? `added ${n} file${n > 1 ? 's' : ''}`
-         : 'already in this project', n ? 'var(--accent)' : null);
-  return b;
-}
-// The standing hint under the add controls. There is no failure branch any
-// more: the page no longer offers a drop that can fail for want of a path.
-function addNote() {
-  const box = document.getElementById('addhint');
-  box.style.color = 'var(--ink-3)';
-  box.textContent = 'Media enters only when you put it here — a browser cannot '
-    + 'give a page a file’s path, so use “Add media…”, paste an absolute path, '
-    + 'or run `cutroom add ' + (DOC ? DOC.name : '<project>') + ' <path>`. '
-    + 'Nothing is ever scanned.';
-}
 function drawBin() {
   const box = document.getElementById('bin'); box.innerHTML='';
   const h = el('h4');
@@ -757,21 +705,9 @@ function drawBin() {
   box.append(h);
 
   const add = el('div'); add.id = 'add';
-  add.innerHTML = `<button id="pick">Add media…</button>
-    <input id="addpath" placeholder="or paste an absolute path" spellcheck="false">
-    <label id="copyin"><input type="checkbox" id="docopy" ${COPYIN ? 'checked' : ''}>
-      copy the file into this project</label>
-    <div id="addhint"></div>`;
+  add.innerHTML = `<button id="pick">Add media…</button>`;
   box.append(add);
-  document.getElementById('docopy').onchange = e => { COPYIN = e.target.checked; };
   document.getElementById('pick').onclick = pickMedia;
-  document.getElementById('addpath').onkeydown = async e => {
-    if (e.key !== 'Enter') return;
-    const p = e.target.value.trim();
-    if (!p) return;
-    if (await addPaths([p])) e.target.value = '';
-  };
-  addNote();
 
   for (const m of MEDIA) {
     const odd = DOC && (m.w !== DOC.resolution[0] || m.h !== DOC.resolution[1]);
@@ -801,20 +737,28 @@ function drawBin() {
   // allowed to tell a page where a dropped file lives on disk — Chrome and
   // Safari both withhold it, permanently — so that affordance advertised
   // something it could never do and every attempt ended in an error. A control
-  // that cannot work should not look like it can. Media comes in by the picker,
-  // the path field, or the CLI, all of which are right there and all of which
-  // deal in real paths.
+  // that cannot work should not look like it can. The page uses the native
+  // picker; agents use the CLI.
 }
 async function pickMedia() {
   note('picker open…', 'var(--warn)');
-  const r = await fetch('/media/pick', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({copy: wantCopy()})});
-  const b = await r.json();
-  if (!r.ok) return note((b.problems||['picker failed'])[0], 'var(--danger)');
-  if (b.cancelled) return note('');
-  adopt(b.project);
-  note(`added ${b.added.length} file${b.added.length === 1 ? '' : 's'}`, 'var(--accent)');
+  try {
+    const r = await fetch('/media/pick', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({copy: true})});
+    const b = await r.json();
+    if (!r.ok && r.status !== 207)
+      return note((b.problems||['picker failed'])[0], 'var(--danger)');
+    if (b.cancelled) return note('');
+    adopt(b.project);
+    const added = b.added || [];
+    if (r.status === 207)
+      return note(`added ${added.length}; stopped part-way — ${(b.problems||['copy failed'])[0]}`,
+                  'var(--danger)');
+    note(`added ${added.length} file${added.length === 1 ? '' : 's'}`, 'var(--accent)');
+  } catch (e) {
+    note(`picker failed — ${e.message || e}`, 'var(--danger)');
+  }
 }
 // >>> adopt (extracted verbatim by test_server.py — keep both markers)
 // Take a whole new document from the server (add media, run a pass) and rebind.

@@ -1587,8 +1587,8 @@ def test_the_page_never_offers_a_drop_it_cannot_honour():
     So the page does not ASK for one. It used to: the media panel had a
     "drop to add to this project" hover state, and every attempt ended in an
     error explaining why it could not work. A control that cannot work should
-    not look like it can. The routes that deal in real paths are the picker,
-    the path field and the CLI, and they are all in the same panel.
+    not look like it can. The page keeps only the native picker; agents use the
+    CLI without needing a second explanation in the interface.
     """
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
     assert "drop to add to this project" not in html, \
@@ -1602,10 +1602,33 @@ def test_the_page_never_offers_a_drop_it_cannot_honour():
     # a dropped file is what makes the whole page look droppable, so the effect
     # is set to none for anything that is not an internal drag from the bin.
     assert "dropEffect = 'none'" in html, "the window still looks like a drop target"
-    # And the three routes that DO work are still offered.
-    assert "cutroom add " in html, "the CLI fallback is gone"
+    # Keep the one user-facing route and no standing import lecture.
     assert "/media/pick" in html and "Add media…" in html, "the picker is gone"
-    assert "paste an absolute path" in html, "the universal fallback is gone"
+    assert "paste an absolute path" not in html, "the path field came back"
+    assert 'id="docopy"' not in html and 'id="copyin"' not in html, \
+        "the copy toggle came back"
+    assert "Media enters only when" not in html, "the import lecture came back"
+    picker = html[html.index("async function pickMedia()"):
+                  html.index("// >>> adopt")]
+    assert "copy: true" in picker, \
+        "the picker no longer copies imports"
+    assert "r.status === 207" in picker and "stopped part-way" in picker, \
+        "a partial copy is reported as complete"
+    assert "catch (e)" in picker and "picker failed" in picker, \
+        "a failed picker request leaves the page stuck on picker open"
+
+
+def test_native_picker_non_macos_points_at_cli_not_a_removed_control():
+    old = server.sys.platform
+    server.sys.platform = "linux"
+    try:
+        status, payload = server.pick_media("film", copy=True)
+    finally:
+        server.sys.platform = old
+    problem = payload["problems"][0]
+    assert status == 501, (status, payload)
+    assert "cutroom add" in problem, problem
+    assert "paste" not in problem and "above" not in problem, problem
 
 
 def test_the_page_never_offers_to_delete_anything():

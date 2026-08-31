@@ -868,7 +868,7 @@ def pick_media(name, copy=False):
     if sys.platform != "darwin":
         return 501, {"problems": [
             "the native picker is macOS-only — add media with "
-            "`cutroom add <project> <absolute path>` or paste the path above"]}
+            "`cutroom add <project> <absolute path>`"]}
     script = ('set picked to choose file with prompt "Add media to cutroom" '
               'with multiple selections allowed\n'
               'set out to ""\n'

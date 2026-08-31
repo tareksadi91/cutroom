@@ -53,9 +53,7 @@ colour fields and two cuts of one source are visibly one source.
 ## Drag-and-drop: what was chosen, and why
 
 **Chosen: a CLI `cutroom add <project> <path>…`, plus an “Add media…” button
-that opens the OS file picker server-side, plus a paste-a-path field — and a
-real drop target that reads a path when the browser offers one and says so
-loudly when it does not.**
+that opens the OS file picker server-side.**
 
 The brief offered a `POST /media` endpoint called with a dropped file's *name*.
 That cannot be built here: a name is not a path, so the server would have to go
@@ -72,18 +70,9 @@ So the path has to come from somewhere that actually has one:
   what was chosen. macOS only; elsewhere the endpoint returns 501 and names the
   CLI. Chosen over a browser file input because `<input type=file>` gives the
   page a `File` object with no path either.
-- **The path field** — universal, no picker required, and the thing an agent or
-  a copied path from Finder (⌥⌘C) lands in.
-- **The drop target** — kept because Finder-drag is the gesture the director
-  will try first. It reads `text/uri-list` / `text/plain` for a `file://` URL,
-  which some browsers do supply; when nothing usable arrives it turns the hint
-  under the button red and prints *“Your browser did not hand over that file's
-  path — it is not allowed to. Use ‘Add media…’, paste the absolute path below,
-  or run `cutroom add <project> <path>`.”* It is never a silent no-op, which is
-  the failure mode the brief called out.
-
-Dropping a file onto a **lane** does the same thing and then places the clip at
-the drop point, so the gesture is complete when the path does arrive.
+The page deliberately has no path field or file-drop target. Agents use the CLI;
+directors use the picker. This keeps the interface from advertising browser
+behaviour that cannot reliably supply an absolute path.
 
 ## The four boundaries: enforcement and proof
 
@@ -211,8 +200,7 @@ step and diffed, unchanged each time; the directory still holds its 41 files.
 ## Residual concerns
 
 - The macOS picker is `osascript`; on Linux the endpoint returns 501 and the
-  page falls back to the path field and the CLI. Nothing is silently broken,
-  but the picker is not portable.
+  page points at the CLI. The picker is not portable.
 - `flock` is advisory. A writer that ignores it can still lose an edit; that is
   a contract, stated in the module docstring, not a guarantee — unchanged from
   the reviewed version and unchangeable in principle.

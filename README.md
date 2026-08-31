@@ -123,28 +123,22 @@ Other commands: `./cutroom export <project>`, `./cutroom ls`,
 
 ## Add media
 
-Media enters **only** when you hand cutroom a path. There are three ways, and
-they are the same way:
+Media enters **only** when you hand cutroom a path. There are two ways:
 
 1. **`./cutroom add <project> <path>…`** — the reliable one. Shell globs work,
    because the shell expands them before cutroom sees anything.
 2. **“Add media…” in the page** — opens the operating system's own file picker,
    server-side, and adds whatever you choose. macOS only.
-3. **Paste an absolute path** into the field under that button.
 
-There is also a real drop target on the media panel. Drag a file onto it and,
-*if your browser hands over the path*, it is added. Most will not: a browser is
-not allowed to tell a page where a dropped file lives on disk, and cutroom may
-not go looking for it by name, because looking means scanning a directory —
-the exact habit that cost 226 clips. So when the path is withheld the drop
-target **says so** and points you at the other two routes. It never fails
-silently.
+The media panel is not a file-drop target. Browsers withhold absolute paths,
+and cutroom will not scan a directory to guess one. Use the picker or let an
+agent run `cutroom add`.
 
 ### Reference, or copy
 
-By default the project *references* the file where it lies. With `--copy` — and
-from the page, with **copy the file into this project**, which is on by default
-— cutroom first copies it into `<project>/media/` and references the copy.
+By default the CLI *references* the file where it lies. With `--copy`, cutroom
+first copies it into `<project>/media/` and references the copy. The page's
+**Add media…** picker always uses this safer copy-in behavior.
 
 The copy is not what keeps your original safe. Nothing here can write to a
 source: it is opened `"rb"` and there is no `unlink`, `rename` or `move`
