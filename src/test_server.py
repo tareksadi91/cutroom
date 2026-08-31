@@ -1627,6 +1627,20 @@ def test_license_copy_is_not_top_nav_clutter_but_source_stays_reachable():
     assert ">Source code</a>" in tip, "the source link is not in the info popover"
 
 
+def test_tooltips_belong_to_the_elements_they_explain():
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    assert 'class="info"' not in html, "a detached tooltip icon remains"
+    assert '>i<span class="tip"' not in html, "a standalone info glyph remains"
+    for target in ('id="film"', 'id="addlane"', 'id="tc-what"',
+                   f'Media · ${{MEDIA.length}}', 'Post pass'):
+        at = html.index(target)
+        assert 'class="has-tip"' in html[max(0, at - 80):at], \
+            f"{target} does not own its tooltip"
+    assert ".has-tip:hover > .tip" in html, "hover no longer opens tooltips"
+    assert ".has-tip:focus-within > .tip" in html, \
+        "keyboard focus no longer opens tooltips"
+
+
 def test_native_picker_non_macos_points_at_cli_not_a_removed_control():
     old = server.sys.platform
     server.sys.platform = "linux"

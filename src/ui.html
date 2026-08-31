@@ -235,23 +235,19 @@
               white-space:pre-wrap; margin-top:10px; overflow-wrap:anywhere; }
   .empty { font:400 13px/1.5 var(--sans); color:var(--ink-3); }
 
-  /* Explanations live behind these, not as standing text. Nothing a person
-     reads once should occupy the surface forever. */
-  .info { position:relative; display:inline-flex; align-items:center;
-          justify-content:center; width:16px; height:16px; flex:none;
-          border-radius:50%; border:1px solid var(--rule);
-          font:600 10px/1 var(--sans); color:var(--ink-3); cursor:help;
-          transition:color .15s var(--ease), border-color .15s var(--ease); }
-  .info:hover, .info:focus-visible { color:var(--ink); border-color:var(--ink-3);
-                                     outline:none; }
-  .tip { position:absolute; top:24px; left:-8px; width:288px; z-index:60;
+  /* Explanations belong to the control or label they explain. No detached icon
+     should make a person map one target to another. */
+  .has-tip { position:relative; display:inline-flex; align-items:center; }
+  .has-tip[tabindex]:focus-visible { outline:1px solid var(--ink-3);
+                                     outline-offset:3px; border-radius:2px; }
+  .tip { position:absolute; top:calc(100% + 8px); left:-8px; width:288px; z-index:60;
          background:var(--raised); border:1px solid var(--rule); border-radius:7px;
          padding:12px 14px; box-shadow:0 10px 32px oklch(0.08 0 0 / 0.55);
          font:400 12px/1.55 var(--sans); color:var(--ink-2);
          opacity:0; visibility:hidden; transform:translateY(-3px);
          transition:opacity .15s var(--ease), transform .15s var(--ease),
                     visibility .15s var(--ease); text-align:left; cursor:default; }
-  .info:hover .tip, .info:focus-visible .tip {
+  .has-tip:hover > .tip, .has-tip:focus-within > .tip {
          opacity:1; visibility:visible; transform:translateY(0); }
   .tip.r { left:auto; right:-8px; }
   .tip b { display:block; color:var(--ink); font-weight:600; margin-bottom:5px; }
@@ -265,8 +261,7 @@
 
 <header>
   <div class="zone">
-    <span class="film" id="film">—</span>
-    <span class="info" tabindex="0">i<span class="tip">
+    <span class="has-tip" tabindex="0"><span class="film" id="film">—</span><span class="tip">
       <b>The cut room</b>
       <p>The cut lives in one JSON file under <kbd>~/cutroom-projects/</kbd>, not in
          this page. Every change saves straight to it, and Claude edits the same
@@ -292,9 +287,7 @@
     <div class="zoom">
       <button id="zout">−</button><span id="zlab">10 px/s</span><button id="zin">+</button>
     </div>
-    <button id="addlane">+ lane</button>
-    <button id="layout" title="move the preview above the lanes (L)">&#9707;</button>
-    <span class="info" tabindex="0">i<span class="tip r">
+    <span class="has-tip"><button id="addlane">+ lane</button><span class="tip r">
       <b>Lanes are a workspace, not layers</b>
       <p>Nothing is ever composited over anything. Lanes just let you keep a
          section separate, or park an alternate take beside the shot it might
@@ -305,6 +298,7 @@
       <p>Drag a clip up or down to move it. Drop it one row past the last lane
          to make a new one.</p>
     </span></span>
+    <button id="layout" title="move the preview above the lanes (L)">&#9707;</button>
   </div>
   <div class="zone">
     <button id="cut" title="cut every clip under the playhead (S)">✂ cut</button>
@@ -326,8 +320,7 @@
                     <video id="mB" muted playsinline></video></div>
   <div id="mono-t"><span id="tc">0.00s</span>
     <span style="display:flex;align-items:center;gap:7px">
-      <span id="tc-what">—</span>
-      <span class="info" tabindex="0">i<span class="tip r">
+      <span class="has-tip" tabindex="0"><span id="tc-what">—</span><span class="tip r">
         <b>True about the cut, not about the look</b>
         <p>Two video elements cross-faded in the browser. Order, timing, trim and
            where a blend lands are all exact.</p>
@@ -686,8 +679,8 @@ async function save() {
 function drawBin() {
   const box = document.getElementById('bin'); box.innerHTML='';
   const h = el('h4');
-  h.innerHTML = `<span>Media · ${MEDIA.length}</span>
-    <span class="info" tabindex="0">i<span class="tip">
+  h.innerHTML = `<span class="has-tip" tabindex="0"><span>Media · ${MEDIA.length}</span>
+    <span class="tip">
       <b>The allowlist, not a folder</b>
       <p>These are the only files this project can read. A file is here because
          you put it here — cutroom never scans, indexes or watches a
@@ -696,7 +689,6 @@ function drawBin() {
          in amber does not match the project's own and will be fitted and padded
          at render.</p>
     </span></span>`;
-  h.style.cssText += 'display:flex;align-items:center;gap:7px;justify-content:space-between';
   box.append(h);
 
   const add = el('div'); add.id = 'add';
@@ -1559,8 +1551,8 @@ function inspect(c) {
     <label>rate <input id="f-rate" type="number" step="0.05" value="${c.rate}"></label>
     <label>label <input id="f-label" type="text" value="${esc(c.label)}"></label>
     <label>note <input id="f-note" type="text" value="${esc(c.note)}"></label>
-    <h4 style="display:flex;align-items:center;gap:7px">Post pass
-      <span class="info" tabindex="0">i<span class="tip r">
+    <h4><span class="has-tip" tabindex="0">Post pass
+      <span class="tip r">
         <b>Writes a new file. Always.</b>
         <p>The pass reads your source and writes
            <kbd>derived/&lt;name&gt;__&lt;pass&gt;.mp4</kbd> inside this project,
