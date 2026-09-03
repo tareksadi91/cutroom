@@ -17,6 +17,8 @@ Bare asserts, no pytest, no numpy, no PIL: a frame is read as raw rgb24 bytes
 out of ffmpeg and measured with the standard library. Every fixture is
 synthesised into a temporary directory. NO TEST EVER ADDRESSES REAL FOOTAGE.
 """
+import array
+import math
 import pathlib
 import subprocess
 import sys
@@ -251,6 +253,36 @@ def _lavfi_src(path, src, seconds=2.0):
          "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", str(path)],
         check=True)
     return path
+
+
+def _lavfi_tone(path, colour, hz, seconds=2.0, size="720x1280"):
+    """A visual source with a distinct, measurable tone."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c={colour}:s={size}:d={seconds}:r=24", "-f", "lavfi",
+         "-i", f"sine=f={hz}:d={seconds}", "-shortest",
+         "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         str(path)], check=True)
+
+
+def _tone(path, hz=440, seconds=2.0):
+    """Audio-only media — no picture at all."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"sine=f={hz}:d={seconds}", "-c:a", "aac", str(path)], check=True)
+
+
+def _audio_rms(path, at, seconds=0.1):
+    """RMS of a short mono window, independent of the render graph."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", str(at), "-t", str(seconds), "-i", str(path),
+         "-map", "0:a:0", "-ac", "1", "-f", "f32le", "pipe:1"],
+        capture_output=True, check=True).stdout
+    samples = array.array("f")
+    samples.frombytes(raw[:len(raw) - len(raw) % samples.itemsize])
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(v * v for v in samples) / len(samples))
 
 
 def _probe_duration(path):
@@ -745,6 +777,198 @@ def test_validate_still_refuses_a_trim_past_a_countable_end():
         problems = render.validate(project, check_files=True)
         assert any("claims" in p for p in problems), (
             f"a 2.0s trim of a 1.0s source should be refused, got {problems}")
+
+
+# -------------------------------------------------------------------- audio
+
+def test_an_audio_only_source_is_valid_but_not_a_video_clip():
+    """A stem has no frames and no grid, so every picture rule must skip it."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _tone(d / "stem.m4a", 440, seconds=1.0)
+        info = render.source_info(d / "stem.m4a")
+        assert info["fps"] is None and info["w"] is None, info
+        assert info["audio"] is True and abs(info["dur"] - 1.0) < 0.05, info
+
+        project = proj(clip("s", 0.0, 1.0, mid="stem"), media=files(d, "stem.m4a"))
+        assert not render.validate(project, check_files=True)
+        assert render.video_clips(project) == []
+
+
+def test_a_legacy_clip_keeps_its_sound_and_a_non_boolean_audio_is_refused():
+    """Projects written before audio existed have no `audio` key at all."""
+    assert render.audio_enabled(clip("a", 0.0, 1.0)) is True
+    assert render.audio_enabled(dict(clip("a", 0.0, 1.0), audio=False)) is False
+    assert render.audio_enabled(dict(clip("a", 0.0, 1.0), audio="false")) is None
+    problems = render.validate(
+        proj(dict(clip("a", 0.0, 1.0), audio="false")), check_files=False)
+    assert any("audio must be true or false" in p for p in problems), problems
+
+
+def test_a_video_tone_and_an_audio_only_tone_are_muxed():
+    """Losing the audio graph or its output map loses a real stem."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _lavfi(d / "picture.mp4", "red", seconds=1.0)
+        _tone(d / "stem.m4a", 660, seconds=1.0)
+        out = render.render(proj(
+            clip("p", 0.0, 1.0, mid="picture"),
+            clip("s", 0.0, 1.0, mid="stem"),
+            media=files(d, "picture.mp4", "stem.m4a")), d / "out.mp4")
+        assert render.has_audio(out), "the muxed movie lost its audio stream"
+
+
+def test_disabling_every_clip_audio_leaves_no_audio_stream():
+    """The video map must not invent audio when all source audio is off."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _lavfi_tone(d / "picture.mp4", "red", 440, seconds=1.0)
+        c = dict(clip("p", 0.0, 1.0, mid="picture"), audio=False)
+        out = render.render(proj(c, media=files(d, "picture.mp4")), d / "out.mp4")
+        assert not render.has_audio(out), "disabled audio was muxed anyway"
+
+
+def test_crossfaded_tones_keep_their_midpoint_power():
+    """Linear amplitude fades make two uncorrelated tones audibly dip."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _lavfi_tone(d / "a.mp4", "red", 440)
+        _lavfi_tone(d / "b.mp4", "blue", 660)
+        out = render.render(proj(
+            clip("a", 0.0, 2.0, mid="a"),
+            clip("b", 1.0, 2.0, mid="b"),
+            media=files(d, "a.mp4", "b.mp4")), d / "out.mp4")
+        before, midpoint = _audio_rms(out, 0.25), _audio_rms(out, 1.45)
+        assert before * 0.86 < midpoint < before * 1.22, (before, midpoint)
+
+
+def test_an_all_audio_timeline_has_a_black_picture_through_its_end():
+    """An audio-only edit still needs a mappable video stream."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _tone(d / "a.m4a", 440, seconds=1.0)
+        _tone(d / "b.m4a", 660, seconds=1.0)
+        out = render.render(proj(
+            clip("a", 0.0, 1.0, mid="a"),
+            clip("b", 1.0, 1.0, mid="b"),
+            media=files(d, "a.m4a", "b.m4a")), d / "out.mp4")
+        assert abs(_probe_duration(out) - 2.0) < 1 / 24 + 0.02
+        assert max(_frame_rgb(out, 0.5)) < 10
+        assert max(_frame_rgb(out, 1.5)) < 10
+
+
+def test_a_slowed_audio_clip_keeps_sound_through_its_retimed_duration():
+    """A sub-0.5 rate needs chained atempo or the tail comes out silent."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _tone(d / "s.m4a", 440, seconds=1.0)
+        out = render.render(proj(
+            clip("s", 0.0, 1.0, rate=0.4, mid="s"),
+            media=files(d, "s.m4a")), d / "out.mp4")
+        assert abs(_probe_duration(out) - 2.5) < 1 / 24 + 0.05, _probe_duration(out)
+        assert _audio_rms(out, 2.2) > 0.01, "the retimed tail went silent"
+
+
+def test_a_trim_past_the_end_of_the_sound_is_refused_not_silently_exported():
+    """The mix is anchored on a silence, so probing the output cannot tell a
+    stem that played from one that trimmed to nothing. Only validation can."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        # three seconds of picture, one second of sound
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "color=c=red:s=720x1280:d=3:r=24",
+             "-f", "lavfi", "-i", "sine=f=440:d=1",
+             "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             str(d / "short.mp4")], check=True)
+        info = render.source_info(d / "short.mp4")
+        assert info["audio"] and info["audio_dur"] < 1.5, info
+
+        media = files(d, "short.mp4")
+        late = dict(clip("a", 0.0, 1.0, mid="short"), **{"in": 2.0, "out": 3.0})
+        problems = render.validate(proj(late, media=media), check_files=True)
+        assert any("starts past" in p and "export silent" in p for p in problems), problems
+
+        # Sound that merely stops part way through the shot is a real cut,
+        # and so is the same trim with the clip's audio switched off.
+        assert not render.validate(
+            proj(clip("a", 0.0, 3.0, mid="short"), media=media), check_files=True)
+        assert not render.validate(
+            proj(dict(late, audio=False), media=media), check_files=True)
+
+
+def test_a_second_longer_audio_stream_does_not_vouch_for_the_rendered_one():
+    """The graph maps a:0. Measuring the longest stream instead would let a
+    silent trim through on any file carrying a commentary track."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "color=c=red:s=720x1280:d=3:r=24",
+             "-f", "lavfi", "-i", "sine=f=440:d=1",     # a:0, one second
+             "-f", "lavfi", "-i", "sine=f=660:d=3",     # a:1, the full three
+             "-map", "0:v", "-map", "1:a", "-map", "2:a",
+             "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             str(d / "two.mp4")], check=True)
+        assert render.source_info(d / "two.mp4")["audio_dur"] < 1.5
+
+        late = dict(clip("a", 0.0, 1.0, mid="two"), **{"in": 2.0, "out": 3.0})
+        problems = render.validate(proj(late, media=files(d, "two.mp4")),
+                                   check_files=True)
+        assert any("starts past" in p for p in problems), problems
+
+
+def test_an_export_that_lost_its_mapped_audio_raises_instead_of_shipping():
+    """ffmpeg can drop a mapped stream without failing. The graph knowing there
+    was sound is the only thing that can catch it, so the check is wired here
+    by making the probe report the loss."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _lavfi_tone(d / "picture.mp4", "red", 440, seconds=1.0)
+        project = proj(clip("p", 0.0, 1.0, mid="picture"),
+                       media=files(d, "picture.mp4"))
+        real = render.has_audio
+        render.has_audio = lambda path: False
+        try:
+            render.render(project, d / "out.mp4")
+        except RuntimeError as e:
+            assert "no audio stream" in str(e), e
+        else:
+            raise AssertionError("a lost audio stream was shipped as a good export")
+        finally:
+            render.has_audio = real
+
+
+def test_one_mixed_timeline_carries_every_audio_case_at_once():
+    """The acceptance gate. Audio-only lead, a video tone, a silent video over
+    it, and an audio-only tail have each passed alone; this is the one export
+    where they have to hold together, and it is the shape a real cut has."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        _tone(d / "lead.m4a", 440, seconds=1.0)
+        _lavfi_tone(d / "tone.mp4", "red", 660, seconds=2.0)
+        _lavfi(d / "silent.mp4", "blue", seconds=2.0)
+        _tone(d / "tail.m4a", 880, seconds=1.0)
+        out = render.render(proj(
+            clip("lead", 0.0, 1.0, mid="lead"),
+            clip("tone", 1.0, 2.0, mid="tone"),
+            clip("silent", 2.0, 2.0, lane=1, mid="silent"),
+            clip("tail", 4.0, 1.0, mid="tail"),
+            media=files(d, "lead.m4a", "tone.mp4", "silent.mp4", "tail.m4a"),
+        ), d / "out.mp4")
+
+        assert render.has_audio(out), "the mixed export lost its audio stream"
+        assert abs(_probe_duration(out) - 5.0) < 1 / 24 + 0.02, _probe_duration(out)
+
+        assert max(_frame_rgb(out, 0.5)) < 10, "the audio-only lead was not black"
+        assert _frame_rgb(out, 1.5)[0] > 150, "the video tone did not paint red"
+        assert _frame_rgb(out, 3.5)[2] > 150, "the silent video did not paint blue"
+        assert max(_frame_rgb(out, 4.5)) < 10, "the audio-only tail was not black"
+
+        # Every stem that should sound does — including the one past the end
+        # of the picture, which is what caught stems being mixed at t=0.
+        for at, what in ((0.5, "lead"), (1.5, "video tone"), (4.5, "tail")):
+            assert _audio_rms(out, at) > 0.01, f"{what} is silent at {at}s"
 
 
 if __name__ == "__main__":

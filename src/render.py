@@ -36,7 +36,11 @@ import pathlib
 import subprocess
 import sys
 
-ENCODE = ["-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", "-an"]
+ENCODE = ["-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p"]
+# Appended only when the graph produced no audio label. Split out of ENCODE so
+# a silent cut still says -an explicitly rather than letting ffmpeg guess.
+NO_AUDIO = ["-an"]
+AUDIO_ENCODE = ["-c:a", "aac"]
 EPS = 1e-6  # float slop; timeline values come from a browser
 
 
@@ -185,45 +189,85 @@ def source_info(path):
 
 
 def _probe_source(path):
+    """One ffprobe for the whole file, because a source is no longer assumed to
+    have a picture. `fps`/`w`/`h` are None for audio-only media, and a caller
+    that does frame arithmetic must check before using them."""
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "stream=width,height,duration,r_frame_rate,avg_frame_rate",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, check=True).stdout.strip().split(",")
-    except (subprocess.CalledProcessError, OSError):
+        out = json.loads(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True).stdout)
+    except (json.JSONDecodeError, subprocess.CalledProcessError, OSError):
         return None
-    # csv order follows the STREAM field order, not the -show_entries order:
-    # width, height, r_frame_rate, avg_frame_rate, duration. BOTH rates are
-    # kept. r_frame_rate is nominal — a variable-rate file can claim 24/1 there
-    # while averaging 10 real frames a second, and a frame-grid model would
-    # accept it and cut nothing like what it predicted. validate() refuses when
-    # they disagree; here they are only reported.
+    # BOTH rates are kept. r_frame_rate is nominal — a variable-rate file can
+    # claim 24/1 there while averaging 10 real frames a second, and a
+    # frame-grid model would accept it and cut nothing like what it predicted.
+    # validate() refuses when they disagree; here they are only reported.
     def rate(text):
         try:
-            num, _, den = text.partition("/")
+            num, _, den = str(text).partition("/")
             r = float(num) / float(den or 1)
         except (ValueError, ZeroDivisionError):
             return None
         return r if r > 0 else None
 
-    def whole(text):
+    def whole(value):
         try:
-            return int(text)
-        except ValueError:
+            return int(value)
+        except (TypeError, ValueError):
             return None
 
-    if len(out) < 5:
+    streams = out.get("streams")
+    if not isinstance(streams, list):
         return None
-    w, h = whole(out[0]), whole(out[1])
-    r_fps, avg_fps = rate(out[2]), rate(out[3])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if video is None and not audio_streams:
+        return None
     try:
-        seconds = float(out[4])
-    except ValueError:
-        seconds = None
-    if seconds is None or r_fps is None:
+        seconds = float(out.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
         return None
-    return {"dur": seconds, "fps": r_fps, "avg_fps": avg_fps, "w": w, "h": h}
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+
+    r_fps = avg_fps = w = h = None
+    if video is not None:
+        r_fps, avg_fps = rate(video.get("r_frame_rate")), rate(video.get("avg_frame_rate"))
+        if r_fps is None:
+            return None
+        w, h = whole(video.get("width")), whole(video.get("height"))
+
+    # The audio stream's OWN length, which is not the file's. A source can hold
+    # three seconds of picture and one of sound; the container reports three,
+    # and a trim into the last two would atrim to nothing and export silence
+    # with no error. The FIRST audio stream, because the graph maps [i:a:0] —
+    # a second, longer track must not vouch for the one actually rendered.
+    # None means ffprobe did not say, and then nothing is refused.
+    audio_dur = None
+    if audio_streams:
+        try:
+            value = float(audio_streams[0].get("duration"))
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and math.isfinite(value) and value >= 0:
+            audio_dur = value
+    return {"dur": seconds, "fps": r_fps, "avg_fps": avg_fps, "w": w, "h": h,
+            "audio": bool(audio_streams), "audio_dur": audio_dur}
+
+
+def audio_enabled(clip):
+    """Whether a clip contributes sound. Missing means enabled — a project
+    written before audio existed keeps its sound. None means the value was
+    present and was not a boolean, which validate() refuses."""
+    value = clip.get("audio", True)
+    return value if isinstance(value, bool) else None
+
+
+def has_audio(path):
+    """Whether a muxed media file carries an audio stream."""
+    info = source_info(path)
+    return bool(info and info["audio"])
 
 
 def source_frames(path):
@@ -261,6 +305,20 @@ def source_duration(path):
 # ------------------------------------------------------------------ the media
 # A clip carries `mid`. `media` maps it to a path. Nothing else does, and
 # nothing here ever turns a path back into permission — see server.servable().
+
+def video_clips(project, index=None):
+    """The clips that carry a picture. A clip whose source is missing or
+    unprobeable stays visual: the frame-grid rules must still be applied to it,
+    and validate() reports the missing file separately."""
+    index = media_index(project) if index is None else index
+    visual = []
+    for clip in project["clips"]:
+        entry = index.get(clip.get("mid"))
+        info = source_info(entry["path"]) if entry and pathlib.Path(entry["path"]).is_file() else None
+        if info is None or info["fps"] is not None:
+            visual.append(clip)
+    return visual
+
 
 def media_index(project):
     return {m["mid"]: m for m in project.get("media", [])}
@@ -376,6 +434,9 @@ def validate(project, check_files=True):
         if c["uid"] in seen:
             problems.append(f"duplicate uid {c['uid']} — uid is the address and must be unique")
         seen.add(c["uid"])
+        if audio_enabled(c) is None:
+            problems.append(
+                f"{c['uid']}: audio must be true or false, got {c.get('audio')!r}")
         if c["out"] <= c["in"]:
             problems.append(f"{c['uid']}: out ({c['out']}) is not after in ({c['in']})")
         if c["rate"] <= 0:
@@ -437,7 +498,11 @@ def validate(project, check_files=True):
                     # CONTAINER says 10.333008s — which floors to 247 and
                     # refused a cut that renders perfectly. The two halves of
                     # this program have to count frames the same way.
-                    have = source_frames(src)
+                    # An audio-only source has no frames to count and no grid
+                    # to sit on, so it is bounded by its duration and skips
+                    # every rule below that names a picture.
+                    visual = info["fps"] is not None
+                    have = source_frames(src) if visual else None
                     if have is None:
                         have = math.floor(info["dur"] * fps + 1e-6)
                     want = math.ceil(cc["out"] * fps - 1e-9)
@@ -445,11 +510,24 @@ def validate(project, check_files=True):
                         problems.append(
                             f"{c['uid']}: out {c['out']:.3f}s claims {want} frames of "
                             f"{name} but it holds {have} ({info['dur']:.3f}s) — retrim it")
+                    # Silence that reports as success. The mix is anchored on a
+                    # generated silence, so an export always HAS an audio stream
+                    # and probing the output cannot tell a stem that played from
+                    # one that trimmed to nothing. Only a trim starting past the
+                    # END of the sound is refused: a source whose audio simply
+                    # stops mid-shot is a real thing to cut.
+                    if (audio_enabled(c) and info["audio"]
+                            and info["audio_dur"] is not None
+                            and cc["in"] >= info["audio_dur"] - 1e-6):
+                        problems.append(
+                            f"{c['uid']}: audio is on but in {c['in']:.3f}s starts past "
+                            f"the {info['audio_dur']:.3f}s of sound in {name} — the clip "
+                            f"would export silent without saying so")
                     # And the assumption duration() rests on, made explicit.
                     # Same trim, same rate, 14 frames from a 24fps source and 13
                     # from a 25fps one. Mixed rates are not modelled here and
                     # must not be guessed at.
-                    if abs(info["fps"] - fps) > 0.01:
+                    if visual and abs(info["fps"] - fps) > 0.01:
                         problems.append(
                             f"{c['uid']}: {name} is {info['fps']:.3f}fps but the project "
                             f"is {fps}fps — the cut's frame arithmetic assumes one "
@@ -457,7 +535,7 @@ def validate(project, check_files=True):
                     # Nominal rate is a claim, average rate is what the file
                     # actually does. A variable-rate source satisfies no
                     # frame-grid model, so it is refused rather than cut badly.
-                    elif (info.get("avg_fps") is not None
+                    elif (visual and info.get("avg_fps") is not None
                           and abs(info["fps"] - info["avg_fps"]) > 0.01):
                         problems.append(
                             f"{c['uid']}: {name} claims {info['fps']:.3f}fps but "
@@ -470,7 +548,13 @@ def validate(project, check_files=True):
     # Use only valid clips for overlap checks to avoid calling duration() on
     # invalid clips — and the CANONICAL ones, so the geometry below measures
     # frames rather than the floats that named them.
-    valid_clips = [canon_clip(clips[i], fps) for i in valid_clips_indices]
+    #
+    # VISUAL clips only. Every rule below describes the crossfade chain, which
+    # is a property of the picture: two stems on the same instant mix, they do
+    # not collapse a shot, and a stem laid under a shot is the normal case.
+    visual_uids = {c["uid"] for c in video_clips(project, index)}
+    valid_clips = [canon_clip(clips[i], fps) for i in valid_clips_indices
+                   if clips[i]["uid"] in visual_uids]
 
     # Two clips starting at the exact same instant collapse to a zero-length
     # shot: the overlap equals the first clip's whole duration, so the xfade
@@ -508,6 +592,21 @@ def validate(project, check_files=True):
     return problems
 
 
+def _atempo(rate):
+    """atempo only accepts 0.5..2.0, so a rate outside that needs a chain.
+    A 0.4x slow-down through one atempo silences the tail instead of
+    stretching it."""
+    factors, remaining = [], float(rate)
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={f:.6f}" for f in factors)
+
+
 def build_graph(project):
     """Return (ffmpeg inputs, filter_complex, final label).
 
@@ -526,10 +625,18 @@ def build_graph(project):
     fps = project["fps"]
     index = media_index(project)
     clips = sorted(project["clips"], key=lambda c: c["t"])
+    infos = [source_info(clip_path(project, c, index)) for c in clips]
+    # (input index, clip) for the clips that carry a picture. Everything that
+    # concats, pads and crossfades below walks THIS list — an audio-only stem
+    # has no segment to place in the visual chain.
+    visuals = [(i, c) for i, (c, info) in enumerate(zip(clips, infos))
+               if info is None or info["fps"] is not None]
+    timeline = max((c["t"] + duration(c, fps) for c in clips), default=0.0)
 
     inputs, chains = [], []
     for i, c in enumerate(clips):
         inputs += ["-i", str(clip_path(project, c, index))]
+    for i, c in visuals:
         chains.append(
             f"[{i}:v]"
             f"trim=start={c['in']}:end={c['out']},"
@@ -549,13 +656,13 @@ def build_graph(project):
             f"color=c=black:s={w}x{h}:d={seconds}:r={fps},format=yuv420p,settb=AVTB[{label}]")
 
     acc_label, acc = None, 0.0
-    lead_frames = round(clips[0]["t"] * fps) if clips else 0
+    lead_frames = round(visuals[0][1]["t"] * fps) if visuals else 0
     if lead_frames > 0:
         lead = lead_frames / fps
         black(lead, "lead")
         acc_label, acc = "lead", lead
 
-    for i, c in enumerate(clips):
+    for i, c in visuals:
         d = duration(c, fps)
         if acc_label is None:
             acc_label, acc = f"v{i}", d
@@ -580,7 +687,67 @@ def build_graph(project):
             acc += d
         acc_label = nxt
 
-    return inputs, ";".join(chains), acc_label
+    # An audio-only lead or tail belongs to the export, so the picture is
+    # extended with black to cover it. With no picture at all the whole
+    # timeline is black — the alternative is a graph with no mappable video.
+    tail_frames = round((timeline - acc) * fps)
+    if acc_label is None:
+        black(timeline, "timeline")
+        acc_label = "timeline"
+    elif tail_frames > 0:
+        black(tail_frames / fps, "tail")
+        chains.append(f"[{acc_label}][tail]concat=n=2:v=1:a=0,settb=AVTB[timeline]")
+        acc_label = "timeline"
+
+    # A visual overlap is a crossfade, so its sound crosses with it. Equal
+    # power (qsin), not linear: two uncorrelated sources faded linearly lose
+    # ~3dB at the midpoint and you hear the cut dip. Audio-only clips are not
+    # auto-faded — they have no picture to cross with, so they simply mix.
+    fades = {i: [] for i, _ in visuals}
+    for (i, a), (j, b) in zip(visuals, visuals[1:]):
+        overlap = a["t"] + duration(a, fps) - b["t"]
+        if overlap > EPS:
+            fades[i].append(
+                f"afade=t=out:st={duration(a, fps) - overlap}:d={overlap}:curve=qsin")
+            fades[j].append(f"afade=t=in:st=0:d={overlap}:curve=qsin")
+
+    audio_labels = []
+    for i, c in enumerate(clips):
+        info = infos[i]
+        if not audio_enabled(c) or not info or not info["audio"]:
+            continue
+        label = f"a{i}"
+        chains.append(
+            # a:0 spelled out. Bare [i:a] resolves to the first audio stream
+            # too, so this is not a behaviour change — it is the graph saying
+            # out loud which stream source_info() measured.
+            f"[{i}:a:0]atrim=start={c['in']}:end={c['out']},"
+            f"asetpts=PTS-STARTPTS,{_atempo(c['rate'])},"
+            f"atrim=duration={duration(c, fps)},"
+            f"{','.join(fades.get(i, [])) + ',' if fades.get(i) else ''}"
+            # adelay, not asetpts. Setting a start PTS does NOT position a
+            # stream inside amix — amix reads each input from its first frame
+            # and lines them all up at zero, so a stem cut in at 4.0s played
+            # over the head of the film. adelay pads real silence in front,
+            # which is the only thing amix honours. In samples at a forced 48k
+            # so a frame-quantised t stays exact.
+            f"aresample=48000,"
+            f"adelay=delays={round(c['t'] * 48000)}S:all=1[{label}]")
+        audio_labels.append(label)
+
+    audio_label = None
+    if audio_labels:
+        audio_label = "audio"
+        # The silence anchors the mix to the timeline's full length so a stem
+        # that ends early cannot shorten it. It also fixes the layout: the
+        # export is stereo whatever the stems are, and a 5.1 source is folded.
+        chains.append(f"anullsrc=r=48000:cl=stereo:d={timeline}[silence]")
+        chains.append(
+            "[silence]" + "".join(f"[{label}]" for label in audio_labels) +
+            f"amix=inputs={len(audio_labels) + 1}:normalize=0,"
+            f"atrim=duration={timeline}[{audio_label}]")
+
+    return inputs, ";".join(chains), acc_label, audio_label
 
 
 def timeline_length(project):
@@ -647,7 +814,7 @@ def render(project, out_path, t_from=None, t_to=None, claimed=False):
     if not project["clips"]:
         raise ValueError("the timeline has no clips.")
 
-    inputs, graph, label = build_graph(project)
+    inputs, graph, label, audio_label = build_graph(project)
     # NOT a bug when a range render is slow: -ss/-to sit AFTER -filter_complex,
     # so they are output-side seeks. Every source is still decoded from t=0 and
     # pushed through the whole graph; only the muxing is trimmed. Input-side -ss
@@ -668,17 +835,26 @@ def render(project, out_path, t_from=None, t_to=None, claimed=False):
         claim_output(out_path)
     # capture, don't stream: the server hands this stderr to the page, and an
     # exit code alone is useless when a filter graph is what went wrong.
+    audio_map = ["-map", f"[{audio_label}]"] if audio_label else []
+    audio_flags = AUDIO_ENCODE if audio_label else NO_AUDIO
     proc = subprocess.run(
         # -y overwrites the zero-byte file claimed above — the only file this
         # program's ffmpeg is ever pointed at, and one it created itself.
         ["ffmpeg", "-v", "error", "-y", *inputs,
-         "-filter_complex", graph, "-map", f"[{label}]", *trim, *ENCODE, str(out_path)],
+         "-filter_complex", graph, "-map", f"[{label}]", *audio_map, *trim,
+         *ENCODE, *audio_flags, str(out_path)],
         check=True, capture_output=True, text=True)
     # Size, not existence: the destination was created empty before ffmpeg ran,
     # so "the file is there" no longer proves anything was written into it.
     if not out_path.is_file() or out_path.stat().st_size == 0:
         raise RuntimeError(
             f"ffmpeg wrote nothing to {out_path}: {(proc.stderr or '').strip()[-2000:]}")
+    # ffmpeg can drop a mapped audio stream without failing. If the graph said
+    # there was sound, the file has to have it.
+    if audio_label and not has_audio(out_path):
+        raise RuntimeError(
+            f"the graph mixed audio but {out_path} has no audio stream: "
+            f"{(proc.stderr or '').strip()[-2000:]}")
     return out_path
 
 
