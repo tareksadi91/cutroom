@@ -76,6 +76,7 @@ import mimetypes
 import os
 import pathlib
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -1121,6 +1122,47 @@ def export(name, t_from=None, t_to=None):
 class Handler(http.server.BaseHTTPRequestHandler):
     project_name = None
 
+    bound_port = None
+
+    # -- the mutation gate ----------------------------------------------------
+    def _allowed_to_mutate(self):
+        """True if this request may change anything. Sends the refusal itself.
+
+        Three independent checks, because each one alone has a hole:
+          Host   — stops DNS rebinding, where a name the attacker controls
+                   resolves to 127.0.0.1 and the browser then treats this
+                   server as same-origin.
+          Origin — stops an ordinary cross-site POST from a page.
+          token  — the one that actually holds. Origin can be absent (curl, a
+                   local agent) and forged by any non-browser client; the token
+                   cannot be read cross-origin.
+
+        A local agent driving the HTTP API sends the token too; it is printed at
+        startup. An agent in this process should call edit_project() instead and
+        never touches this path.
+        """
+        host = (self.headers.get("Host") or "").strip()
+        allowed_hosts = {f"127.0.0.1:{self.bound_port}", f"localhost:{self.bound_port}",
+                         f"[::1]:{self.bound_port}"}
+        if host not in allowed_hosts:
+            self._send(403, {"problems": [
+                f"refused: Host {host!r} is not this server's address. If you are "
+                f"seeing this in a browser, open http://127.0.0.1:{self.bound_port}/ directly."]})
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in (f"http://127.0.0.1:{self.bound_port}",
+                                                 f"http://localhost:{self.bound_port}"):
+            self._send(403, {"problems": [
+                f"refused: {origin} is not allowed to change this cut"]})
+            return False
+        token = self.headers.get("X-Cutroom-Token")
+        if not token or not secrets.compare_digest(token, SESSION_TOKEN):
+            self._send(403, {"problems": [
+                "refused: missing or wrong X-Cutroom-Token. Reload the page; a "
+                "command-line caller must send the token printed when the server started."]})
+            return False
+        return True
+
     # -- helpers ------------------------------------------------------------
     def _write(self, blob):
         """Write, and treat a dropped socket as normal. The range path below
@@ -1229,8 +1271,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name = self.project_name
         try:
             if route == "/":
-                return self._send(200, (HERE / "ui.html").read_bytes(),
-                                  "text/html; charset=utf-8")
+                # The token is injected, never stored in ui.html: it is new every
+                # run, and a file on disk is not where a capability belongs.
+                page = (HERE / "ui.html").read_text()
+                page = page.replace("__CUTROOM_TOKEN__", SESSION_TOKEN, 1)
+                return self._send(200, page.encode(), "text/html; charset=utf-8")
             if route == "/project":
                 project = self._project()
                 return self._send(200, {
@@ -1277,6 +1322,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         if self.path != "/project":
             return self._send(404, {"problems": [f"no {self.path}"]})
+        if not self._allowed_to_mutate():
+            return
         # A PUT is a whole document, so its Content-Length is required: an
         # empty body is a malformed save, not a save of nothing.
         body = self._body(require_length=True)
@@ -1289,11 +1336,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _body(self, require_length=False):
         """Parsed JSON object, or None after a 400 has already been sent."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype != "application/json":
+            self._send(415, {"problems": [
+                f"refused: {ctype} — this route takes application/json"]})
+            return None
         try:
             raw = self.headers.get("Content-Length")
             if raw is None and require_length:
                 raise TypeError("no Content-Length")
             length = int(raw or 0)
+            if length > MAX_BODY:
+                # Before the read, not after: the point is to not take the bytes.
+                self._send(413, {"problems": [
+                    f"refused: {length} bytes is over the {MAX_BODY} byte limit"]})
+                return None
             body = json.loads(self.rfile.read(length)) if length else {}
         except (TypeError, ValueError) as e:
             # Missing/non-numeric Content-Length, or a body that isn't JSON
@@ -1308,6 +1365,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return body
 
     def do_POST(self):
+        if not self._allowed_to_mutate():
+            return
         route = urllib.parse.unquote(self.path.split("?")[0])
         name = self.project_name
         body = self._body()
@@ -1387,6 +1446,21 @@ def create(name, fps=24, resolution=(720, 1280)):
     return doc
 
 
+# A capability token, new every run. The page is handed it when it loads; a
+# website you happen to be visiting cannot read it, because reading the page
+# means reading a cross-origin response body and the browser will not allow it.
+#
+# ⚠️ WHY A TOKEN AND NOT JUST AN ORIGIN CHECK. A cross-origin
+# `Content-Type: text/plain` POST is a "simple request" — the browser sends it
+# with NO preflight, so a hostile page can reach a loopback server before any
+# CORS rule is consulted. Measured before this existed: a POST carrying
+# `Origin: https://attacker.example` ran a real /render and the reply handed
+# back an absolute path on this machine. Origin is also absent on some requests
+# and forgeable by anything that is not a browser, so it cannot be the only gate.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+MAX_BODY = 32 * 1024 * 1024      # a project document, not a media upload
+
+
 def serve(name, port, passes_dir=None, open_browser=True):
     global PASSES_DIR
     check_name(name)
@@ -1404,10 +1478,12 @@ def serve(name, port, passes_dir=None, open_browser=True):
         sys.exit(f"{project_path(name)} is malformed at line {e.lineno}: {e.msg}")
 
     Handler.project_name = name
+    Handler.bound_port = port
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"cut room — {name} — {url}   (ctrl-c to stop)")
     print(f"  passes: {PASSES_DIR if PASSES_DIR else 'disabled (no --passes-dir)'}")
+    print(f"  token:  {SESSION_TOKEN}   (send as X-Cutroom-Token to change anything)")
     # Opening is a convenience for the first start, not a rule. A restart is the
     # common case while editing this file, and each one used to spawn another tab
     # — fifteen of them in one session before anybody counted.

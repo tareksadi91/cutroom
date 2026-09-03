@@ -117,8 +117,14 @@ def media_entry(mid, path, dur=1.0, w=160, h=120):
 def request(port, method, route, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
     blob = json.dumps(body).encode() if body is not None else b""
-    h = {"Content-Type": "application/json", "Content-Length": str(len(blob))}
+    # Every mutation needs the capability token. Tests that are ABOUT the gate
+    # override or drop it through `headers`.
+    h = {"Content-Type": "application/json", "Content-Length": str(len(blob)),
+         "X-Cutroom-Token": server.SESSION_TOKEN}
     h.update(headers or {})
+    for k, v in list(h.items()):
+        if v is None:
+            del h[k]
     conn.request(method, route, body=blob, headers=h)
     resp = conn.getresponse()
     status, raw, hdrs = resp.status, resp.read(), dict(resp.getheaders())
@@ -137,6 +143,9 @@ def start_server(name):
     race) rather than calling write_project directly."""
     server.Handler.project_name = name
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    # The Host check compares against the port actually bound, so a test server
+    # on an ephemeral port has to say which one it got.
+    server.Handler.bound_port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
 
@@ -611,10 +620,22 @@ def test_the_program_contains_no_way_to_delete_a_file():
         # zero-byte claim.
         assert "O_EXCL" in code, f"{mod} creates a file without claiming the name"
         assert code.count('"-y"') <= 1, f"{mod} has an unaccounted-for ffmpeg -y"
-    # exactly one replace() in the whole program: the project JSON swap, whose
-    # prior state is snapshotted first.
+    # Every replace() in the program, named. The one that matters is the
+    # project JSON's atomic swap, whose prior state is snapshotted first; an
+    # unaccounted-for second in-place file replace is how a cut gets
+    # overwritten without a snapshot behind it.
+    #
+    # WIDENED 2026-09-03 from "exactly one" to "exactly these two": serving the
+    # page substitutes the capability token into the HTML, which is a str
+    # replace on a value in memory and touches no file. Listing both by name
+    # keeps the guard as tight as a count — a third still fails.
     code = (pathlib.Path(server.HERE) / "server.py").read_text()
-    assert code.count(".replace(") == 1, "a second in-place replace appeared"
+    replaces = [l.strip() for l in code.splitlines() if ".replace(" in l]
+    assert len(replaces) == 2, f"an unaccounted-for replace appeared: {replaces}"
+    assert any("tmp.replace(path)" in l for l in replaces), \
+        "the project JSON's atomic swap is gone"
+    assert any("__CUTROOM_TOKEN__" in l for l in replaces), \
+        "the token injection is gone — the page would ship the placeholder"
     assert "tmp.replace(path)" in code
     # and the claim is stated at that width everywhere a reader will meet it
     for doc in (server.__doc__,
@@ -779,16 +800,24 @@ def test_a_malformed_request_is_a_400_not_a_dropped_connection():
     with project() as (name, root):
         srv, port = start_server(name)
         try:
+            # The token and a real Host are present throughout: this test is
+            # about MALFORMED bodies, and the mutation gate (which runs first,
+            # by design) has its own tests below.
+            tok = server.SESSION_TOKEN
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("PUT", "/project", body=b"not json",
-                         headers={"Content-Length": "8"})
+                         headers={"Content-Length": "8",
+                                  "Content-Type": "application/json",
+                                  "X-Cutroom-Token": tok})
             resp = conn.getresponse()
             not_json = resp.status
             resp.read()
             conn.close()
 
             s = socket.create_connection(("127.0.0.1", port), timeout=5)
-            s.sendall(b"PUT /project HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            s.sendall(f"PUT /project HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                      f"X-Cutroom-Token: {tok}\r\n"
+                      f"Connection: close\r\n\r\n".encode())
             raw = b""
             while True:
                 chunk = s.recv(4096)
@@ -1029,6 +1058,11 @@ __REGION__
 DOC = {version: 3, clips: [{uid: 'c000', t: 0}]};
 const SERVER = {version: 9, clips: [{uid: 'c000', t: 0}], who: 'agent'};
 let calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async (url, opts) => {
   // A conflict also stashes the local cut to /pending. That is a POST to a
   // different route, not another attempt to write the project, so it must not
@@ -1119,6 +1153,11 @@ DOC.clips[0].t = 5;               // the director drags c000
 const SERVER = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
                                     {uid: 'c001', t: 9, rate: 1, note: 'ungraded'}]};
 let calls = 0, sentLast = null;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async (url, opts) => {
   calls++;
   sentLast = JSON.parse(opts.body);
@@ -1147,6 +1186,11 @@ DOC.clips[0].t = 5;
 const BOTHGEO = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
                                      {uid: 'c001', t: 9, rate: 0.75}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => BOTHGEO}; };
 await save();
 if (!/NOT SAVED/.test(STATUS.textContent))
@@ -1160,6 +1204,11 @@ baseline();
 DOC.clips[0].t = 5;
 const CLASH = {version: 9, clips: [{uid: 'c000', t: 0, rate: 0.5}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async () => {
   calls++;
   return {status: 409, ok: false, json: async () => CLASH};
@@ -1185,6 +1234,11 @@ const ROUNDED = {version: 9, clips: [{uid: 'c000', t: 0, out: 4.041667, rate: 1}
                                      {uid: 'c001', t: 9, out: 4.041667, rate: 1,
                                       label: 'B'}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async (url, opts) => {
   calls++; sentLast = JSON.parse(opts.body);
   if (calls === 1) return {status: 409, ok: false, json: async () => ROUNDED};
@@ -1204,6 +1258,11 @@ baseline();
 DOC.clips[0].label = 'renamed';        // page writes only a label
 const REAL = {version: 9, clips: [{uid: 'c000', t: 0, out: 4.03, rate: 1, label: 'x'}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => REAL}; };
 await save();
 if (!/NOT SAVED/.test(STATUS.textContent))
@@ -1218,6 +1277,11 @@ DOC.clips[0].t = 5;
 const ADDED = {version: 9, clips: [{uid: 'c000', t: 0, rate: 1},
                                    {uid: 'c009', t: 40, rate: 1}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => ADDED}; };
 await save();
 if (!/NOT SAVED/.test(STATUS.textContent))
@@ -1236,6 +1300,11 @@ DOC.clips[0].out = 12;                      // page: two seconds of overlap
 const GEOTRAP = {version: 9, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1},
                                      {uid: 'B', t: 12, in: 0, out: 4, lane: 0, rate: 1}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async () => { calls++; return {status: 409, ok: false, json: async () => GEOTRAP}; };
 await save();
 if (!/NOT SAVED/.test(STATUS.textContent))
@@ -1252,6 +1321,11 @@ const NOTEONLY = {version: 9, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, 
                                       {uid: 'B', t: 10, in: 0, out: 4, lane: 0, rate: 1,
                                        label: '2.4'}]};
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async (url, opts) => {
   calls++; sentLast = JSON.parse(opts.body);
   if (calls === 1) return {status: 409, ok: false, json: async () => NOTEONLY};
@@ -1272,6 +1346,11 @@ STATUS.textContent = ''; STATUS.clicks = {}; THEIRS = null;
 DOC = {version: 3, clips: [{uid: 'A', t: 0, in: 0, out: 10, lane: 0, rate: 1}]};
 baseline();
 calls = 0;
+// The page stamps a capability token on every write; these harnesses lift
+// the save loop, so they need the helper it uses. globalThis, not const:
+// several harnesses reassign fetch more than once and a const would collide.
+globalThis.TOKEN = 'test-token';
+globalThis.wHeaders = (extra) => Object.assign({'X-Cutroom-Token': globalThis.TOKEN}, extra || {});
 globalThis.fetch = async (url, opts) => {
   calls++; sentLast = JSON.parse(opts.body);
   if (calls === 1) DOC.clips[0].t = 4;      // the director drags mid-flight
@@ -2692,6 +2771,127 @@ console.log('js ok');
         r = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=20)
     assert r.returncode == 0, r.stderr + r.stdout
     assert r.stdout.strip() == "js ok", r.stdout
+
+
+def test_the_readme_shows_the_tool_and_the_image_exists():
+    """A visitor decides in seconds. The screenshot was committed to the repo on
+    2026-08-31 and never referenced from the README — present on disk, invisible
+    to every reader."""
+    root = pathlib.Path(server.HERE).parent
+    readme = (root / "README.md").read_text()
+    assert "docs/assets/cutroom-the-courier.png" in readme, \
+        "the README does not show the screenshot"
+    assert (root / "docs/assets/cutroom-the-courier.png").is_file(), \
+        "the README points at a screenshot that is not in the repo"
+    at = readme.index("](docs/assets/cutroom-the-courier.png)")
+    alt = readme[readme.rindex("![", 0, at) + 2:at]
+    for word in ("bin", "monitor", "timeline"):
+        assert word in alt.lower(), f"the alt text does not describe the {word}"
+
+
+# ======================================== a website you visit may not touch this
+
+def test_a_hostile_page_cannot_reach_a_mutation_route():
+    """MEASURED BEFORE THIS EXISTED: a cross-origin POST carrying
+    `Origin: https://attacker.example` and `Content-Type: text/plain` ran a real
+    /render and the reply handed back an absolute path on this machine.
+
+    text/plain is the shape that matters: it is a CORS "simple request", so the
+    browser sends it with NO preflight and any page you happen to have open can
+    fire it at a loopback server."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            hostile = {"Origin": "https://attacker.example"}
+            plain, _, _ = request(port, "POST", "/render", {},
+                                  {**hostile, "Content-Type": "text/plain"})
+            asjson, _, _ = request(port, "POST", "/render", {}, hostile)
+            put, _, _ = request(port, "PUT", "/project", {"version": 3, "clips": []},
+                                hostile)
+        finally:
+            stop_server(srv)
+        assert plain == 403, f"the original attack still works: {plain}"
+        assert asjson == 403, asjson
+        assert put == 403, put
+
+
+def test_a_rebound_dns_name_cannot_pose_as_this_server():
+    """DNS rebinding: a name the attacker controls resolves to 127.0.0.1 and the
+    browser then treats this server as same-origin, so Origin stops helping.
+    The Host header is what still names who the client thinks it reached."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            forged, _, _ = request(port, "POST", "/render", {}, {"Host": "evil.example"})
+            right, _, _ = request(port, "POST", "/render", {},
+                                  {"Host": f"127.0.0.1:{port}"})
+        finally:
+            stop_server(srv)
+        assert forged == 403, f"a forged Host reached a mutation route: {forged}"
+        assert right != 403, "the server refused its own address"
+
+
+def test_no_token_no_change():
+    """The check that actually holds. Origin is absent on a curl or an agent and
+    forgeable by anything that is not a browser; the token cannot be read
+    cross-origin, because reading it means reading this page's body."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            missing, _, _ = request(port, "POST", "/render", {},
+                                    {"X-Cutroom-Token": None})
+            wrong, _, _ = request(port, "POST", "/render", {},
+                                  {"X-Cutroom-Token": "not-the-token"})
+            good, _, _ = request(port, "POST", "/render", {})
+        finally:
+            stop_server(srv)
+        assert missing == 403, missing
+        assert wrong == 403, wrong
+        assert good != 403, "a correctly tokened call was refused"
+
+
+def test_the_page_is_served_with_a_real_token_never_the_placeholder():
+    """The token is injected at serve time and is new every run: a capability
+    does not belong in a file on disk."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            status, raw, _ = request(port, "GET", "/")
+        finally:
+            stop_server(srv)
+        page = raw.decode()
+        assert status == 200
+        assert "__CUTROOM_TOKEN__" not in page, \
+            "the page shipped the placeholder — every write would be refused"
+        assert server.SESSION_TOKEN in page, "the page was served without its token"
+        assert len(server.SESSION_TOKEN) >= 32, "the token is too short to be one"
+
+
+def test_a_mutation_route_takes_json_and_a_bounded_body():
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            plain, _, _ = request(port, "POST", "/render", {},
+                                  {"Content-Type": "text/plain"})
+            huge, _, _ = request(port, "PUT", "/project", {"version": 3, "clips": []},
+                                 {"Content-Length": str(server.MAX_BODY + 1)})
+        finally:
+            stop_server(srv)
+        assert plain == 415, plain
+        assert huge == 413, huge
+
+
+def test_reading_is_still_open_to_the_page_that_asks():
+    """The gate is on CHANGE, not on read: the monitor pulls media with plain
+    GETs and range requests, and breaking those breaks playback."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            root_, _, _ = request(port, "GET", "/", None, {"X-Cutroom-Token": None})
+            proj, _, _ = request(port, "GET", "/project", None, {"X-Cutroom-Token": None})
+        finally:
+            stop_server(srv)
+        assert root_ == 200 and proj == 200, (root_, proj)
 
 
 if __name__ == "__main__":

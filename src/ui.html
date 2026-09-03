@@ -405,6 +405,16 @@ const snap = (v,free) => free ? Math.max(0,v) : Math.max(0, Math.round(v/SNAP)*S
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
   ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
 const newUid = () => 'c' + Math.random().toString(36).slice(2,8);
+// The server injects this when it serves the page, fresh every run. A site you
+// are visiting cannot read it — reading this page means reading a cross-origin
+// response body, which the browser forbids — so it is what proves a write came
+// from Cut Room and not from a tab you happen to have open.
+const TOKEN = '__CUTROOM_TOKEN__';
+// Every state-changing fetch goes through this. The server refuses a mutation
+// without the token, so a missed call site fails loudly rather than silently
+// leaving a hole.
+const wHeaders = (extra) => Object.assign({'X-Cutroom-Token': TOKEN}, extra || {});
+
 const mediaOf = mid => MEDIA.find(m => m.mid === mid) || null;
 // Media is addressed by mid over the wire too, so a path never travels in a
 // URL and there is nothing for a request to try to spell differently.
@@ -460,7 +470,7 @@ async function stash() {
 async function stashOnce() {
   try {
     const r = await fetch('/pending', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+      method: 'POST', headers: wHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({stamp: PENDING, doc: DOC})
     });
     if (!r.ok) return false;
@@ -582,7 +592,7 @@ async function saveOnce() {
   const outbound = JSON.stringify(DOC);
   try {
     r = await fetch('/project', {
-      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      method: 'PUT', headers: wHeaders({'Content-Type': 'application/json'}),
       body: outbound
     });
     body = await r.json();
@@ -776,7 +786,7 @@ async function pickMedia() {
   note('picker open…', 'var(--warn)');
   try {
     const r = await fetch('/media/pick', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: wHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({copy: true})});
     const b = await r.json();
     if (!r.ok && r.status !== 207)
@@ -1775,7 +1785,7 @@ function inspect(c) {
   if (run) run.onclick = async () => {
     note('running…', 'var(--warn)');
     const r = await fetch('/pass', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+      method: 'POST', headers: wHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({uid: c.uid, pass: document.getElementById('tool').value,
                             args: document.getElementById('targs').value.split(/\s+/)
                                     .filter(Boolean)})});
@@ -1829,7 +1839,7 @@ document.getElementById('addlane').onclick = () => {
   EXTRA = Math.max(1, ...DOC.clips.map(c=>c.lane+1))+1; draw(); };
 async function doExport() {
   note('exporting…', 'var(--warn)');
-  const r = await fetch('/render', {method: 'POST',
+  const r = await fetch('/render', {method: 'POST', headers: wHeaders(),
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({export: true})});
   const b = await r.json();
@@ -1858,7 +1868,7 @@ HIST.onchange = async () => {
   HIST.selectedIndex = 0;
   if (!stamp || stamp === 'history…') return;
   try {
-    const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST'});
+    const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST', headers: wHeaders()});
     const b = await r.json();
     if (!r.ok) return note((b.problems || ['restore failed'])[0], 'var(--danger)');
     // A restore IS a choice about which state wins, so it also settles any

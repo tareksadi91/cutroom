@@ -8,6 +8,11 @@ No account. No subscription. No upload requirement. No proprietary project forma
 
 > Your media stays yours. Cutroom never moves, deletes, or writes over source footage.
 
+![Cutroom editing a film: the media bin down the left listing every source clip,
+the program monitor at top right showing the shot under the playhead, and the
+timeline across the bottom with clips laid out on lanes, a playhead, and
+crossfades between shots.](docs/assets/cutroom-the-courier.png)
+
 ## What problem does it solve?
 
 Most editing software assumes one of two things: you are already a professional editor, or you are happy to work inside somebody else's app, cloud, format, and limitations.
