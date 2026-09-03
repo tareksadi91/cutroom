@@ -1553,8 +1553,14 @@ let MASTER_AUDIO = true;          // session only — never written to the proje
 let PLAY_BLOCKED = false;         // one notice per blocked run, not one per frame
 const AUDIO = {};                 // uid -> Audio(), reused across frames
 const audioEnabled = c => c.audio !== false;
+// ⚠️ `!== false`, NOT a truthiness test. Every media entry probed before audio
+// existed has NEITHER field, and there is no migration: reading a missing
+// has_audio as "no sound" would have shipped an audition that does nothing at
+// all on every project made until now. Unknown means assume it sounds — an
+// unmuted video with no audio track plays silence, which costs nothing, while
+// the opposite mistake is the whole feature silently not working.
 const hasVideo = c => (mediaOf(c.mid) || {}).has_video !== false;
-const hasAudio = c => !!(mediaOf(c.mid) || {}).has_audio;
+const hasAudio = c => (mediaOf(c.mid) || {}).has_audio !== false;
 
 function pauseMedia(el) { el.cutroomPlayPending = null; el.pause(); }
 function playMedia(el) {

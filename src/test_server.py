@@ -2497,6 +2497,7 @@ const Audio = function () { return media(); };
 let MEDIA = [
   {mid: 'pic', has_video: true, has_audio: true},
   {mid: 'stem', has_video: false, has_audio: true},
+  {mid: 'old'},                      // probed before audio existed: no fields
 ];
 let DOC = {clips: [
   {uid: 'pic', mid: 'pic', t: 0, in: 0, out: 3, rate: 1},
@@ -2578,6 +2579,15 @@ if (!master.textContent.includes('🔇')) fail('the master mute did not show as 
 syncAudio(CLOCK, false);
 if (!M_A.muted) fail('the master mute did not silence the monitor');
 same(AUDIO.stem.volume, 0, 'the master mute did not silence the stem');
+
+// A media entry written before audio existed has NEITHER field. There is no
+// migration, so unknown has to mean "assume it sounds" — reading it as "no
+// sound" is an audition that does nothing on every project made until now.
+master.onclick();                    // unmute again
+DOC = {clips: [{uid: 'old', mid: 'old', t: 0, in: 0, out: 3, rate: 1}]};
+SLOT_UID.mA = 'old';
+syncAudio(1.0, false);
+if (M_A.muted) fail('a clip whose media predates audio was left silent');
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
