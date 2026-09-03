@@ -53,6 +53,68 @@ def files(d, *names):
              "label": n, "dur": 99.0, "w": 720, "h": 1280} for n in names]
 
 
+# ----------------------------------------------------------- the shape check
+
+def test_shape_problems_names_the_type_of_a_non_object():
+    for bad in ([], "nope", 7, None):
+        problems = render.shape_problems(bad)
+        assert problems and "object" in problems[0], (bad, problems)
+
+
+def test_shape_problems_requires_a_positive_fps():
+    for bad in (0, -24, 0.0, "24", None):
+        problems = render.shape_problems(proj(fps=bad))
+        assert problems and any("fps" in p for p in problems), (bad, problems)
+    assert render.shape_problems(proj(fps=23.976)) == []
+
+
+def test_shape_problems_requires_a_positive_even_integer_resolution():
+    for bad in ([720], [720, 1281], [721, 1280], [720.5, 1280],
+                [-720, 1280], [0, 1280], "720x1280", None):
+        problems = render.shape_problems(proj(resolution=bad))
+        assert problems and any("resolution" in p for p in problems), (bad, problems)
+    assert render.shape_problems(proj(resolution=[720, 1280])) == []
+
+
+def test_shape_problems_rejects_non_finite_numbers():
+    """json.loads accepts NaN/Infinity/-Infinity by default — a Python
+    extension, not standard JSON. Each used to pass the plain isinstance/>0
+    checks (nan <= 0 is False), and on_grid()'s round(seconds * fps) then
+    raised ValueError deep inside validate() instead of a clean refusal."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        problems = render.shape_problems(proj(fps=bad))
+        assert problems and any("fps" in p for p in problems), (bad, problems)
+        c = clip("c1", 0.0, 0.5)
+        c["rate"] = bad
+        problems = render.shape_problems(proj(c))
+        assert problems, (bad, problems)
+
+
+def test_shape_problems_requires_a_valid_version():
+    """export_path() formats this as f"{project['version']:03d}" — a missing
+    or non-integer version raised KeyError/ValueError there, past every other
+    check, instead of the refusal every other malformed field gets."""
+    for bad in (None, "1", 1.0, -1, True):
+        problems = render.shape_problems(proj(version=bad))
+        assert problems and any("version" in p for p in problems), (bad, problems)
+    assert render.shape_problems(proj(version=0)) == []
+
+
+def test_shape_problems_catches_a_partially_malformed_project():
+    docs = [
+        {},
+        {"fps": 24, "resolution": [720, 1280], "clips": [{}]},
+        {"fps": 24, "resolution": [720, 1280], "clips": [{"uid": "c1"}]},
+        {"fps": 24, "resolution": [720, 1280], "clips": "not a list"},
+        {"fps": 24, "resolution": [720, 1280], "clips": [7]},
+        {"fps": 24, "resolution": [720, 1280], "media": "not a list", "clips": []},
+        {"fps": 24, "resolution": [720, 1280], "media": [{"mid": "m01"}], "clips": []},
+    ]
+    for doc in docs:
+        assert render.shape_problems(doc), doc
+    assert render.shape_problems(proj()) == [], "an ordinary empty project has no problems"
+
+
 # --------------------------------------------------------------- the validator
 
 def test_duration_divides_by_rate():

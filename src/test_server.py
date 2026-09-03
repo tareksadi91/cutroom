@@ -1796,6 +1796,34 @@ def test_the_cli_makes_a_project_and_refuses_to_stand_on_one():
             server.ROOT = old
 
 
+def test_new_refuses_bad_fps_and_resolution_before_writing_anything():
+    """§2 of the open-source checklist: `cutroom new` used to hand fps and
+    resolution straight to json.dumps, so a bad value surfaced much later as a
+    KeyError deep in render.py, or as a raw ValueError traceback out of
+    int(w)/int(h). Both must now be a concise refusal, before any file or
+    directory exists."""
+    with tempfile.TemporaryDirectory() as d:
+        old, server.ROOT = server.ROOT, pathlib.Path(d)
+        try:
+            for argv in (["new", "bad", "--fps", "0"],
+                         ["new", "bad", "--fps", "-24"],
+                         ["new", "bad", "--res", "721x1280"],   # odd width
+                         ["new", "bad", "--res", "720x1281"],   # odd height
+                         ["new", "bad", "--res", "not-a-resolution"],
+                         ["new", "bad", "--res", "0x1280"]):
+                try:
+                    server.main(argv)
+                    assert False, f"{argv} was allowed"
+                except SystemExit as e:
+                    assert str(e), (argv, e)
+            assert not (pathlib.Path(d) / "bad.json").exists(), \
+                "a rejected project still touched disk"
+            assert not (pathlib.Path(d) / "bad").exists(), \
+                "a rejected project still made a directory"
+        finally:
+            server.ROOT = old
+
+
 # ================================================ what the adversarial review found
 # One test per finding, each written against the broken version first and seen
 # to fail there. The order is the order of how much each one matters.
@@ -2168,6 +2196,41 @@ def test_a_malformed_project_body_is_a_400_not_a_crash():
         assert status == 400, (status, payload)
 
 
+def test_serve_refuses_a_hand_edited_project_before_binding():
+    """§2. A project on disk is not necessarily one that came through PUT
+    /project — it can be hand-edited directly. `serve()` used to check only
+    that the file parsed as JSON at all; a `{"clips": [{}]}` on disk passed
+    that check and would have crashed the first request that touched a
+    field. The shape check has to run before the port is bound or a browser
+    tab opens, same as it runs before /project accepts a PUT."""
+    with project() as (name, root):
+        server.project_path(name).write_text(json.dumps({"clips": [{}]}))
+        try:
+            server.serve(name, 0, open_browser=False)
+            assert False, "serve started on a shapeless project"
+        except SystemExit as e:
+            assert str(e), e
+
+
+def test_export_refuses_a_hand_edited_project_instead_of_crashing():
+    """§2. export() used to call render_mod.load(), which canonicalises and
+    indexes project["fps"] and every clip's "in"/"out" directly — a
+    hand-edited file missing a field raised KeyError instead of the clean
+    400 every other door into a project gives. Same fix as PUT /project and
+    serve(), applied to the export door, and to its CLI wrapper."""
+    with project() as (name, root):
+        server.project_path(name).write_text(json.dumps({"clips": [{}]}))
+        status, payload = server.export(name)
+        assert status == 400, (status, payload)
+        assert payload["problems"], payload
+
+        try:
+            server.main(["export", name])
+            assert False, "export ran on a shapeless project"
+        except SystemExit as e:
+            assert str(e), e
+
+
 def test_the_renderer_cli_cannot_write_outside_the_projects_root():
     """The renderer is a program too. `-o` used to be handed straight to
     ffmpeg with no guard at all, which is a second way to name an output — and
@@ -2220,6 +2283,46 @@ def test_the_renderer_cli_cannot_write_outside_the_projects_root():
         r = run()
         assert r.returncode == 0, r.stderr
         assert (root / name / "renders" / f"{name}_cli.mp4").is_file(), r.stdout
+
+
+def test_the_renderer_cli_refuses_malformed_input_before_claiming_output():
+    """Adversarial review: the CLI's own json.loads had no JSONDecodeError
+    handler (a raw traceback, unlike server export/serve's clean refusal),
+    and it used to claim its output name — a zero-byte file on disk — BEFORE
+    parsing or shape-checking the project at all. A malformed project left a
+    zero-byte file sitting in renders/ with no way for the CLI to clean it up,
+    and a second `-o` at the same name then failed with a misleading
+    "already exists"."""
+    with project() as (name, root):
+        runner = root / "cli.py"
+        runner.write_text(
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(server.HERE)!r})\n"
+            "import server, render\n"
+            f"server.ROOT = pathlib.Path({str(root)!r})\n"
+            "sys.argv = ['render.py'] + sys.argv[1:]\n"
+            "render.main()\n")
+
+        def run(project_file, *args):
+            return subprocess.run([sys.executable, str(runner), str(project_file), *args],
+                                  capture_output=True, text=True, timeout=600)
+
+        bad_json = root / "bad.json"
+        bad_json.write_text("{not json")
+        r = run(bad_json)
+        assert r.returncode != 0, r.stdout
+        assert "Traceback" not in r.stderr, r.stderr
+        assert "malformed" in r.stderr, r.stderr
+
+        bad_shape = root / "bad_shape.json"
+        bad_shape.write_text(json.dumps({"clips": [{}]}))
+        r = run(bad_shape)
+        assert r.returncode != 0, r.stdout
+        assert "Traceback" not in r.stderr, r.stderr
+
+        renders = root / name / "renders"
+        assert not renders.exists() or not list(renders.iterdir()), \
+            "a rejected project still left a claimed output file on disk"
 
 
 def test_what_an_external_pass_script_actually_receives():

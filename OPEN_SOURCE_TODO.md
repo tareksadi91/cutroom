@@ -49,23 +49,50 @@ disclosure, and closing it would mean the page could not show thumbnails.
 
 ## 2. Validate projects at their boundaries
 
-- [ ] Validate `cutroom new` arguments before creating any file.
-- [ ] Require positive fps.
-- [ ] Require `WIDTHxHEIGHT` with positive integer dimensions compatible with
+- [x] Validate `cutroom new` arguments before creating any file.
+- [x] Require positive fps.
+- [x] Require `WIDTHxHEIGHT` with positive integer dimensions compatible with
       `yuv420p` output; use even dimensions unless renderer format changes.
-- [ ] Return concise argparse-style errors instead of Python tracebacks.
-- [ ] On `serve`, run project shape validation before binding or opening browser.
-- [ ] On `export`, fail cleanly for malformed hand-edited project documents.
-- [ ] Tighten `shape_problems()` so resolution values match renderer's real
+- [x] Return concise argparse-style errors instead of Python tracebacks.
+- [x] On `serve`, run project shape validation before binding or opening browser.
+- [x] On `export`, fail cleanly for malformed hand-edited project documents.
+- [x] Tighten `shape_problems()` so resolution values match renderer's real
       integer/even-dimension requirements.
-- [ ] Add tests for zero/negative fps, malformed resolution strings, float/odd/
+- [x] Add tests for zero/negative fps, malformed resolution strings, float/odd/
       negative dimensions, `{}`, and partially malformed project documents.
 
-Evidence: `src/server.py:create()` writes unchecked settings; `serve()` checks
-JSON syntax only. `src/render.py:offline()` then indexes `project["clips"]`.
+Evidence: `src/server.py:create()` wrote unchecked settings; `serve()` checked
+JSON syntax only; `export()` called `render_mod.load()`, which indexes
+`project["fps"]` and every clip's `in`/`out` directly.
 
 Done when: invalid project cannot be created or served, and every refusal names
 the bad field without a traceback or partial project.
+
+**DONE 2026-09-03.** `create()` now runs the same `shape_problems()` every
+other door into a project runs, before `mkdirs()` or `write_new()` touch disk
+— so a rejected `cutroom new` leaves nothing on disk. `shape_problems()`
+itself now requires resolution to be positive, even integers (yuv420p has no
+center pixel to subsample on an odd dimension). `serve()` runs the same check
+right after its existing JSON-parse check, before `Handler.project_name` is
+set or the port is bound. `export()` — both the `/render` HTTP route and the
+`cutroom export` CLI go through this one function — now shape-checks the
+document itself instead of calling `render_mod.load()` (which canonicalises
+and indexes fields directly); `render.py`'s own `--check`-adjacent standalone
+CLI got the same fix for the same reason. `--res` values that fail `int()`
+now raise `Refused` instead of a bare `ValueError` traceback. Six new tests
+(`test_render.py`: shape_problems on a non-object, bad fps, bad resolution,
+partially malformed docs; `test_server.py`: bad `new` args write nothing,
+`serve` refuses before binding, `export` refuses cleanly both over HTTP and
+via the CLI). Independent Codex review then found four more: a missing/
+non-integer `version` passed shape_problems() and crashed `export_path()`'s
+`f"{version:03d}"`; NaN/Infinity fps and clip fields passed the plain
+`>0`/`isinstance` checks (`nan <= 0` is False) and crashed deep inside
+`on_grid()`; the standalone `render.py` CLI's own `json.loads()` had no
+`JSONDecodeError` handler; and that CLI claimed its output name — a
+zero-byte file — before parsing or shape-checking the project at all. All
+four fixed (`shape_problems()` now requires `math.isfinite()` and a
+non-negative int version; the CLI parses and shape-checks before claiming
+output) with 4 more regression tests. 142 tests green (was 129).
 
 ## 3. Reject unreadable media during import
 

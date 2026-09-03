@@ -1089,7 +1089,18 @@ def export_path(name, project):
 
 
 def export(name, t_from=None, t_to=None):
-    project = render_mod.load(project_path(name))
+    path = project_path(name)
+    try:
+        project = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        return 400, {"problems": [f"{path} is malformed at line {e.lineno}: {e.msg}"]}
+    # SHAPE FIRST — validate()/canonicalise() index project["fps"] and
+    # clip["in"]/["out"] directly, so a hand-edited file missing a field
+    # raised KeyError out of render.py before any rule ran. See the same
+    # comment on shape_problems() in edit_project().
+    malformed = render_mod.shape_problems(project)
+    if malformed:
+        return 400, {"problems": malformed}
     missing = render_mod.offline(project)
     if missing:
         return 422, {"problems": [f"{uid}: {why} — put the file back or re-point "
@@ -1485,10 +1496,17 @@ def create(name, fps=24, resolution=(720, 1280)):
     """A new project: one JSON file and its directory. Refuses to touch an
     existing one — that is the no-overwrite rule, not politeness."""
     check_name(name)
+    doc = dict(BLANK, name=name, fps=fps, resolution=list(resolution))
+    # Same shape check every other door into a project runs (PUT /project,
+    # a pass's edit) — so bad fps/resolution is refused HERE, before any
+    # file exists, instead of surfacing as a KeyError from deep in render.py
+    # the first time something reads project["fps"].
+    problems = render_mod.shape_problems(doc)
+    if problems:
+        raise Refused("; ".join(problems))
     mkdirs(root())
     writable(project_path(name))          # the friendly refusal, with a reason
     mkdirs(project_dir(name))
-    doc = dict(BLANK, name=name, fps=fps, resolution=list(resolution))
     write_new(project_path(name), json.dumps(doc, indent=2))
     return doc
 
@@ -1522,10 +1540,17 @@ def serve(name, port, passes_dir=None, open_browser=True):
         sys.exit(f"No project at {project_path(name)} — make one with "
                  f"`cutroom new {name}`.")
     try:
-        json.loads(project_path(name).read_text())
+        doc = json.loads(project_path(name).read_text())
     except json.JSONDecodeError as e:
         # Starting empty would look exactly like having lost the cut.
         sys.exit(f"{project_path(name)} is malformed at line {e.lineno}: {e.msg}")
+    problems = render_mod.shape_problems(doc)
+    if problems:
+        # Refused before a port is bound or a browser tab opens — a project
+        # that will throw KeyError the first time the UI loads it should
+        # never get that far.
+        sys.exit(f"{project_path(name)} is not a valid project:\n"
+                  + "\n".join(f"  {p}" for p in problems))
 
     Handler.project_name = name
     Handler.bound_port = port
@@ -1579,8 +1604,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         if a.cmd == "new":
-            w, _, h = a.res.partition("x")
-            doc = create(a.project, a.fps, (int(w), int(h)))
+            w, x, h = a.res.partition("x")
+            try:
+                if not x:
+                    raise ValueError
+                resolution = (int(w), int(h))
+            except ValueError:
+                raise Refused(f"--res must be WIDTHxHEIGHT of integers, got {a.res!r}")
+            doc = create(a.project, a.fps, resolution)
             print(f"{project_path(a.project)}  {doc['fps']}fps "
                   f"{doc['resolution'][0]}x{doc['resolution'][1]}")
         elif a.cmd == "add":

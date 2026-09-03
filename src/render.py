@@ -374,16 +374,37 @@ def shape_problems(project):
         return [f"a project must be a JSON object, got {type(project).__name__}"]
 
     def num(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool)
+        # json.loads accepts NaN/Infinity/-Infinity by default (Python's
+        # extension, not standard JSON) and each of those passes an
+        # isinstance/>0 check — NaN <= 0 is False, so `fps <= 0` alone let a
+        # NaN fps through and on_grid()'s round(seconds * fps) then raised
+        # ValueError deep inside validate(). isfinite() closes that.
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v))
 
     problems = []
+    version = project.get("version")
+    if not (isinstance(version, int) and not isinstance(version, bool) and version >= 0):
+        # export_path() formats this as f"{version:03d}" — a missing or
+        # non-integer version raised KeyError/ValueError there instead of a
+        # refusal, the same class of bug this function exists to catch.
+        problems.append(f"version must be a non-negative integer, got {version!r}")
     fps = project.get("fps")
     if not num(fps) or fps <= 0:
         problems.append(f"fps must be a positive number, got {fps!r}")
     res = project.get("resolution")
-    if not (isinstance(res, list) and len(res) == 2
-            and all(num(v) and v > 0 for v in res)):
-        problems.append(f"resolution must be [width, height], got {res!r}")
+
+    def whole(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+    if not (isinstance(res, list) and len(res) == 2 and all(whole(v) for v in res)):
+        problems.append(
+            f"resolution must be [width, height] of positive integers, got {res!r}")
+    elif any(v % 2 for v in res):
+        # yuv420p (ENCODE, see render()) subsamples chroma 2x2 — an odd
+        # dimension has no center pixel to subsample and ffmpeg refuses it.
+        problems.append(f"resolution must have even width and height "
+                         f"(yuv420p output), got {res!r}")
 
     media = project.get("media", [])
     if not isinstance(media, list):
@@ -899,6 +920,18 @@ def main():
     if not a.project:
         ap.error("need a project file, or --check")
 
+    # Parse and shape-check BEFORE claiming an output name: claiming first left
+    # a zero-byte file in renders/ (or at -o) every time this ran on a project
+    # that was never going to render, with no way for the CLI to clean it up.
+    project_path = pathlib.Path(a.project)
+    try:
+        doc = json.loads(project_path.read_text())
+    except json.JSONDecodeError as e:
+        sys.exit(f"{project_path} is malformed at line {e.lineno}: {e.msg}")
+    malformed = shape_problems(doc)
+    if malformed:
+        sys.exit("\n".join(malformed))
+
     # THE CLI IS A WRITE PATH TOO. -o used to be handed straight to ffmpeg, so
     # `render.py p.json -o ~/footage/master.mp4` walked around every boundary
     # the server enforces — a second way to name an output, which is precisely
@@ -910,7 +943,7 @@ def main():
 
     try:
         if a.out is None:
-            name = pathlib.Path(a.project).stem
+            name = project_path.stem
             out_dir = boundary.mkdirs(boundary.project_dir(name) / "renders")
             out = boundary.claim_free(out_dir, f"{name}_cli", ".mp4")
         else:
@@ -923,7 +956,7 @@ def main():
         sys.exit(str(e))
 
     try:
-        out = render(load(pathlib.Path(a.project)), out, a.t_from, a.t_to, claimed=True)
+        out = render(doc, out, a.t_from, a.t_to, claimed=True)
     except ValueError as e:
         sys.exit(str(e))
     print(f"{out}  {bitrate(out) / 1e6:.2f} Mbps")
