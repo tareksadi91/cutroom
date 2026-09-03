@@ -2459,6 +2459,137 @@ def test_probe_falls_back_to_flooring_when_the_decode_cannot_answer():
             f"fallback produced an off-grid duration: {got['dur']}"
 
 
+def test_the_audition_follows_the_cut_without_ever_persisting_the_master_mute():
+    """The audition lifted out of ui.html and driven with fake media elements.
+
+    A parse check does not catch an undeclared symbol and cannot catch a
+    per-frame retry, so the real code is executed here rather than read.
+    """
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the audition is JS)")
+        return
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    audition = html[html.index("// >>> audition"):html.index("// <<< audition")]
+    transport = html[html.index("// >>> transport"):html.index("// <<< transport")]
+    play = html[html.index("document.getElementById('play').onclick"):]
+    play = play[:play.index("tick(); };") + len("tick(); };")]
+
+    harness = r"""
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+const same = (a, b, m) => { if (a !== b) fail(m + ': ' + a + ' !== ' + b); };
+let rejectPlay = false;
+const NOTES = [];
+const media = () => ({currentTime: 0, volume: 1, muted: false, paused: true,
+  playbackRate: 1, playCalls: 0,
+  play() { this.playCalls++; if (rejectPlay) return Promise.reject(Error('blocked'));
+           this.paused = false; return Promise.resolve(); },
+  pause() { this.paused = true; }});
+const M_A = media(), M_B = media();
+M_A.id = 'mA'; M_B.id = 'mB';
+const master = {textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }};
+const PLAY = {textContent: ''}, HEAD = {style: {}};
+const document = {
+  getElementById: id => ({'master-audio': master, play: PLAY, playhead: HEAD,
+                          stage: {scrollLeft: 0}}[id] || {style: {}}),
+  querySelectorAll: () => [M_A, M_B]};
+const Audio = function () { return media(); };
+let MEDIA = [
+  {mid: 'pic', has_video: true, has_audio: true},
+  {mid: 'stem', has_video: false, has_audio: true},
+];
+let DOC = {clips: [
+  {uid: 'pic', mid: 'pic', t: 0, in: 0, out: 3, rate: 1},
+  {uid: 'stem', mid: 'stem', t: 1, in: .25, out: 3.25, rate: 1.5},
+]};
+const OFFLINE = {}, SLOT_UID = {mA: 'pic', mB: null};
+let CLOCK = 1.5, PX = 10, RAF = 4, T0 = 0, SAVES = 0, PAINTED = [];
+const performance = {now: () => 0};
+const window = {innerWidth: 0};
+const requestAnimationFrame = () => 7;
+const cancelAnimationFrame = () => {};
+const totalLen = () => 99;
+const mediaOf = mid => MEDIA.find(m => m.mid === mid) || null;
+const mediaURL = mid => '/media/' + mid;
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+const activeAt = t => DOC.clips.filter(c => t >= c.t && t < endOf(c))
+                               .sort((a, b) => a.t - b.t);
+const setRate = (el, r) => { el.playbackRate = r; };
+function note(m) { NOTES.push(m); }
+function save() { SAVES++; }
+function paint() { return PAINTED; }
+__AUDITION__
+__TRANSPORT__
+__PLAY__
+
+// A stem is seeked from the cut's own arithmetic, and it plays.
+syncAudio(CLOCK, true);
+const stem = AUDIO.stem;
+same(stem.currentTime, 1, 'audio-only source seek');
+same(stem.playCalls, 1, 'audio-only source play');
+same(stem.playbackRate, 1.5, 'the stem ignored the clip rate');
+if (M_A.muted) fail('the shot on screen was muted');
+// mB is parked — it holds a decoded source and no live clip. It must be
+// silent, or a preloaded shot sounds underneath the one being watched.
+if (!M_B.muted) fail('a parked monitor slot was left sounding');
+await Promise.resolve();
+
+// A monitor slot holding a clip that is no longer live must go silent.
+CLOCK = 4; syncAudio(CLOCK, false);
+if (!M_A.muted) fail('the monitor kept sounding after its clip ended');
+
+// A scrub puts the stem exactly on the frame, not merely within 0.2s of it.
+CLOCK = 1.5; syncAudio(CLOCK, true); await Promise.resolve();
+CLOCK = 2; stem.currentTime = 1.7;
+scrubTo(CLOCK);
+same(stem.currentTime, 1.75, 'a scrub left the stem off the frame');
+
+// A refused play is reported ONCE and not retried every frame.
+CLOCK = 1.5; syncAudio(CLOCK, true); await Promise.resolve();
+rejectPlay = true; stem.paused = true; NOTES.length = 0;
+syncAudio(CLOCK, true); await Promise.resolve();
+const refused = stem.playCalls;
+syncAudio(CLOCK, true); syncAudio(CLOCK, true);
+same(stem.playCalls, refused, 'a refused stem retried every frame');
+if (!NOTES.some(m => m.includes('blocked'))) fail('a refused stem said nothing');
+
+// The play button is the explicit retry, and it clears the block.
+rejectPlay = false; RAF = null;
+PLAY.onclick(); await Promise.resolve();
+if (stem.paused) fail('the play button did not clear the blocked state');
+
+// The monitor video is refusable too, and obeys the same rule.
+PAINTED = [M_A]; rejectPlay = true; M_A.paused = true; NOTES.length = 0;
+RAF = null; PLAY.onclick(); await Promise.resolve(); await Promise.resolve();
+const vRefused = M_A.playCalls;
+if (!vRefused) fail('the monitor video was never asked to play');
+tick(); tick();
+same(M_A.playCalls, vRefused, 'a refused monitor video retried every frame');
+if (!NOTES.some(m => m.includes('blocked'))) fail('a refused monitor video said nothing');
+PAINTED = []; rejectPlay = false;
+
+// The header mute is a session control and must never reach the document.
+const before = JSON.stringify(DOC);
+master.onclick();
+same(JSON.stringify(DOC), before, 'the master mute changed the cut');
+same(SAVES, 0, 'the master mute saved the project');
+if (!master.textContent.includes('🔇')) fail('the master mute did not show as muted');
+syncAudio(CLOCK, false);
+if (!M_A.muted) fail('the master mute did not silence the monitor');
+same(AUDIO.stem.volume, 0, 'the master mute did not silence the stem');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "audition.mjs"
+        js.write_text(harness.replace("__AUDITION__", audition)
+                             .replace("__TRANSPORT__", transport)
+                             .replace("__PLAY__", play))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert r.stdout.strip() == "js ok", r.stdout
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

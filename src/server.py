@@ -686,7 +686,8 @@ def restore(name, stamp):
 
 # --------------------------------------------------------------------- media
 def probe(path):
-    """{"dur", "w", "h"} for a source, or {} if ffprobe cannot say.
+    """{"dur", "w", "h", "kind", "has_video", "has_audio"}, or {} if ffprobe
+    cannot say.
 
     Cached in `media` so the UI never re-probes on load. A source that has gone
     missing keeps whatever it last said — the cached numbers are what let a
@@ -716,7 +717,11 @@ def probe(path):
             dur = frames / fps
         elif dur is not None:
             dur = math.floor(dur * fps + 1e-6) / fps
-    return {"dur": dur, "w": info["w"], "h": info["h"]}
+    # The UI has to tell a stem from a shot: an audio-only card carries no
+    # poster frame, and a source with no sound gets no audio control.
+    return {"dur": dur, "w": info["w"], "h": info["h"],
+            "kind": "video" if fps else "audio",
+            "has_video": bool(fps), "has_audio": bool(info["audio"])}
 
 
 def _next_mid(project):
@@ -903,6 +908,11 @@ def thumb(name, project, mid):
         return None
     src = servable(project, entry["path"])
     if src is None or not src.is_file():
+        return None
+    # Nothing to grab a frame from. Asking ffmpeg anyway leaves an empty
+    # claimed file behind, which is then reported as a broken thumbnail
+    # forever, because a claim is never remade.
+    if entry.get("has_video") is False:
         return None
     out = mkdirs(project_dir(name) / "thumbs") / f"{mid}.jpg"
     try:
@@ -1112,6 +1122,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     project_name = None
 
     # -- helpers ------------------------------------------------------------
+    def _write(self, blob):
+        """Write, and treat a dropped socket as normal. The range path below
+        already did this; these two did not, and now that the monitor plays
+        UNMUTED video a cancelled request is a routine event on every path —
+        a <video> opens a request, decides it has seen enough and goes away.
+        A traceback per scrub is how a real failure gets missed."""
+        try:
+            self.wfile.write(blob)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+
     def _send(self, status, payload, ctype="application/json"):
         blob = json.dumps(payload).encode() if ctype == "application/json" else payload
         self.send_response(status)
@@ -1119,7 +1141,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(blob)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(blob)
+        self._write(blob)
 
     def _project(self):
         return json.loads(project_path(self.project_name).read_text())
@@ -1137,7 +1159,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Range", f"bytes */{size}")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        self._write(payload)
 
     def _file(self, path):
         """Static send with Range support, read-only.
@@ -1190,7 +1212,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     chunk = fh.read(min(65536, remaining))
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    if not self._write(chunk):
+                        break
                     remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             # NORMAL, and it happens constantly: a <video> element opens a
