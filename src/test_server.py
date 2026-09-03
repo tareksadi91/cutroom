@@ -2773,6 +2773,88 @@ console.log('js ok');
     assert r.stdout.strip() == "js ok", r.stdout
 
 
+def test_every_write_the_page_makes_carries_the_token():
+    """The export button shipped without it: the fetch had `headers:` twice and
+    JavaScript keeps the LAST duplicate key, so wHeaders() was silently dropped
+    and /render answered 403. No behavioural test saw it, because nothing drove
+    the export button — so this reads the source and checks every write."""
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    misses = []
+    at = 0
+    while True:
+        at = html.find("fetch(", at)
+        if at < 0:
+            break
+        call = html[at:at + 320]
+        end = call.find("});")
+        call = call[:end if end > 0 else 320]
+        if "method:" in call and ("'POST'" in call or "'PUT'" in call):
+            if "wHeaders(" not in call:
+                misses.append(call.split("\n")[0].strip())
+            # a duplicate key means the earlier one is discarded outright
+            assert call.count("headers:") <= 1, \
+                f"duplicate headers key drops the token: {call.split(chr(10))[0].strip()}"
+        at += 6
+    assert not misses, f"writes with no token: {misses}"
+
+
+def test_a_rebound_name_cannot_even_READ_the_token_paths_or_media():
+    """The half the mutation gate did not cover. Under DNS rebinding the browser
+    believes this server is same-origin, so a page can simply read: `/` hands
+    over the capability token, `/project` hands over every absolute media path
+    on this machine, `/media/<mid>` hands over the footage."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            forged = {"Host": "evil.example"}
+            page, _, _ = request(port, "GET", "/", None, forged)
+            proj, _, _ = request(port, "GET", "/project", None, forged)
+            media, _, _ = request(port, "GET", "/media/m01", None, forged)
+            ok_page, raw, _ = request(port, "GET", "/")
+        finally:
+            stop_server(srv)
+        assert page == 403, f"a rebound name read the page (and its token): {page}"
+        assert proj == 403, f"a rebound name read the project: {proj}"
+        assert media == 403, f"a rebound name read the footage: {media}"
+        assert ok_page == 200 and server.SESSION_TOKEN in raw.decode(), \
+            "the real address stopped working"
+
+
+def test_another_sites_img_tag_cannot_drive_ffmpeg():
+    """/thumb has to stay a GET — the page loads it with <img src>, which cannot
+    carry a token — but it RUNS FFMPEG and writes a jpg. Sec-Fetch-Site is set
+    by the browser and page script cannot forge it, so it is what separates our
+    own img tag from the same tag on somebody else's site."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            cross, _, _ = request(port, "GET", "/thumb/m01", None,
+                                  {"Sec-Fetch-Site": "cross-site"})
+            same, _, _ = request(port, "GET", "/thumb/m01", None,
+                                 {"Sec-Fetch-Site": "same-origin"})
+        finally:
+            stop_server(srv)
+        assert cross == 403, f"another site's img tag reached ffmpeg: {cross}"
+        assert same != 403, "the page's own thumbnail request was refused"
+
+
+def test_a_negative_content_length_cannot_slip_under_the_cap():
+    """int('-1') parses, slips under any `> MAX_BODY` test, and read(-1) then
+    reads until EOF with no bound at all."""
+    with project() as (name, root):
+        srv, port = start_server(name)
+        try:
+            neg, _, _ = request(port, "POST", "/render", {}, {"Content-Length": "-1"})
+            words, _, _ = request(port, "POST", "/render", {}, {"Content-Length": "lots"})
+            chunked, _, _ = request(port, "POST", "/render", {},
+                                    {"Transfer-Encoding": "chunked"})
+        finally:
+            stop_server(srv)
+        assert neg == 400, f"a negative Content-Length was accepted: {neg}"
+        assert words == 400, words
+        assert chunked == 411, chunked
+
+
 def test_the_readme_shows_the_tool_and_the_image_exists():
     """A visitor decides in seconds. The screenshot was committed to the repo on
     2026-08-31 and never referenced from the README — present on disk, invisible

@@ -1839,8 +1839,8 @@ document.getElementById('addlane').onclick = () => {
   EXTRA = Math.max(1, ...DOC.clips.map(c=>c.lane+1))+1; draw(); };
 async function doExport() {
   note('exporting…', 'var(--warn)');
-  const r = await fetch('/render', {method: 'POST', headers: wHeaders(),
-    headers: {'Content-Type': 'application/json'},
+  const r = await fetch('/render', {method: 'POST',
+    headers: wHeaders({'Content-Type': 'application/json'}),
     body: JSON.stringify({export: true})});
   const b = await r.json();
   if (!r.ok) { document.getElementById('insp').innerHTML =

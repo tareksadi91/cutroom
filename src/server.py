@@ -1124,6 +1124,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     bound_port = None
 
+    # -- every request, read or write -----------------------------------------
+    def _host_is_ours(self):
+        """True if the client thinks it reached THIS server. Sends the refusal.
+
+        ⚠️ ON READS TOO, not only on mutations. Under DNS rebinding a name the
+        attacker controls resolves to 127.0.0.1, the browser then treats this
+        server as same-origin, and a page can simply READ: `/` hands over the
+        capability token, `/project` hands over every absolute media path on
+        this machine, `/media/<mid>` hands over the footage. No CORS header
+        helps once the browser believes the origin is its own — the Host header
+        is the only thing that still says which name was dialled.
+        """
+        host = (self.headers.get("Host") or "").strip()
+        allowed = {f"127.0.0.1:{self.bound_port}", f"localhost:{self.bound_port}",
+                   f"[::1]:{self.bound_port}"}
+        if host in allowed:
+            return True
+        self._send(403, {"problems": [
+            f"refused: Host {host!r} is not this server's address. If you are "
+            f"seeing this in a browser, open http://127.0.0.1:{self.bound_port}/ directly."]})
+        return False
+
+    def _not_cross_site(self):
+        """Reject a request a browser itself labels cross-site.
+
+        Sec-Fetch-Site is set by the browser and cannot be spoofed by page
+        script. It is the only thing that separates the page's own
+        `<img src="/thumb/...">` from the same tag on someone else's site —
+        a token cannot, because an img tag sends no headers. Absent (curl, an
+        agent, an old browser) means allowed: those are not this vector.
+        """
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self._send(403, {"problems": ["refused: cross-site request"]})
+            return False
+        return True
+
     # -- the mutation gate ----------------------------------------------------
     def _allowed_to_mutate(self):
         """True if this request may change anything. Sends the refusal itself.
@@ -1141,13 +1177,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         startup. An agent in this process should call edit_project() instead and
         never touches this path.
         """
-        host = (self.headers.get("Host") or "").strip()
-        allowed_hosts = {f"127.0.0.1:{self.bound_port}", f"localhost:{self.bound_port}",
-                         f"[::1]:{self.bound_port}"}
-        if host not in allowed_hosts:
-            self._send(403, {"problems": [
-                f"refused: Host {host!r} is not this server's address. If you are "
-                f"seeing this in a browser, open http://127.0.0.1:{self.bound_port}/ directly."]})
+        if not self._host_is_ours():
             return False
         origin = self.headers.get("Origin")
         if origin is not None and origin not in (f"http://127.0.0.1:{self.bound_port}",
@@ -1267,8 +1297,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):
+        if not self._host_is_ours():
+            return
         route = urllib.parse.unquote(self.path.split("?")[0])
         name = self.project_name
+        # /thumb is a GET that DOES something: it runs ffmpeg and writes a jpg.
+        # It has to stay a GET because the page loads it with an <img> tag, and
+        # an img tag cannot carry a token — so this is what keeps another site's
+        # img tag from driving ffmpeg on this machine.
+        if route.startswith("/thumb/") and not self._not_cross_site():
+            return
         try:
             if route == "/":
                 # The token is injected, never stored in ui.html: it is new every
@@ -1341,10 +1379,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(415, {"problems": [
                 f"refused: {ctype} — this route takes application/json"]})
             return None
+        if self.headers.get("Transfer-Encoding"):
+            # A chunked body has no Content-Length to cap, and this server
+            # never needs one.
+            self._send(411, {"problems": ["refused: send a Content-Length, not chunked"]})
+            return None
         try:
             raw = self.headers.get("Content-Length")
             if raw is None and require_length:
                 raise TypeError("no Content-Length")
+            # A NEGATIVE length is the trap: int("-1") parses, slips under any
+            # "> MAX_BODY" test, and read(-1) then reads until EOF unbounded.
+            if raw is not None and not str(raw).strip().isdigit():
+                raise ValueError(f"Content-Length {raw!r} is not a whole number")
             length = int(raw or 0)
             if length > MAX_BODY:
                 # Before the read, not after: the point is to not take the bytes.
@@ -1462,7 +1509,10 @@ MAX_BODY = 32 * 1024 * 1024      # a project document, not a media upload
 
 
 def serve(name, port, passes_dir=None, open_browser=True):
-    global PASSES_DIR
+    global PASSES_DIR, SESSION_TOKEN
+    # New for every serve, not merely for every interpreter: two serves in one
+    # process would otherwise share a capability.
+    SESSION_TOKEN = secrets.token_urlsafe(32)
     check_name(name)
     if passes_dir is not None:
         PASSES_DIR = pathlib.Path(passes_dir).expanduser().resolve()
