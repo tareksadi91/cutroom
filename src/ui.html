@@ -1157,7 +1157,14 @@ function timelineFault() {
   // and it was BOTH too weak and too strict: it missed the renderer's same-start rule
   // and it rejected equal end points, which the renderer allows. A gate that refuses a
   // legal edit is as bad as one that lets an illegal one through.
-  const cs = [...DOC.clips].sort((a,b)=>a.t-b.t);
+  //
+  // ⚠️⚠️ VISUAL CLIPS ONLY, because every rule below is about the crossfade chain and
+  // the chain is a property of the PICTURE. render.py scopes these to video_clips();
+  // leaving this walking every clip made the gate refuse the ordinary act of laying a
+  // stem under a shot — same start instant, "a full overlap collapses one of them" —
+  // for a timeline the renderer calls clean. The drag handler holds a position only
+  // while this stays null, so a stem could not be placed at all.
+  const cs = DOC.clips.filter(hasVideo).sort((a,b)=>a.t-b.t);
   const E = 1e-6;
   for (let i=0;i<cs.length-1;i++) {
     const a=cs[i], b=cs[i+1];

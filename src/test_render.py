@@ -795,6 +795,31 @@ def test_an_audio_only_source_is_valid_but_not_a_video_clip():
         assert render.video_clips(project) == []
 
 
+def test_album_art_is_not_footage():
+    """An ordinary mp3 with a cover image carries an mjpeg stream at 90000fps.
+    Taken at face value it made the file a video clip, which then failed the
+    project's frame-grid rule — a music file could not be cut in."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "color=c=orange:s=300x300:d=1:r=1", "-frames:v", "1",
+             str(d / "cover.jpg")], check=True)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3",
+             "-i", str(d / "cover.jpg"), "-map", "0:a", "-map", "1:v",
+             "-c:a", "libmp3lame", "-c:v", "copy", "-id3v2_version", "3",
+             "-disposition:v", "attached_pic", str(d / "song.mp3")], check=True)
+
+        info = render.source_info(d / "song.mp3")
+        assert info["fps"] is None, f"album art was read as footage: {info}"
+        assert info["audio"] is True, info
+
+        project = proj(clip("s", 0.0, 2.0, mid="song"), media=files(d, "song.mp3"))
+        assert not render.validate(project, check_files=True)
+        assert render.video_clips(project) == []
+
+
 def test_a_legacy_clip_keeps_its_sound_and_a_non_boolean_audio_is_refused():
     """Projects written before audio existed have no `audio` key at all."""
     assert render.audio_enabled(clip("a", 0.0, 1.0)) is True

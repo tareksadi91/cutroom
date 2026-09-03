@@ -220,7 +220,12 @@ def _probe_source(path):
     streams = out.get("streams")
     if not isinstance(streams, list):
         return None
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    # attached_pic is album art, not footage. An ordinary mp3 with a cover
+    # image carries an mjpeg "video" stream at 90000fps; taking it at face
+    # value classified the file as a video clip, asked for a thumbnail of it,
+    # and then refused the clip for not being on the project's frame grid.
+    video = next((s for s in streams if s.get("codec_type") == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
     audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
     if video is None and not audio_streams:
         return None

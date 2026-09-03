@@ -1492,6 +1492,10 @@ def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     harness = r"""
 const dur = c => (c.out - c.in) / c.rate;
 const endOf = c => c.t + dur(c);
+// timelineFault() scopes its rules to the picture the way validate() does;
+// every clip in this fixture is a shot.
+const mediaOf = () => null;
+const hasVideo = () => true;
 let DOC = {fps: 24, clips: [
   {uid:'A', t:0, in:0, out:4,   rate:1, lane:0, label:'A'},
   {uid:'B', t:4, in:0, out:2.5, rate:1, lane:0, label:'B'}]};
@@ -2614,6 +2618,53 @@ console.log('js ok');
         js.write_text(harness.replace("__AUDITION__", audition)
                              .replace("__TRANSPORT__", transport)
                              .replace("__PLAY__", play))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert r.stdout.strip() == "js ok", r.stdout
+
+
+def test_the_page_and_the_renderer_agree_that_a_stem_may_sit_under_a_shot():
+    """timelineFault() mirrors validate() expression for expression, so when
+    validate() scoped the crossfade rules to the picture this had to move with
+    it. It did not, and the page then refused the ordinary act of laying a stem
+    under a shot — same start instant — for a cut the renderer calls clean. The
+    drag handler holds a position only while this returns null, so the stem
+    could not be placed at all."""
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the gate is JS)")
+        return
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    at = html.index("function timelineFault()")
+    fault = html[at:html.index("\n}", at) + 2]
+
+    harness = r"""
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+let MEDIA = [{mid: 'pic', has_video: true}, {mid: 'stem', has_video: false}];
+const mediaOf = mid => MEDIA.find(m => m.mid === mid) || null;
+const hasVideo = c => (mediaOf(c.mid) || {}).has_video !== false;
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let DOC = {fps: 24, clips: [
+  {uid: 'a', label: 'shot', mid: 'pic', t: 0, in: 0, out: 2, rate: 1},
+  {uid: 's', label: 'score', mid: 'stem', t: 0, in: 0, out: 5, rate: 1},
+]};
+__FAULT__
+// A stem starting on the same instant as a shot, and outlasting it: legal.
+if (timelineFault()) fail('a stem under a shot was refused: ' + timelineFault());
+// Two stems fully overlapping each other: a mix, not a collapsed crossfade.
+DOC.clips = [{uid: 's1', label: 'a', mid: 'stem', t: 0, in: 0, out: 4, rate: 1},
+             {uid: 's2', label: 'b', mid: 'stem', t: 0, in: 0, out: 4, rate: 1}];
+if (timelineFault()) fail('two stems mixing were refused: ' + timelineFault());
+// But the picture rules still bite on the picture.
+DOC.clips = [{uid: 'a', label: 'a', mid: 'pic', t: 0, in: 0, out: 2, rate: 1},
+             {uid: 'b', label: 'b', mid: 'pic', t: 0, in: 0, out: 2, rate: 1}];
+if (!timelineFault()) fail('two shots on the same instant were allowed');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "fault.mjs"
+        js.write_text(harness.replace("__FAULT__", fault))
         r = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=20)
     assert r.returncode == 0, r.stderr + r.stdout
     assert r.stdout.strip() == "js ok", r.stdout
