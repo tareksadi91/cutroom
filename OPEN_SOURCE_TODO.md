@@ -13,16 +13,18 @@ Baseline at review time:
 
 ## 1. Release blocker: protect local HTTP mutations
 
-- [ ] Add protection against malicious websites sending requests to Cutroom on
+- [x] Add protection against malicious websites sending requests to Cutroom on
       `127.0.0.1`.
-- [ ] Require a server-generated capability token for every state-changing HTTP
+- [x] Require a server-generated capability token for every state-changing HTTP
       request: `PUT /project` and all `POST` routes.
-- [ ] Validate `Host` against the bound loopback host and port.
-- [ ] Reject browser mutation requests whose `Origin` is not Cutroom's own origin.
+- [x] Validate `Host` against the bound loopback host and port — on READS too,
+      which is what actually stops DNS rebinding.
+- [x] Reject browser mutation requests whose `Origin` is not Cutroom's own origin.
       Keep a documented path for local agents that do not send an `Origin` header.
-- [ ] Require `Content-Type: application/json` for JSON mutation routes.
-- [ ] Cap request-body size and return `413` when exceeded.
-- [ ] Add regression tests covering hostile `Origin`, hostile `Host`, missing or
+- [x] Require `Content-Type: application/json` for JSON mutation routes.
+- [x] Cap request-body size and return `413` when exceeded (and refuse a
+      negative or non-decimal `Content-Length`, and chunked framing).
+- [x] Add regression tests covering hostile `Origin`, hostile `Host`, missing or
       wrong token, non-JSON content, oversized bodies, and valid browser/agent calls.
 
 Evidence: `src/server.py:_body`, `do_PUT`, and `do_POST` currently accept a
@@ -32,6 +34,18 @@ being rejected.
 
 Done when: hostile requests fail before any route action; browser UI, CLI, and
 documented agent workflow still work; all tests pass.
+
+**DONE 2026-09-03** (`7a7714d`, `df7a201`). Re-measured: the original attack now
+answers 403. An independent security review then found the gate covered writes
+only — under DNS rebinding a page could READ the token, every absolute media
+path, and the footage, without mutating anything — so the `Host` check runs on
+every request. `/thumb` stays a GET (an `<img>` tag cannot carry a token) and is
+guarded by `Sec-Fetch-Site`. Verified in a real browser, export included.
+
+⚠️ RESIDUAL, ACCEPTED: a same-origin-looking simple GET from an old browser that
+sends no `Sec-Fetch-Site` can still reach `/thumb`. It runs ffmpeg on media
+already in the project and writes a jpg inside the project — bounded, no
+disclosure, and closing it would mean the page could not show thumbnails.
 
 ## 2. Validate projects at their boundaries
 
@@ -119,8 +133,8 @@ contribute or report a security issue.
 
 - [x] Preserve supplied screenshot inside repository at
       `docs/assets/cutroom-the-courier.png`.
-- [ ] Insert screenshot near top of README after opening description.
-- [ ] Add useful alt text describing media bin, program monitor, and timeline.
+- [x] Insert screenshot near top of README after opening description.
+- [x] Add useful alt text describing media bin, program monitor, and timeline.
 - [ ] Check GitHub rendering at desktop and narrow widths.
 - [ ] Consider whether project name or film imagery exposes anything unwanted
       before repository becomes public.
