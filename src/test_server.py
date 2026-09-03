@@ -2463,6 +2463,30 @@ def test_probe_falls_back_to_flooring_when_the_decode_cannot_answer():
             f"fallback produced an off-grid duration: {got['dur']}"
 
 
+def test_the_audio_controls_are_drawn_icons_not_emoji():
+    """An emoji renders in the font's own colour and weight and never matches
+    the rest of the chrome. Both audio controls are icon buttons whose whole
+    state is aria-pressed, so the picture cannot disagree with the flag."""
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    for emoji in ("🔊", "🔇"):
+        assert emoji not in html, f"{emoji} came back into the interface"
+    for cid in ('id="master-audio"', 'id="f-audio"'):
+        at = html.index(cid)
+        block = html[at:at + 400]
+        assert 'class="icon-btn"' in block, f"{cid} is not an icon button"
+        assert "aria-pressed" in block, f"{cid} has no pressed state"
+        assert "<svg" in block, f"{cid} has no drawn icon"
+        assert "aria-label" in block, f"{cid} has no accessible name"
+    # The header control explains itself on hover rather than with a label.
+    at = html.index('id="master-audio"')
+    assert 'class="has-tip"' in html[max(0, at - 120):at], \
+        "the master audio button lost its hover card"
+    assert "type=\"checkbox\"" not in html, "a raw checkbox remains in the interface"
+    # The state lives in one place: CSS drives the icon off aria-pressed.
+    assert '.icon-btn[aria-pressed="false"] svg .wave' in html, \
+        "the muted state is no longer expressed from aria-pressed"
+
+
 def test_nothing_asks_for_a_poster_frame_of_media_that_has_no_picture():
     """Found by driving the real page: the media card correctly drew a waveform
     for an audio-only source, and the TIMELINE card next to it still requested
@@ -2598,7 +2622,7 @@ const before = JSON.stringify(DOC);
 master.onclick();
 same(JSON.stringify(DOC), before, 'the master mute changed the cut');
 same(SAVES, 0, 'the master mute saved the project');
-if (!master.textContent.includes('🔇')) fail('the master mute did not show as muted');
+if (master.attrs['aria-pressed'] !== 'false') fail('the master mute did not read as muted');
 syncAudio(CLOCK, false);
 if (!M_A.muted) fail('the master mute did not silence the monitor');
 same(AUDIO.stem.volume, 0, 'the master mute did not silence the stem');

@@ -69,6 +69,20 @@
   }
   button:hover, select:hover { color:var(--ink); border-color:var(--rule); background:oklch(0.29 0.006 130); }
   button.primary { color:var(--ink); }
+  /* The audio toggles. An emoji renders in the font's own colour and weight and
+     never matches the rest of the chrome; this is a path that inherits
+     currentColor like every other control. One icon, two states: the waves are
+     dropped and a slash drawn when the sound is off. */
+  .icon-btn { padding:6px 9px; display:inline-flex; align-items:center;
+              justify-content:center; }
+  .icon-btn svg { width:15px; height:15px; display:block; }
+  .icon-btn svg .wave { transition:opacity .12s var(--ease); }
+  .icon-btn[aria-pressed="false"] { color:var(--ink-3); }
+  .icon-btn[aria-pressed="false"] svg .wave { opacity:0; }
+  .icon-btn[aria-pressed="false"] svg .slash { opacity:1; }
+  .icon-btn svg .slash { opacity:0; transition:opacity .12s var(--ease); }
+  /* In the inspector it sits on the row like a value, not like a toolbar item. */
+  #insp .icon-btn { padding:3px 6px; }
   .zoom { display:flex; align-items:center; gap:2px; }
   .zoom button { padding:6px 10px; font:500 14px/1 var(--mono); }
   .zoom span { font:400 11px/1 var(--mono); color:var(--ink-3); width:52px;
@@ -313,8 +327,15 @@
   <div class="zone">
     <button id="cut" title="cut every clip under the playhead (S)">✂ cut</button>
     <button id="play" class="primary" title="play or stop from the playhead (Space)">▶ play</button>
-    <button id="master-audio" aria-pressed="true"
-            title="mute the audition — this session only, never saved">🔊 audio</button>
+    <span class="has-tip"><button id="master-audio" class="icon-btn" aria-pressed="true"
+            aria-label="mute the audition"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 2.5 4.5 5.75H2.25v4.5H4.5l4 3.25z" fill="currentColor" stroke="none"/><path class="wave" d="M11 6a2.75 2.75 0 0 1 0 4"/><path class="wave" d="M13 4a5.5 5.5 0 0 1 0 8"/><path class="slash" d="M11.5 6.5 15 10M15 6.5 11.5 10"/></svg></button><span class="tip">
+      <b>Monitor sound</b>
+      <p>Mutes what you hear while cutting. It is a setting for this session
+         only — it is never written to the project and it does not change the
+         export.</p>
+      <p>To take a clip's sound OUT of the film, use the speaker on the clip
+         itself in the inspector.</p>
+    </span></span>
     <button id="export" title="render this cut to a new versioned video">export</button>
     <select id="hist" title="restore an earlier state of the cut"><option>history…</option></select>
   </div>
@@ -1631,11 +1652,12 @@ function audioElement(c) {
   return a;
 }
 function updateMasterAudio() {
+  // aria-pressed is the whole state: the CSS drops the waves and draws the
+  // slash off it, so there is no second place for the icon to disagree with
+  // the flag. No title — the hover card beside it does the explaining.
   const b = document.getElementById('master-audio');
-  b.textContent = MASTER_AUDIO ? '🔊 audio' : '🔇 audio';
   b.setAttribute('aria-pressed', String(MASTER_AUDIO));
-  b.title = MASTER_AUDIO ? 'mute the audition — this session only, never saved'
-                         : 'unmute the audition';
+  b.setAttribute('aria-label', MASTER_AUDIO ? 'mute the audition' : 'unmute the audition');
 }
 function syncAudio(t, playing) {
   const live = activeAt(t), visuals = live.filter(hasVideo), seen = new Set();
@@ -1703,10 +1725,9 @@ function inspect(c) {
     <label>rate <input id="f-rate" type="number" step="0.05" value="${c.rate}"></label>
     <label>label <input id="f-label" type="text" value="${esc(c.label)}"></label>
     <label>note <input id="f-note" type="text" value="${esc(c.note)}"></label>
-    ${m.has_audio === false ? '' : `<label style="flex-direction:row;align-items:center;gap:7px">
-      <input id="f-audio" type="checkbox" ${c.audio === false ? '' : 'checked'}
-             title="include this clip's sound in the audition and the export">
-      audio</label>`}
+    ${m.has_audio === false ? '' : `<label>audio
+      <button id="f-audio" class="icon-btn" aria-pressed="${c.audio !== false}"
+              aria-label="this clip's sound"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 2.5 4.5 5.75H2.25v4.5H4.5l4 3.25z" fill="currentColor" stroke="none"/><path class="wave" d="M11 6a2.75 2.75 0 0 1 0 4"/><path class="wave" d="M13 4a5.5 5.5 0 0 1 0 8"/><path class="slash" d="M11.5 6.5 15 10M15 6.5 11.5 10"/></svg></button></label>`}
     <h4><span class="has-tip" tabindex="0">Post pass
       <span class="tip r">
         <b>Writes a new file. Always.</b>
@@ -1744,8 +1765,12 @@ function inspect(c) {
       draw(); save(); };
   const audioBox = document.getElementById('f-audio');
   // Unlike the header mute this one IS the cut: it is what export reads.
-  if (audioBox) audioBox.onchange = e => {
-    c.audio = e.target.checked; save(); syncAudio(CLOCK, false); };
+  if (audioBox) audioBox.onclick = () => {
+    c.audio = !(c.audio !== false);
+    audioBox.setAttribute('aria-pressed', String(c.audio));
+    audioBox.setAttribute('aria-label',
+      c.audio ? "this clip's sound is in the film" : "this clip is silent in the film");
+    save(); syncAudio(CLOCK, false); };
   const run = document.getElementById('runpass');
   if (run) run.onclick = async () => {
     note('running…', 'var(--warn)');
