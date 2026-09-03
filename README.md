@@ -86,7 +86,9 @@ Send your agent this:
 
 A browser window opens with your empty cutting room. If `./cutroom` is not executable after downloading a ZIP, run `chmod +x cutroom` once and retry.
 
-On macOS, use **Add media…** to choose files. On any system, you or an agent can add exact files with `./cutroom add`.
+On macOS, use **Add media…** to choose files — it opens a native file picker. On Linux, use `./cutroom add` (or have your agent run it) to add exact files by path; there is no native picker there yet, so the button falls back to the same command-line instructions.
+
+**Platform support:** macOS and Linux. Windows is not supported yet.
 
 ## Start a first project
 
@@ -120,6 +122,8 @@ The page's **Add media…** picker always copies imports into the project. The c
 Cutroom is designed so you and an agent can share one project without fighting over it.
 
 You work visually in the browser. Your agent can make structured changes to the project, add media, create alternate cuts, or build small custom workflows. Cutroom protects against conflicting saves, preserves history, and does not let its own operations silently change your source footage.
+
+If you are the agent, read [`AGENTS.md`](AGENTS.md) — it documents the safe API contract (never write the project file directly), the version guard, and how to resolve a conflicting write.
 
 Useful starting prompts:
 

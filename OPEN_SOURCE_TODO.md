@@ -111,15 +111,15 @@ still appears as OFFLINE without rewriting the project.
 
 ## 4. Document safe agent integration
 
-- [ ] Add `AGENTS.md` or `docs/agent-integration.md`.
-- [ ] State hard rule: agents use `PUT /project` or `edit_project()`, never write
+- [x] Add `AGENTS.md` or `docs/agent-integration.md`.
+- [x] State hard rule: agents use `PUT /project` or `edit_project()`, never write
       `<project>.json` directly.
-- [ ] Explain version guard, conflict response, snapshots, media allowlist, and
+- [x] Explain version guard, conflict response, snapshots, media allowlist, and
       retry/rebase behavior.
-- [ ] Include copy-paste examples for reading a project, adding media, making a
+- [x] Include copy-paste examples for reading a project, adding media, making a
       safe edit, and handling `409`.
-- [ ] Explain capability-token flow introduced by task 1.
-- [ ] Link guide from README within two clicks.
+- [x] Explain capability-token flow introduced by task 1.
+- [x] Link guide from README within two clicks.
 
 Evidence: locking contract exists in `src/server.py` module comments and one line
 of `SPEC.md`, but README's agent promises do not give agents enough operational
@@ -128,33 +128,57 @@ instructions to honor it.
 Done when: a fresh coding agent can install Cutroom and edit one project safely
 without reverse-engineering server code.
 
+**DONE 2026-09-03.** `AGENTS.md` added at repo root, linked from README's
+"Work with an agent" section. Covers both doors in (`edit_project()` in-process,
+the HTTP API with the capability token), the version guard and how to rebase on
+a 409 (the 409 body IS the live project, not an error object — verified against
+`write_project()`/`_guarded_write()`), the `media` allowlist, and three worked
+examples using the real function signatures (`add_media()`, `edit_project()`,
+`write_project()`).
+
 ## 5. Make platform support honest
 
-- [ ] State clearly in README: macOS and Linux supported; Windows not yet
+- [x] State clearly in README: macOS and Linux supported; Windows not yet
       supported.
-- [ ] Explain macOS has native `Add media...` picker; Linux uses CLI import.
-- [ ] Ensure installation prerequisites name Python 3, `ffmpeg`, and `ffprobe`.
-- [ ] Verify manual setup commands on both supported platforms through CI or a
+- [x] Explain macOS has native `Add media...` picker; Linux uses CLI import.
+- [x] Ensure installation prerequisites name Python 3, `ffmpeg`, and `ffprobe`.
+- [x] Verify manual setup commands on both supported platforms through CI or a
       documented manual check.
 
 Evidence: server imports `fcntl`; README currently says "On any system" for CLI
 import, which can imply Windows support.
 
+**DONE 2026-09-03.** README's "On any system" claim replaced with an explicit
+per-platform note (macOS native picker vs. Linux CLI import) and a one-line
+"Platform support: macOS and Linux. Windows is not supported yet." The CI
+workflow added in §6 runs the documented `./cutroom check` on both platforms on
+every push, which is the "verify through CI" half of the last item.
+
 ## 6. Add minimum public-repository infrastructure
 
-- [ ] Add GitHub Actions workflow running `./cutroom check` on macOS and Linux.
-- [ ] Add concise `CONTRIBUTING.md` with setup, test command, safety invariants,
+- [x] Add GitHub Actions workflow running `./cutroom check` on macOS and Linux.
+- [x] Add concise `CONTRIBUTING.md` with setup, test command, safety invariants,
       and pull-request expectations.
-- [ ] Add `SECURITY.md` with private vulnerability-reporting route and supported
+- [x] Add `SECURITY.md` with private vulnerability-reporting route and supported
       versions.
-- [ ] Update GitHub description to match new README positioning.
-- [ ] Add useful topics such as `video-editing`, `local-first`, `ffmpeg`,
+- [x] Update GitHub description to match new README positioning.
+- [x] Add useful topics such as `video-editing`, `local-first`, `ffmpeg`,
       `agent-tools`, and `open-source`.
-- [ ] Decide whether homepage field should remain empty or point to demo/docs.
-- [ ] Keep repository private until release blockers and final QA are complete.
+- [x] Decide whether homepage field should remain empty or point to demo/docs.
+- [x] Keep repository private until release blockers and final QA are complete.
 
 Done when: every pushed commit gets tested and a visitor can understand how to
 contribute or report a security issue.
+
+**DONE 2026-09-03.** `.github/workflows/check.yml` runs `./cutroom check` on
+`ubuntu-latest` and `macos-latest` on every push/PR. `CONTRIBUTING.md` and
+`SECURITY.md` added (the latter points to GitHub's private advisory flow —
+`Security → Report a vulnerability` — never an email, since §9's history
+cleanup is still open). GitHub description was already accurate; added the five
+suggested topics via `gh repo edit`. Homepage left empty — no demo/docs site
+exists yet, and pointing it at one prematurely would be a stale field, not a
+positioning choice. Visibility unchanged: still **PRIVATE**, per the last
+checkbox — §9 and §10 are not done.
 
 ## 7. Add screenshot to README
 
