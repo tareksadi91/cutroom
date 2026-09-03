@@ -725,6 +725,28 @@ def probe(path):
             "has_video": bool(fps), "has_audio": bool(info["audio"])}
 
 
+def unreadable_media_problem(path):
+    """None if ffprobe can use `path`, else a friendly reason it can't.
+
+    Shared by add_media() and copy_in() so a bad source is refused at THE
+    SAME check regardless of which door it came through, and so copy_in()
+    can run this BEFORE copying — copying junk first and rejecting after
+    left orphaned, unreferenced copies sitting in <project>/media/.
+    """
+    info = render_mod.source_info(path)
+    if info is None:
+        return (f"{path} could not be read by ffprobe as video or audio — "
+                f"is it a valid, unencrypted media file?")
+    # A video stream ffprobe could read but not size at all — whole() (see
+    # render.py:source_info) swallows a ValueError/TypeError on width/height
+    # rather than crash, precisely so THIS is a refusal here and not a
+    # ValueError three functions later trying to letterbox a None.
+    if info["fps"] and not (isinstance(info["w"], int) and isinstance(info["h"], int)
+                             and info["w"] > 0 and info["h"] > 0):
+        return f"{path} has a video stream ffprobe could not report valid dimensions for"
+    return None
+
+
 def _next_mid(project):
     used = {m["mid"] for m in project.get("media", [])}
     n = 1
@@ -745,6 +767,21 @@ def add_media(name, paths, label=None):
     duplicated: adding the same file twice must not give one file two mids and
     split the timeline's idea of it in half.
     """
+    # A path already on the allowlist is exempt from the probe check below,
+    # same as it always was exempt from probe() itself: mutate() below never
+    # calls probe() on an already-tracked path either, it just reports the
+    # existing mid. Without this exemption, a tracked file that later goes
+    # unreadable in place (corrupted, not merely moved) would turn every
+    # future add_media() call that happens to re-mention it into a 400 for
+    # the WHOLE batch — new, unrelated media included — which is a stricter
+    # rule than "moved/missing existing footage still appears as OFFLINE
+    # without rewriting the project" allows.
+    try:
+        tracked = {m.get("path") for m in
+                   json.loads(project_path(name).read_text()).get("media", [])}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        tracked = set()
+
     entries, already, bad = [], [], []
     for p in paths:
         if not isinstance(p, str) or not p:
@@ -757,6 +794,16 @@ def add_media(name, paths, label=None):
         if not pathlib.Path(p).is_file():
             bad.append(f"{p} is not a file")
             continue
+        # Probed here, before anything is written — not left to surface at
+        # export as "0 frames" or a KeyError from a media entry with no
+        # `dur`/`w`/`h` at all. render_mod.source_info() caches on
+        # (path, mtime, size), so this and probe()'s later call below cost
+        # one real ffprobe, not two.
+        if p not in tracked:
+            problem = unreadable_media_problem(p)
+            if problem:
+                bad.append(problem)
+                continue
         entries.append(p)
     if bad:
         return 400, {"problems": bad}
@@ -830,6 +877,16 @@ def copy_in(name, paths):
             bad.append(f"{pth!r} is not an absolute path")
         elif not pathlib.Path(pth).is_file():
             bad.append(f"{pth} is not a file")
+        else:
+            # Checked on the ORIGINAL path, before any copy is made. Copying
+            # every source first and only then calling add_media() — which
+            # runs the same check — meant a bad file among good ones got
+            # copied into <project>/media/ before the batch was refused,
+            # leaving an orphaned, unreferenced copy of every source that
+            # copied fine right alongside it.
+            problem = unreadable_media_problem(pth)
+            if problem:
+                bad.append(problem)
     if bad:
         return 400, {"problems": bad}
     if not paths:

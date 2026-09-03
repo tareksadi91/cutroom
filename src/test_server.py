@@ -736,6 +736,68 @@ def test_add_media_takes_absolute_paths_and_nothing_else():
         assert len(doc["media"]) == 1, doc["media"]
 
 
+def test_add_media_rejects_a_file_ffprobe_cannot_read():
+    """§3 of the open-source checklist: add_media() used to store an entry
+    even when probe() returned {} — no dur/w/h/kind at all, because
+    render_mod.source_info() found neither a video nor an audio stream — so
+    the failure surfaced much later as a KeyError or a confusing export
+    refusal, at a point far from the actually-bad path. Same
+    all-or-nothing-batch treatment as an already-existing bad path (a
+    relative path, a missing file): one unreadable file refuses the whole
+    call, nothing is written."""
+    with project() as (name, root):
+        junk = root / "src" / "junk.mp4"
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        junk.write_text("this is not a video")
+
+        status, payload = server.add_media(name, [str(junk)])
+        assert status == 400, payload
+        assert any("ffprobe" in p for p in payload["problems"]), payload
+        doc = json.loads(server.project_path(name).read_text())
+        assert doc["media"] == [], "a file ffprobe can't read still entered the allowlist"
+
+        # mixed batch: one good file, one junk file — the batch is rejected
+        # as a whole, and the good file is not added either
+        good = synth(root / "src" / "good.mp4")
+        status, payload = server.add_media(name, [str(good), str(junk)])
+        assert status == 400, payload
+        doc = json.loads(server.project_path(name).read_text())
+        assert doc["media"] == [], "the valid file in a mixed batch was still added"
+
+        # the good file on its own still works
+        status, payload = server.add_media(name, [str(good)])
+        assert status == 200, payload
+        mid = payload["added"][0]["mid"]
+
+        # re-adding it is "already", not re-probed or rejected
+        status, payload = server.add_media(name, [str(good)])
+        assert status == 200 and payload["already"] == [mid], payload
+
+
+def test_add_media_does_not_re_probe_an_already_tracked_path():
+    """Codex catch on the §3 fix: an already-tracked path used to skip
+    probe() entirely (mutate() reports its existing mid without calling it).
+    A naive "probe every submitted path" check broke that — a file that
+    later goes unreadable IN PLACE (corrupted, not merely moved) turned
+    every future add_media() call mentioning it into a 400 for the whole
+    batch, new unrelated media included, which is stricter than "existing
+    footage that goes missing/offline is never rewritten or refused"."""
+    with project() as (name, root):
+        tracked = synth(root / "src" / "tracked.mp4")
+        status, payload = server.add_media(name, [str(tracked)])
+        assert status == 200, payload
+        mid = payload["added"][0]["mid"]
+
+        tracked.write_text("corrupted in place, no longer real media")
+        assert not render.source_info(str(tracked))  # confirms the premise
+
+        other = synth(root / "src" / "other.mp4")
+        status, payload = server.add_media(name, [str(tracked), str(other)])
+        assert status == 200, payload
+        assert payload["already"] == [mid], payload
+        assert payload["added"][0]["path"] == str(other), payload
+
+
 def test_the_media_endpoint_adds_and_the_cli_adds_the_same_way():
     with project() as (name, root):
         a, b = synth(root / "src" / "a.mp4"), synth(root / "src" / "b.mp4")
@@ -2421,6 +2483,26 @@ def test_copy_in_refuses_what_add_media_refuses():
         assert status == 400 and "not a file" in payload["problems"][0]
         assert not (server.project_dir(name) / "media").exists(), \
             "a refused import still made the directory"
+
+
+def test_copy_in_does_not_orphan_a_copy_when_a_sibling_is_unreadable():
+    """Codex catch on the §3 fix: copy_in() used to copy every source into
+    <project>/media/ FIRST, then call add_media() — which now refuses the
+    whole batch if any one file is unreadable. The good files' copies had
+    already landed on disk by then, unreferenced by anything. The probe now
+    runs on the ORIGINAL paths before any copy is made."""
+    with project() as (name, root):
+        good = synth(root / "src" / "good.mp4")
+        junk = root / "src" / "junk.mp4"
+        junk.write_text("this is not a video")
+
+        status, payload = server.copy_in(name, [str(good), str(junk)])
+        assert status == 400, payload
+        media_dir = server.project_dir(name) / "media"
+        assert not media_dir.exists() or not list(media_dir.iterdir()), \
+            "the good file's copy was made even though the batch was refused"
+        doc = json.loads(server.project_path(name).read_text())
+        assert doc["media"] == [], doc["media"]
 
 
 def test_the_razor_cuts_on_a_frame_and_loses_nothing():

@@ -96,18 +96,40 @@ output) with 4 more regression tests. 142 tests green (was 129).
 
 ## 3. Reject unreadable media during import
 
-- [ ] Make `add_media()` reject new files that `ffprobe` cannot identify as usable
+- [x] Make `add_media()` reject new files that `ffprobe` cannot identify as usable
       video.
-- [ ] Show one friendly problem per rejected path.
-- [ ] Preserve current behavior for media already in a project that later goes
+- [x] Show one friendly problem per rejected path.
+- [x] Preserve current behavior for media already in a project that later goes
       missing or offline.
-- [ ] Test mixed batches containing valid, invalid, and already-added media.
+- [x] Test mixed batches containing valid, invalid, and already-added media.
 
 Evidence: `src/server.py:add_media()` currently stores an entry even when
 `probe()` returns no duration or dimensions; failure appears much later at export.
 
 Done when: broken input fails at import, while moved/missing existing footage
 still appears as OFFLINE without rewriting the project.
+
+**DONE 2026-09-03.** `unreadable_media_problem()` is the one check both
+`add_media()` and `copy_in()` run — same all-or-nothing batch treatment as an
+already-bad path (relative, missing): one unreadable file refuses the whole
+call, nothing written, one friendly problem per bad path. Independent Codex
+review found two real regressions in the first draft, both fixed: (1) the
+probe ran on EVERY submitted path, including already-tracked ones — a
+tracked file that later corrupts in place (stays present, ffprobe can no
+longer read it) would have turned a later, unrelated `add_media()` call into
+a 400 for the whole batch, which is stricter than "existing footage that
+goes offline is never rewritten or refused." Already-tracked paths are now
+read from the project up front and exempted, matching that mutate() never
+probes them either. (2) `copy_in()` copied every source into
+`<project>/media/` *before* calling `add_media()`, so a junk file among good
+ones got the good copies made and then orphaned when the batch was refused
+after the fact; the same check now runs on the original paths before any
+copy happens. Also (advisory, unconfirmed in practice): a video stream
+ffprobe reports a frame rate for but cannot size — `whole()` in
+`render.py:source_info()` already tolerates this without crashing — is now
+refused at import too, though the same gap in `render.py`'s render-time
+`build_graph()` path is unrelated to this door and untouched. 144 tests
+(was 141).
 
 ## 4. Document safe agent integration
 
