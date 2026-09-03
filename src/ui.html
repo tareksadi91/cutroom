@@ -93,6 +93,10 @@
   #bin .noimg.wave { border-style:solid; display:flex; align-items:center;
                      justify-content:center; color:var(--ink-3);
                      font:400 20px/1 var(--sans); }
+  /* A stem on the timeline: a repeating wash instead of a film strip, so the
+     card reads as sound at any width without asking for a frame. */
+  .clip .poster.wave { background-image:repeating-linear-gradient(
+      90deg, transparent 0 3px, rgba(255,255,255,.13) 3px 4px); }
   #bin .stem { font:500 13px/1.3 var(--sans); color:var(--ink);
                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #bin .sub { font:400 11px/1.4 var(--mono); color:var(--ink-3); }
@@ -820,7 +824,14 @@ function card(c) {
   // The poster goes in as a background rather than an <img>: a 404 (an offline
   // source, or a thumbnail that could not be made) then shows the clip's own tint
   // instead of a broken-image icon.
-  d.innerHTML = `<div class="poster"${off ? '' :
+  //
+  // A clip with no picture is not asked for one at all. The 404 was harmless to
+  // look at — the tint showed through — but it fired on every draw of every
+  // stem, filled the console, and asked the server for a frame that cannot
+  // exist. A stem gets a waveform wash instead, so it reads as a different kind
+  // of thing on the timeline as well as in the media panel.
+  const soundOnly = (mediaOf(c.mid) || {}).has_video === false;
+  d.innerHTML = `<div class="poster${soundOnly ? ' wave' : ''}"${off || soundOnly ? '' :
                    ` style="background-image:url(/thumb/${encodeURIComponent(c.mid)})"`}></div>
                  <span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
                  <div class="h l"></div><div class="h r"></div>`;

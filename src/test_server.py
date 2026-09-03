@@ -2459,6 +2459,25 @@ def test_probe_falls_back_to_flooring_when_the_decode_cannot_answer():
             f"fallback produced an off-grid duration: {got['dur']}"
 
 
+def test_nothing_asks_for_a_poster_frame_of_media_that_has_no_picture():
+    """Found by driving the real page: the media card correctly drew a waveform
+    for an audio-only source, and the TIMELINE card next to it still requested
+    /thumb/<mid> for the same media — a 404 on every draw of every stem, for a
+    frame that cannot ever exist. Both consumers have to check."""
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    for at in range(len(html)):
+        at = html.find("/thumb/", at)
+        if at < 0:
+            break
+        # The 800 characters before each thumbnail URL must contain the guard
+        # that decides whether this media has a picture at all. Both consumers
+        # compute it near the top of the same template literal.
+        window = html[max(0, at - 800):at]
+        assert "has_video === false" in window, \
+            f"a /thumb/ request at offset {at} is not guarded by a has_video check"
+        at += 1
+
+
 def test_the_audition_follows_the_cut_without_ever_persisting_the_master_mute():
     """The audition lifted out of ui.html and driven with fake media elements.
 
