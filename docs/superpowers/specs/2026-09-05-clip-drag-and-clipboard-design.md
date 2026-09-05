@@ -21,7 +21,9 @@ together.
   This design keeps that lesson but narrows what "fighting the gesture"
   means: a magnet capped at a fraction of a grid cell cannot swallow a
   crossfade a person would actually drag; a magnet in the 1+ second range
-  can and did.
+  can and did. (This holds from roughly 18px/s upward — see piece 1 for
+  the honest lower-zoom numbers, and `ev.altKey` as the reliable override
+  at any zoom.)
 - **Media-pool insert (`insertAt()`) still ripples on purpose** — bringing
   in new footage grows the film, so everything after the insert point
   shifts, in every lane, to keep unrelated lanes in sync
@@ -92,15 +94,24 @@ gap to the next point, cap it at `SEAM_GRAB_PX` pixels — plus one new,
   real tension at 6px/s, and no fix here removes that. The 3px floor keeps
   the magnet from being literally inert; it does **not** make precision
   edge-snapping comfortable at the lowest zoom, and the spec is explicit
-  about that rather than implying one constant solves it: **snapping onto
-  a specific frame-exact seam is a task the tool already expects zoom for**
-  (the razor's own frame-vs-grid distinction, `ui.html:1112-1115`, already
-  assumes this). Between 64px/s and 100px/s the cap is a clean 0.125s. At
-  120px/s — the top `ZOOMS` step — 0.125s of screen space is 15px, one
-  more than `SEAM_GRAB_PX` (14px, `ui.html:1292`), so the existing pixel
-  cap binds there instead and the effective radius is 14/120 ≈ 0.117s, not
-  0.125s. Both caps stay in force at every zoom; whichever is tighter at
-  that zoom wins.
+  about the actual radius at every step rather than implying one constant
+  solves it everywhere: **snapping onto a specific frame-exact seam is a
+  task the tool already expects zoom for** (the razor's own frame-vs-grid
+  distinction, `ui.html:1112-1115`, already assumes this).
+
+  Both caps (`max(0.125s, 3px-worth-of-seconds)`, and the pre-existing
+  pixel/gap-share caps `nearestPoint()` already enforces) stay in force at
+  every zoom; whichever is tighter wins. Worked out against every `ZOOMS`
+  step: **6px/s → 0.5s · 10px/s → 0.3s · 18px/s → 0.167s · 34px/s and
+  64px/s → 0.125s · 120px/s → ≈0.117s** (the `SEAM_GRAB_PX=14px` pixel cap,
+  `ui.html:1292`, binds ahead of the 0.125s seconds cap at 120px/s, since
+  15px > 14px there). **A one-grid-cell (0.25s) crossfade drag is only
+  reliably safe from 18px/s up.** At 6px/s and 10px/s the passive radius
+  (0.5s, 0.3s) exceeds one grid cell, so a small deliberate crossfade at
+  those zooms needs `Alt` held to suppress the magnet outright, exactly
+  the escape hatch already documented below — not a gap this design
+  leaves unaddressed, but a real, named cost of choosing a pixel floor
+  over letting the magnet go fully inert at low zoom.
 
 `magnet()` is defined **inside** the existing `// >>> seam-pick` /
 `// <<< seam-pick` region (`test_server.py:1723-1726` extracts it verbatim
@@ -412,12 +423,16 @@ already does (`test_server.py:1830-1831`), rather than re-deriving it.
 
 New coverage needed, run the same way:
 
-- At the lowest zoom (`PX = 6`), the move-path magnet radius is small
-  (pixel-floored, not zero) but a 0.25s or larger deliberate crossfade
-  drag still lands as a crossfade, not a flush snap. Between 64px/s and
-  100px/s the radius is exactly 0.125s; at 120px/s it's bounded by
-  `SEAM_GRAB_PX` instead, ≈0.117s — assert the tighter of the two caps
-  wins at every `ZOOMS` step, not a single constant everywhere.
+- The move-path magnet radius matches the worked-out value at every
+  `ZOOMS` step (0.5s, 0.3s, 0.167s, 0.125s, 0.125s, ≈0.117s) — assert the
+  tighter of the two caps wins at each step, not a single constant
+  everywhere.
+- From 18px/s up, a 0.25s (one grid cell) deliberate crossfade drag lands
+  as a crossfade, not a flush snap. At 6px/s and 10px/s, a 0.25s crossfade
+  drag *without* Alt held is expected to snap flush instead (radius
+  exceeds one grid cell there) — assert that `ev.altKey` reliably
+  preserves it regardless of zoom, since that's the actual safety net at
+  low zoom, not the passive radius.
 - `nearestPoint()` (bin-drop) is unaffected: `test_server.py:1767` and
   `1787`'s existing assertions still hold with no changes.
 - The dragged clip's own points are excluded from the move-path candidate
