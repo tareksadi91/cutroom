@@ -2229,6 +2229,212 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_commit_reorder_matches_the_specs_hand_derived_swap_formula():
+    """A 2-member reindex (swap) must produce EXACTLY B.t=A.t_old,
+    A.t=A.t_old+B.dur_old -- not just 'nothing after them moved'. A wrong
+    formula that happens to leave the tail alone should still fail this.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function commitReorder(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; commitReorder() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0},    // dur 2
+  {uid:'B', t:2, in:0, out:5, rate:1, lane:0},    // dur 5, unequal to A on purpose
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const A = DOC.clips[0], B = DOC.clips[1];
+const aTOld = A.t, bDurOld = dur(B);
+const run = flushRun(A.t, dur(A), 0, 'A');          // members=[B], bounds=[0,7]
+commitReorder(A, run, 1);                            // A moves to index 1 (after B)
+
+if (Math.abs(B.t - aTOld) > 1e-9)
+  fail('expected B.t = A.t_old (' + aTOld + '), got ' + B.t);
+if (Math.abs(A.t - (aTOld + bDurOld)) > 1e-9)
+  fail('expected A.t = A.t_old + B.dur_old (' + (aTOld+bDurOld) + '), got ' + A.t);
+if (Math.abs(endOf(A) - 7) > 1e-9 || Math.abs(B.t - 0) > 1e-9)
+  fail('the pair must occupy exactly the same combined span as before');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "swapformula.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_commit_reorder_moves_only_the_run_and_leaves_other_lanes_alone():
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; commitReorder() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: [
+  {uid:'X', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:2, in:0, out:3, rate:1, lane:0},
+  {uid:'C', t:5, in:0, out:1, rate:1, lane:0},
+  {uid:'Y', t:0, in:0, out:9, rate:1, lane:1},     // a different lane entirely
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const X = DOC.clips[0];
+const run = flushRun(X.t, dur(X), 0, 'X');   // members [B,C], bounds [0,6]
+commitReorder(X, run, 2);                     // append X after C
+
+const B = DOC.clips.find(c=>c.uid==='B'), C = DOC.clips.find(c=>c.uid==='C');
+const Y = DOC.clips.find(c=>c.uid==='Y');
+if (Math.abs(B.t - 0) > 1e-9 || Math.abs(C.t - 3) > 1e-9 || Math.abs(X.t - 4) > 1e-9)
+  fail('expected B@0, C@3, X@4, got B@' + B.t + ' C@' + C.t + ' X@' + X.t);
+if (Y.t !== 0) fail('a clip in a different lane must never move');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "reorderscope.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_commit_with_gate_reverts_a_cross_lane_nesting_fault():
+    """Same-lane span-invariance does not guarantee legality -- a swap
+    between unequal-duration clips can nest one of them inside a clip on a
+    DIFFERENT lane, since the renderer's overlap check is lane-blind. The
+    gate must revert every touched clip's t, not just refuse silently.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function commitWithGate(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; commitWithGate() is JS)")
+        return
+
+    # timelineFault() lives outside both drag-clamp and move-target -- splice
+    # it in exactly the way test_a_drag_stops_at_a_full_overlap_instead_of_nesting
+    # already does (test_server.py:1830-1831).
+    html_full = html
+    tf_region = html_full[html_full.index("function timelineFault() {"):
+                           html_full.index("// How far the clip before a seam reaches")]
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+const hasVideo = () => true;
+let PX = 10;
+// Lane 0: A[0,2] flush B[2,10] (dur 8). Lane 1: Z[1.9,2.4] -- a legal 0.1s/
+// 0.4s crossfade pair straddling the A|B seam TODAY. After A and B swap
+// (B moves to [0,8], A to [8,10]), Z sits fully nested inside the new B --
+// illegal only AFTER the swap, which is the property this test actually
+// needs: a fixture that's already faulty proves nothing about the commit.
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:2, in:0, out:8, rate:1, lane:0},
+  {uid:'Z', t:1.9, in:0, out:0.5, rate:1, lane:1},
+]};
+__REGION_TIMELINEFAULT__
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const A = DOC.clips[0], B = DOC.clips[1];
+if (timelineFault()) fail('the fixture must start legal -- got: ' + timelineFault());
+const aTOld = A.t, bTOld = B.t;
+const run = flushRun(A.t, dur(A), 0, 'A');
+const fault = commitWithGate([A, B], () => commitReorder(A, run, 1));
+if (!fault) fail('expected a fault (Z would end up nested inside the swapped B)');
+if (Math.abs(A.t - aTOld) > 1e-9 || Math.abs(B.t - bTOld) > 1e-9)
+  fail('a reverted commit must restore BOTH clips to their exact original t');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "gate.mjs"
+        js.write_text(
+            harness.replace("__REGION_TIMELINEFAULT__", tf_region)
+                   .replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_commit_with_gate_still_allows_repair_of_an_already_faulty_cut():
+    """Mirrors the existing drag-clamp test's own 'a cut that is ALREADY
+    faulty must still be draggable' case (test_server.py:1877-1886) -- a
+    commit must not refuse just because the cut was illegal before it ran,
+    or a timeline that arrived broken could never be nudged, swapped, or
+    reordered back out of trouble.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    tf_region = html[html.index("function timelineFault() {"):
+                      html.index("// How far the clip before a seam reaches")]
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; commitWithGate() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+const hasVideo = () => true;
+let PX = 10;
+// Already illegal: A and B start at the same instant.
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0, label:'A'},
+  {uid:'B', t:0, in:0, out:1, rate:1, lane:0, label:'B'},
+]};
+__REGION_TIMELINEFAULT__
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const A = DOC.clips[0], B = DOC.clips[1];
+if (!timelineFault()) fail('the fixture must start faulty for this test to mean anything');
+// B.t=0.5 leaves the cut STILL faulty (ov = endOf(A)-B.t = 1.5 > min(2,1)=1)
+// -- deliberately not a full repair. Without the wasFaulty exception, a
+// plain "revert on any fault" would undo this and leave B.t back at 0,
+// which is exactly the bug this test needs to catch; a fixture that fully
+// repairs itself (e.g. B.t=5) passes identically whether or not the
+// exception exists and proves nothing.
+const fault = commitWithGate([B], () => { B.t = 0.5; });
+if (fault) fail('a commit on an already-faulty cut must not be refused, got: ' + fault);
+if (B.t !== 0.5) fail('the mutation must be kept, not reverted, on an already-faulty cut');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "gate_repair.mjs"
+        js.write_text(
+            harness.replace("__REGION_TIMELINEFAULT__", tf_region)
+                   .replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     """Run the real clamp out of ui.html, against the real fault check.
 

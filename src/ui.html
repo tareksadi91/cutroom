@@ -1446,6 +1446,37 @@ function resolveMoveTarget({draggedUid, origT, proposedT, dur0, lane0, dropLane,
   if (newIndex === currentIndex) return {type: 'seam', landT};
   return {type: 'reorder', run, newIndex};
 }
+// Reindex the dragged clip to `newIndex` among its own run's members and
+// relay the whole run out flush from run.start, each clip keeping its own
+// duration. This is provably span-preserving (durations are invariant under
+// reordering), so it needs no directional shift logic of its own -- and a
+// 2-member run reindexed this way reproduces the spec's own hand-derived
+// swap formula exactly (see the test in this task).
+function commitReorder(draggedClip, run, newIndex) {
+  const rest = run.members.slice();
+  rest.splice(newIndex, 0, draggedClip);
+  let t = run.start;
+  for (const c of rest) { c.t = t; t += dur(c); }
+}
+// Snapshot every clip's t, run the mutation, check legality once, and
+// revert everything on a fault -- the same shape insertAt() already uses
+// for its own single-clip creation (ui.html:1377-1389), generalized to any
+// number of clips whose t might change in one commit. Mirrors keepIfLegal()'s
+// own gate.armed rule (ui.html:1241-1242): a cut that was ALREADY faulty
+// before this commit must still be allowed to change, or a timeline that
+// arrived illegal (e.g. from a hand-edited or agent-written project) could
+// never be nudged, swapped, or reordered back out of trouble.
+function commitWithGate(clips, mutate) {
+  const wasFaulty = !!timelineFault();
+  const before = clips.map(c => c.t);
+  mutate();
+  const fault = timelineFault();
+  if (fault && !wasFaulty) {
+    clips.forEach((c, i) => { c.t = before[i]; });
+    return fault;
+  }
+  return null;
+}
 // <<< move-target
 function clearSeam() {
   SEAM = null;
