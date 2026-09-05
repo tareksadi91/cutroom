@@ -2233,6 +2233,14 @@ def test_commit_reorder_matches_the_specs_hand_derived_swap_formula():
     """A 2-member reindex (swap) must produce EXACTLY B.t=A.t_old,
     A.t=A.t_old+B.dur_old -- not just 'nothing after them moved'. A wrong
     formula that happens to leave the tail alone should still fail this.
+
+    Also covers the anchor: the first fixture always drags the clip that
+    starts at index 0 of its own run, so it can never distinguish
+    `let t = run.start` from the wrong `let t = draggedClip.t` -- both give
+    the same answer when the dragged clip's own original t already equals
+    run.start. The second fixture below drags the clip that is SECOND in
+    its run (Q, run.start=0 but Q.t=3) specifically to catch that mutant:
+    the correct anchor gives Q@0/P@2, the wrong one gives Q@3/P@5.
     """
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
     a = html.index("// >>> move-target")
@@ -2267,6 +2275,20 @@ if (Math.abs(A.t - (aTOld + bDurOld)) > 1e-9)
 if (Math.abs(endOf(A) - 7) > 1e-9 || Math.abs(B.t - 0) > 1e-9)
   fail('the pair must occupy exactly the same combined span as before');
 
+// The dragged clip is SECOND in its own run here (Q.t=3, run.start=0), so
+// this distinguishes the correct `let t = run.start` anchor from the wrong
+// `let t = draggedClip.t` -- the two fixtures above never could, since A
+// and X both already sit at their own run's start. Reassign the global
+// DOC (declared with `let` above) rather than shadow it -- flushRun() and
+// commitReorder() close over DOC by that name, not a parameter.
+DOC = {fps:24, clips:[{uid:'P',t:0,in:0,out:3,rate:1,lane:0},
+                       {uid:'Q',t:3,in:0,out:2,rate:1,lane:0}]};
+const P = DOC.clips[0], Q = DOC.clips[1];
+const runQ = flushRun(Q.t, dur(Q), 0, 'Q');   // start=0, members=[P]
+commitReorder(Q, runQ, 0);                     // drag Q to index 0
+if (Math.abs(Q.t - 0) > 1e-9 || Math.abs(P.t - 2) > 1e-9)
+  fail('expected Q@0, P@2, got Q@' + Q.t + ' P@' + P.t);
+
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
@@ -2294,7 +2316,11 @@ let DOC = {fps: 24, clips: [
   {uid:'X', t:0, in:0, out:2, rate:1, lane:0},
   {uid:'B', t:2, in:0, out:3, rate:1, lane:0},
   {uid:'C', t:5, in:0, out:1, rate:1, lane:0},
-  {uid:'Y', t:0, in:0, out:9, rate:1, lane:1},     // a different lane entirely
+  // Y sits flush against the run's own end (t=6=run.end) on a DIFFERENT
+  // lane -- positioned so it WOULD flush-join [B,C] if the lane filter
+  // were missing, unlike a Y parked somewhere that could never join
+  // regardless of the filter (which would make this fixture prove nothing).
+  {uid:'Y', t:6, in:0, out:9, rate:1, lane:1},
 ]};
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
@@ -2307,7 +2333,12 @@ const B = DOC.clips.find(c=>c.uid==='B'), C = DOC.clips.find(c=>c.uid==='C');
 const Y = DOC.clips.find(c=>c.uid==='Y');
 if (Math.abs(B.t - 0) > 1e-9 || Math.abs(C.t - 3) > 1e-9 || Math.abs(X.t - 4) > 1e-9)
   fail('expected B@0, C@3, X@4, got B@' + B.t + ' C@' + C.t + ' X@' + X.t);
-if (Y.t !== 0) fail('a clip in a different lane must never move');
+// A positional "Y.t !== 0" check can never fail here regardless of whether
+// the lane filter exists at all -- Y never moves either way. Assert run
+// MEMBERSHIP instead: with the lane filter in place Y (lane 1) must never
+// join [B,C]'s run even though it sits flush against the run's own end.
+if (run.members.includes(Y)) fail('a clip in a different lane joined the run');
+if (Math.abs(Y.t - 6) > 1e-9) fail('a clip in a different lane must never move');
 
 console.log('js ok');
 """
