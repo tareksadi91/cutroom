@@ -214,16 +214,28 @@ checkbox — §9 and §10 are not done.
 
 ## 8. Keep AGPL source access visible without restoring nav clutter
 
-- [ ] Move or duplicate `Source code` link into a small, discoverable help/about
+- [x] Move or duplicate `Source code` link into a small, discoverable help/about
       surface or footer.
-- [ ] Keep AGPL label out of top navigation.
-- [ ] Confirm keyboard and touch users can reach source link without discovering
+- [x] Keep AGPL label out of top navigation.
+- [x] Confirm keyboard and touch users can reach source link without discovering
       an unmarked hover target.
-- [ ] Preserve `rel="noopener"` on external link.
+- [x] Preserve `rel="noopener"` on external link.
 
 Evidence: link currently lives inside project-name tooltip in `src/ui.html`.
 AGPL section 13 says modified network versions must "prominently offer" source.
 This checklist is product hygiene, not legal advice.
+
+**DONE 2026-09-05.** Moved (not duplicated) out of the hover-only tooltip to a
+small always-visible `<a id="agpl">` fixed at the bottom-right corner —
+`position:fixed`, low-contrast at rest (`opacity:.6`), full contrast on
+hover/focus. It's a real `<a>` outside any `.zone` toolbar group, so it's in
+normal tab order for keyboard users and a normal tap target for touch —
+neither needs to discover that hovering the project name reveals a popover.
+`target="_blank" rel="noopener"` preserved. Verified in the actual browser
+against a live `cutroom serve` instance (read-only — GET only, no clicks,
+version unchanged at 494 before and after) since `ui.html` is re-read from
+disk on every page load with no restart needed. `test_license_copy_is_not_top_nav_clutter_but_source_stays_reachable`
+updated to assert the new placement instead of the old tooltip location.
 
 ## 9. Clean public-facing repository history and documents
 

@@ -281,6 +281,15 @@
              border-radius:3px; padding:2px 4px; }
   .tip em { color:var(--warn); font-style:normal; }
   .tip a { color:var(--accent); }
+  /* Always visible — not a hover/focus reveal — because AGPL section 13
+     requires a network user can find the source "prominently", and a link
+     that only appears on hover is not prominent to a touch user or anyone
+     who never discovers the tooltip is there. Small and out of the toolbar
+     zones so it stays out of top navigation. */
+  #agpl { position:fixed; right:8px; bottom:6px; z-index:50;
+          font:400 10px/1 var(--sans); color:var(--ink-3); text-decoration:none;
+          opacity:.6; }
+  #agpl:hover, #agpl:focus-visible { opacity:1; color:var(--accent); }
 </style>
 
 <header>
@@ -299,9 +308,6 @@
          <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> one second ·
          <kbd>home</kbd><kbd>end</kbd> jump ·
          <kbd>-</kbd><kbd>=</kbd> zoom · <kbd>delete</kbd> remove a clip.</p>
-      <!-- AGPL-3.0 section 13: keep source reachable to network users. -->
-      <p><a href="https://github.com/tareksadi91/cutroom" target="_blank"
-            rel="noopener">Source code</a></p>
     </span></span>
   </div>
   <div class="zone grow">
@@ -341,6 +347,11 @@
   </div>
   <div class="zone"><span id="status"></span></div>
 </header>
+
+<!-- AGPL-3.0 section 13: source must stay reachable to network users, and
+     reachably means a real always-present link, not a hover-only tooltip. -->
+<a id="agpl" href="https://github.com/tareksadi91/cutroom" target="_blank"
+   rel="noopener">AGPL-3.0 · source</a>
 
 <div id="bin"></div>
 <div id="stage"><div id="ruler" title="click or drag to move the playhead"></div>

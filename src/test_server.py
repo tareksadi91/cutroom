@@ -1764,12 +1764,31 @@ def test_the_page_never_offers_a_drop_it_cannot_honour():
 
 
 def test_license_copy_is_not_top_nav_clutter_but_source_stays_reachable():
+    """§8 of the open-source checklist: the source link used to live only
+    inside the project-name tooltip — reachable on hover or keyboard focus,
+    but invisible to anyone who never discovers that plain text is
+    interactive, and unreachable to a touch user with no hover at all.
+    AGPL section 13 requires the source stay reachable to a network user,
+    and a link that only appears on hover is not "prominently offered"."""
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
-    assert "AGPL · source" not in html, "the licence label came back into the nav"
+    # not inside a toolbar `.zone` — those are the header's own
+    # `<div class="zone">` groups, and this link sits after </header> instead
+    header = html[html.index("<header>"):html.index("</header>")]
+    assert 'id="agpl"' not in header, "the source link came back into the toolbar"
     assert 'href="https://github.com/tareksadi91/cutroom"' in html, \
         "network users lost the source link"
+    link = html[html.index('id="agpl"') - 10:html.index('id="agpl"') + 200]
+    assert 'target="_blank"' in link and 'rel="noopener"' in link, link
+
+    # not hidden inside the hover/focus-only tooltip anymore
     tip = html[html.index('<span class="tip">'):html.index('</span></span>')]
-    assert ">Source code</a>" in tip, "the source link is not in the info popover"
+    assert "Source code" not in tip and "github.com/tareksadi91/cutroom" not in tip, \
+        "the source link is still gated behind the hover-only tooltip"
+
+    # and not gated behind :hover/:focus at all — always visible
+    agpl_rule = html[html.index("#agpl {"):html.index("#agpl {") + 300]
+    assert "display:none" not in agpl_rule and "visibility:hidden" not in agpl_rule, \
+        "the always-visible source link is hidden by default"
 
 
 def test_tooltips_belong_to_the_elements_they_explain():
