@@ -15,7 +15,7 @@
 - Touches `src/ui.html` and `src/test_server.py` only. No server, renderer, or project-schema changes (spec, line 4).
 - Every new marked-region function must not alter `nearestPoint()`'s name, signature, or behavior — the existing test `test_a_bin_drop_only_snaps_to_a_seam_you_are_pointing_at` (`test_server.py:1714`) depends on both, unchanged (spec §1).
 - Trim-left/trim-right dragging is out of scope — no magnet, no change (spec, Non-goals).
-- Swap and reorder never apply to a multi-clip selection (`selected().length !== 1`) — falls through to today's plain free-move-together (spec, Non-goals).
+- Swap and reorder never apply to a multi-clip selection (`selected().length !== 1`) — falls through to today's plain free-move-together (spec, Non-goals). This plan goes one step further than the spec states explicitly: a multi-selection drag gets no magnet/seam-land benefit either, only single-clip drags do (see Task 5's explicit note on this).
 - No modifier key gates swap; it fires on a plain drop (spec, Non-goals).
 - Every commit that moves more than one clip's `t` (swap, reorder, group nudge) is legality-gated via `timelineFault()` with snapshot/revert-on-fault, the same shape `insertAt()` already uses (`ui.html:1377-1389`).
 - `1e-6` is this file's standing epsilon for time-equality comparisons (`timelineFault()`, `seamFor()`, `insertPoints()` all use it) — use the same value in every new function, not a fresh one.
@@ -26,7 +26,7 @@
 
 All changes land in two existing files — no new files:
 
-- **`src/ui.html`** — six new pure functions (Tasks 1–4, 6, 7), added inside or immediately after the existing `// >>> seam-pick` / `// <<< seam-pick` marked region (`ui.html:1286-1330`) so `magnet()` shares that region, plus a brand-new `// >>> move-target` / `// <<< move-target` region for the move-path logic. Wiring changes (Tasks 5–7) modify the existing `card()` function's drag handlers (`ui.html:909-1049`) and the keydown handler (`ui.html:2052-2094`).
+- **`src/ui.html`** — six new pure functions (Tasks 1–4, 6, 7), added inside or immediately after the existing `// >>> seam-pick` / `// <<< seam-pick` marked region (`ui.html:1286-1330`) so `magnet()` shares that region, plus a brand-new `// >>> move-target` / `// <<< move-target` region. That region ends up holding more than its name suggests — the drag classification/commit functions (Tasks 2–4) it's named for, plus `nudgeGroup()` (Task 6) and `pasteAnchor()` (Task 7), which piggyback on the same region rather than each getting their own marker pair, since they're small, share the same `node`-harness test convention, and don't need to be extracted independently of each other. Wiring changes (Tasks 5–7) modify the existing `card()` function's drag handlers (`ui.html:909-1049`) and the keydown handler (`ui.html:2052-2094`).
 - **`src/test_server.py`** — new test functions following the exact existing convention: extract a marked region verbatim, splice in any other regions/stubs it calls, write a small fixture + assertions to a temp `.mjs` file, run it with `node`, skip gracefully if `node` isn't installed (see `test_a_bin_drop_only_snaps_to_a_seam_you_are_pointing_at`, `test_server.py:1714-1811`, as the exact template).
 
 ---
@@ -94,11 +94,14 @@ r = magnet(0.2, points, 10, 0.125);
 if (r !== null) fail('secondsCap: 0.2s away should be outside a 0.125s cap');
 
 // At a high enough zoom the pixel cap (14px) is tighter than a 0.125s seconds
-// cap (0.125*120=15px) -- whichever is tighter wins, not always the seconds one.
-r = magnet(14.9/120, points.map(p=>({...p})), 120, 0.125);   // 14.9px away
-if (!r) fail('pixel-cap should still win when it is the tighter of the two');
-r = magnet(14.9/120 + 0.02, points, 120, 0.125);              // now past both caps
-if (r !== null) fail('past both caps should be null');
+// cap (0.125*120=15px) -- whichever is tighter wins, not always the seconds
+// one. Prove it by bracketing the PIXEL cap's own edge (14px), not the
+// seconds cap's -- a point outside 14px but still inside 15px must be null,
+// or the seconds cap would be winning instead of the pixel one.
+r = magnet(13.5/120, points, 120, 0.125);   // 13.5px away, inside the 14px pixel cap
+if (!r) fail('13.5px should be inside the 14px pixel cap');
+r = magnet(14.5/120, points, 120, 0.125);   // 14.5px away: outside 14px, inside 15px
+if (r !== null) fail('14.5px should be null -- the tighter 14px pixel cap must bind, not the 15px seconds cap');
 
 console.log('js ok');
 """
@@ -479,7 +482,7 @@ EOF
 **Interfaces:**
 - Consumes: `magnet()`, `moveMagnetCap()` (Task 1); `moveCandidates()`, `flushRun()` (Task 2); `dur(c)`, `endOf(c)` (global)
 - Produces: `findSwapNeighbors(originalT, originalDur, lane) → {before: clip|null, after: clip|null}` — the clip immediately before/after the dragged clip's *original* slot in `lane`, only if flush (zero gap, zero overlap) against it.
-- Produces: `resolveMoveTarget(args) → {type:'swap', clip} | {type:'seam', landT} | {type:'reorder', run, newIndex} | null`, where `args = {draggedUid, proposedT, dur0, lane0, dropLane, swapNeighbors, run, hoveredClip, pxPerSecond, altKey}`. `draggedUid` is excluded from the magnet's own candidate set internally (via `moveCandidates`), so the dragged clip's own live, moving position is never a candidate against itself. `hoveredClip` is whichever clip (if any) the pointer's raw screen coordinate currently sits fully inside — the caller (Task 5) supplies it via a DOM hit-test; this function does not touch the DOM.
+- Produces: `resolveMoveTarget(args) → {type:'swap', clip} | {type:'seam', landT} | {type:'reorder', run, newIndex} | null`, where `args = {draggedUid, origT, proposedT, dur0, lane0, dropLane, swapNeighbors, run, hoveredClip, pxPerSecond, altKey}`. `draggedUid` is excluded from the magnet's own candidate set internally (via `moveCandidates`), so the dragged clip's own live, moving position is never a candidate against itself. `origT` is the dragged clip's ORIGINAL `t` (same value as `t0` in the drag handler) — required to compute where the clip currently sits *among its own run's members*, which is not always index 0 (only the spec's own worked example happens to start there); do not substitute `run.start` for it, since that's only equal to `origT` when the dragged clip happens to be first in its run. `hoveredClip` is whichever clip (if any) the pointer's raw screen coordinate currently sits fully inside — the caller (Task 5) supplies it via a DOM hit-test; this function does not touch the DOM.
 
 **A note on why the run-membership check, not a distance check, decides seam vs. reorder:** a candidate seam belongs to case (b) (reorder) exactly when moving the dragged clip's start there would reorder some *other* member of its own flush run — i.e. the candidate's owning clip (or the run's own outward boundary) is inside `run.members` (or equals `run.start`/`run.end`) **and** applying it would actually change the dragged clip's position among those members. A candidate is case (a) (plain seam-land) whenever it *doesn't* imply moving another clip — either because it's outside the run entirely (a different run, a gap, a different lane, the run's own boundary when the dragged clip is already there) or because, worked through the reindex below, nothing else would move. This plan computes both the newIndex and whether it changes anything in one pass, so there is no separate "is it my own edge" special case to get wrong.
 
@@ -535,9 +538,11 @@ def test_resolve_move_target_classification():
     exact worked example from the design spec: run X[0,2], B[2,5], C[5,6].
     """
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
-    a = html.index("// >>> move-target")
-    b = html.index("// <<< move-target")
-    region = html[a:b]
+    # resolveMoveTarget() calls magnet()/moveMagnetCap(), which live in
+    # seam-pick, not move-target -- both regions must be in scope together.
+    sa, sb = html.index("// >>> seam-pick"), html.index("// <<< seam-pick")
+    ma, mb = html.index("// >>> move-target"), html.index("// <<< move-target")
+    region = html[sa:sb] + html[ma:mb]
     assert "function resolveMoveTarget(" in region
     node = shutil.which("node")
     if node is None:
@@ -553,17 +558,18 @@ let DOC = {fps: 24, clips: [
   {uid:'B', t:2, in:0, out:3, rate:1, lane:0},
   {uid:'C', t:5, in:0, out:1, rate:1, lane:0},
 ]};
+function insertPoints() { return []; }   // unused here, resolveMoveTarget never calls nearestPoint
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 
-const dur0 = 2, lane0 = 0;
-const swapNeighbors = findSwapNeighbors(0, dur0, lane0);   // X has no 'before', 'after'=B
-const run = flushRun(0, dur0, lane0, 'X');                  // members [B,C], bounds [0,6]
+const dur0 = 2, lane0 = 0, origT = 0;
+const swapNeighbors = findSwapNeighbors(origT, dur0, lane0);   // X has no 'before', 'after'=B
+const run = flushRun(origT, dur0, lane0, 'X');                  // members [B,C], bounds [0,6]
 
 // 1) Hovering B's body (the fixed swap neighbor) -> swap, regardless of the
 //    nearby magnet candidates.
 let res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 2.4, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 2.4, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: DOC.clips[1], pxPerSecond: PX, altKey: false});
 if (!res || res.type !== 'swap' || res.clip.uid !== 'B')
   fail('expected swap with B, got ' + JSON.stringify(res));
@@ -573,7 +579,7 @@ if (!res || res.type !== 'swap' || res.clip.uid !== 'B')
 //    reorder, landing X immediately before C (newIndex counts run members
 //    with original t < 5: just B -> newIndex=1).
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: false});
 if (!res || res.type !== 'reorder' || res.newIndex !== 1)
   fail('expected reorder at newIndex 1, got ' + JSON.stringify(res));
@@ -581,7 +587,7 @@ if (!res || res.type !== 'reorder' || res.newIndex !== 1)
 // 3) Proposed start near the run's own end (t=6, appending after C) ->
 //    reorder, newIndex = run.members.length (2): dragged clip goes last.
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 6.03, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 6.03, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: false});
 if (!res || res.type !== 'reorder' || res.newIndex !== 2)
   fail('expected reorder at newIndex 2 (append), got ' + JSON.stringify(res));
@@ -591,7 +597,7 @@ if (!res || res.type !== 'reorder' || res.newIndex !== 2)
 //    (newIndex identical to X's current index, 0) -- classify as 'seam',
 //    a plain positional move, never a multi-clip commit for a no-op.
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 0.02, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 0.02, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: false});
 if (!res || res.type !== 'seam')
   fail('expected a plain seam-land landing back on its own original slot, got ' +
@@ -601,14 +607,14 @@ if (!res || res.type !== 'seam')
 //    always classifies as 'seam', never 'reorder', regardless of distance.
 DOC.clips.push({uid:'D', t:9, in:0, out:1, rate:1, lane:0});   // isolated, gap after C
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 8.97, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 8.97, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: false});
 if (!res || res.type !== 'seam')
   fail('a seam outside the run must classify as seam-land, got ' + JSON.stringify(res));
 
 // 6) Nothing in radius, nothing hovered -> free (null).
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 20, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 20, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: false});
 if (res !== null) fail('expected free placement (null), got ' + JSON.stringify(res));
 
@@ -616,9 +622,31 @@ if (res !== null) fail('expected free placement (null), got ' + JSON.stringify(r
 //    NOT swap -- swap is a deliberate whole-body hover, not a proximity
 //    magnet, and altKey never touched it in the spec.
 res = resolveMoveTarget({
-  draggedUid: 'X', proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  draggedUid: 'X', origT, proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
   hoveredClip: null, pxPerSecond: PX, altKey: true});
 if (res !== null) fail('altKey must suppress the seam/reorder magnet, got ' + JSON.stringify(res));
+
+// 8) THE CASE THAT CATCHES A WRONG currentIndex FORMULA: drag the LAST, and
+// SHORTEST, member of a 3-clip run toward an EARLIER slot boundary. A[0,4],
+// B[4,4.5], C[4.5,5] flush; dragging C (dur0=0.5, origT=4.5) to land at t=4
+// (B's own start) is a real reorder -- C moves from index 2 to index 1 among
+// its run's members [A,B]. A formula that derives "current index" from
+// run.start and dur0 instead of from origT gets this wrong (it would count
+// only A, matching newIndex=1, and wrongly call it a no-op).
+DOC.clips = [
+  {uid:'A', t:0,   in:0, out:4,   rate:1, lane:0},
+  {uid:'B', t:4,   in:0, out:0.5, rate:1, lane:0},
+  {uid:'C', t:4.5, in:0, out:0.5, rate:1, lane:0},
+];
+const dur0c = 0.5, origTc = 4.5;
+const runC = flushRun(origTc, dur0c, 0, 'C');           // members [A,B], bounds [0,5]
+const swapNeighborsC = findSwapNeighbors(origTc, dur0c, 0);
+res = resolveMoveTarget({
+  draggedUid: 'C', origT: origTc, proposedT: 3.97, dur0: dur0c, lane0: 0, dropLane: 0,
+  swapNeighbors: swapNeighborsC, run: runC, hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'reorder' || res.newIndex !== 1)
+  fail('dragging the last, shortest run member to an earlier slot must reorder '
+       + '(newIndex 1), got ' + JSON.stringify(res));
 
 console.log('js ok');
 """
@@ -660,7 +688,7 @@ function reorderIndexFor(landT, run) {
 // The full swap / seam-land / reorder / free decision for one pointermove.
 // Nothing here touches the DOM or DOC beyond reading it -- `hoveredClip` is
 // supplied by the caller from its own hit-test.
-function resolveMoveTarget({draggedUid, proposedT, dur0, lane0, dropLane, swapNeighbors,
+function resolveMoveTarget({draggedUid, origT, proposedT, dur0, lane0, dropLane, swapNeighbors,
                              run, hoveredClip, pxPerSecond, altKey}) {
   const E = 1e-6;
   // 1) Swap: only the two fixed original neighbors, only same lane, only
@@ -691,7 +719,13 @@ function resolveMoveTarget({draggedUid, proposedT, dur0, lane0, dropLane, swapNe
     return {type: 'seam', landT};
   }
   const newIndex = reorderIndexFor(landT, run);
-  const currentIndex = run.members.filter(c => c.t < run.start + dur0 - E).length; // always 0: dragged clip starts at run.start
+  // How many of the run's OTHER members currently sit before the dragged
+  // clip's own ORIGINAL position -- NOT run.start, which only coincides with
+  // origT when the dragged clip happens to be first in its run. Using
+  // run.start here silently misclassifies a real reorder as a no-op
+  // whenever the dragged clip is 2nd-or-later in its run (see Task 3's own
+  // regression test for the concrete case this was wrong on).
+  const currentIndex = run.members.filter(c => c.t < origT - E).length;
   if (newIndex === currentIndex) return {type: 'seam', landT};
   return {type: 'reorder', run, newIndex};
 }
@@ -738,7 +772,7 @@ EOF
 - Test: `src/test_server.py`
 
 **Interfaces:**
-- Consumes: `flushRun()`, `reorderIndexFor()` (Tasks 2-3); `timelineFault()` (`ui.html:1247`, existing); `dur(c)` (global)
+- Consumes: `flushRun()` (Task 2), a `run` shaped the way it returns (Task 3's `resolveMoveTarget` already computed `newIndex` by the time this task's functions are called — `commitReorder` takes it as a plain argument, it doesn't call `reorderIndexFor()` itself); `timelineFault()` (`ui.html:1247`, existing); `dur(c)` (global)
 - Produces: `commitReorder(draggedClip, run, newIndex)` → mutates `draggedClip.t` and every clip in `run.members` in place, laying the run's members plus the dragged clip out flush from `run.start`, in the new order. Also handles the swap case (a 2-member reindex is exactly a swap — see the worked check in Step 1).
 - Produces: `commitWithGate(clips, mutate)` → calls `mutate()`, then `timelineFault()`; on a fault, restores every clip in `clips` to its pre-`mutate()` `.t` and returns the fault string; on success returns `null`. Generic — Task 5 (swap/reorder) and Task 6 (group nudge) both use it.
 
@@ -866,19 +900,22 @@ const dur = c => (c.out - c.in) / c.rate;
 const endOf = c => c.t + dur(c);
 const hasVideo = () => true;
 let PX = 10;
-// Lane 0: A[0,2] flush B[2,10] (unequal durations, swap will nest one).
-// Lane 1: Z[3,4] -- sits inside where B currently is, fine; but after a
-// swap that puts A at [8,10] and B at [0,8], Z[3,4] ends up nested inside B.
+// Lane 0: A[0,2] flush B[2,10] (dur 8). Lane 1: Z[1.9,2.4] -- a legal 0.1s/
+// 0.4s crossfade pair straddling the A|B seam TODAY. After A and B swap
+// (B moves to [0,8], A to [8,10]), Z sits fully nested inside the new B --
+// illegal only AFTER the swap, which is the property this test actually
+// needs: a fixture that's already faulty proves nothing about the commit.
 let DOC = {fps: 24, clips: [
   {uid:'A', t:0, in:0, out:2, rate:1, lane:0},
-  {uid:'B', t:2, in:0, out:10, rate:1, lane:0},
-  {uid:'Z', t:3, in:0, out:1, rate:1, lane:1},
+  {uid:'B', t:2, in:0, out:8, rate:1, lane:0},
+  {uid:'Z', t:1.9, in:0, out:0.5, rate:1, lane:1},
 ]};
 __REGION_TIMELINEFAULT__
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 
 const A = DOC.clips[0], B = DOC.clips[1];
+if (timelineFault()) fail('the fixture must start legal -- got: ' + timelineFault());
 const aTOld = A.t, bTOld = B.t;
 const run = flushRun(A.t, dur(A), 0, 'A');
 const fault = commitWithGate([A, B], () => commitReorder(A, run, 1));
@@ -890,6 +927,55 @@ console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
         js = pathlib.Path(d) / "gate.mjs"
+        js.write_text(
+            harness.replace("__REGION_TIMELINEFAULT__", tf_region)
+                   .replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_commit_with_gate_still_allows_repair_of_an_already_faulty_cut():
+    """Mirrors the existing drag-clamp test's own 'a cut that is ALREADY
+    faulty must still be draggable' case (test_server.py:1877-1886) -- a
+    commit must not refuse just because the cut was illegal before it ran,
+    or a timeline that arrived broken could never be nudged, swapped, or
+    reordered back out of trouble.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    tf_region = html[html.index("function timelineFault() {"):
+                      html.index("// How far the clip before a seam reaches")]
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; commitWithGate() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+const hasVideo = () => true;
+let PX = 10;
+// Already illegal: A and B start at the same instant.
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0, label:'A'},
+  {uid:'B', t:0, in:0, out:1, rate:1, lane:0, label:'B'},
+]};
+__REGION_TIMELINEFAULT__
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const A = DOC.clips[0], B = DOC.clips[1];
+if (!timelineFault()) fail('the fixture must start faulty for this test to mean anything');
+const fault = commitWithGate([B], () => { B.t = 5; });
+if (fault) fail('a commit on an already-faulty cut must not be refused, got: ' + fault);
+if (B.t !== 5) fail('the mutation must be kept, not reverted, on an already-faulty cut');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "gate_repair.mjs"
         js.write_text(
             harness.replace("__REGION_TIMELINEFAULT__", tf_region)
                    .replace("__REGION__", region))
@@ -922,13 +1008,21 @@ function commitReorder(draggedClip, run, newIndex) {
 // Snapshot every clip's t, run the mutation, check legality once, and
 // revert everything on a fault -- the same shape insertAt() already uses
 // for its own single-clip creation (ui.html:1377-1389), generalized to any
-// number of clips whose t might change in one commit.
+// number of clips whose t might change in one commit. Mirrors keepIfLegal()'s
+// own gate.armed rule (ui.html:1241-1242): a cut that was ALREADY faulty
+// before this commit must still be allowed to change, or a timeline that
+// arrived illegal (e.g. from a hand-edited or agent-written project) could
+// never be nudged, swapped, or reordered back out of trouble.
 function commitWithGate(clips, mutate) {
+  const wasFaulty = !!timelineFault();
   const before = clips.map(c => c.t);
   mutate();
   const fault = timelineFault();
-  if (fault) clips.forEach((c, i) => { c.t = before[i]; });
-  return fault;
+  if (fault && !wasFaulty) {
+    clips.forEach((c, i) => { c.t = before[i]; });
+    return fault;
+  }
+  return null;
 }
 ```
 
@@ -979,6 +1073,8 @@ EOF
 
 This task is DOM-dependent (pointer events, `classList`, live element lookup) and cannot be driven by the `node`-harness convention this file's pure-logic tests use. Its verification step is a manual check in a real running instance, matching how every other piece of interactive wiring in this codebase has been verified (e.g. the AGPL-link placement change, verified "in the actual browser against a live `cutroom serve` instance").
 
+**An explicit scope decision, not an oversight:** a multi-clip (`MULTI`) selection gets NO magnet/seam-land benefit from this plan, not just no swap/reorder — `pendingTarget` is only ever resolved when `singleMove` (`group.length === 1`). The spec's own candidate-exclusion wording ("excluding every uid in `selected()` — not just `SEL` — so the dragged clip (and the rest of a multi-selection, where applicable) is never a candidate for its own magnet") could be read as implying group drags should still get seam-land. This plan deliberately keeps that narrower: extending seam-land to a group is a real, separate feature (which member's edge does the magnet aim from? does the whole group need to test the same candidate, or does each member get its own?) that the spec never actually specifies for the group case, and guessing an answer here risks the exact kind of silent design decision this project's review process exists to catch. A multi-selection drag keeps today's exact, unchanged free-move-together behavior. Follow up with the user/spec author before extending this, rather than assuming.
+
 - [ ] **Step 1: Add the swap-neighbor and flush-run snapshot at drag start**
 
 In `src/ui.html`, inside `card()`'s `d.onpointerdown = e => {` handler, immediately after the existing line (`ui.html:969`) `const minT    = Math.min(...g0.map(([,T]) => T));`, add:
@@ -1000,76 +1096,81 @@ In `src/ui.html`, inside `card()`'s `d.onpointerdown = e => {` handler, immediat
     let pendingTarget = null;
 ```
 
-- [ ] **Step 2: Replace the move-mode positioning in `onpointermove` with the resolution pipeline**
+- [ ] **Step 2: Replace the entire move-mode block in `onpointermove` with the resolution pipeline**
 
-Still in `src/ui.html`, inside `d.onpointermove = ev => {`, the existing move-mode block (`ui.html:986-1012`) currently starts:
+Still in `src/ui.html`, inside `d.onpointermove = ev => {`, replace the ENTIRE existing `if (mode==='move') { ... }` block (`ui.html:986-1013`, from `if (mode==='move') {` through the `d.style.top = (8 + dl*LANE_H) + 'px';` line and its closing `}`) with the following. Do not patch this in with several separate insert-after-this-line edits — the horizontal delta (`want`) has to be computed strictly *after* `dropLane` is known (since `resolveMoveTarget` needs it), which is *before* the vertical lane-tracking code runs today; replacing the whole block in one piece is what keeps that order correct instead of leaving `keepIfLegal(want, ...)` referencing a `want` that isn't in scope yet:
 
 ```js
       if (mode==='move') {
         // The grabbed clip sets the delta; everyone else follows it, so the shape of
         // the selection is rigid and only its position changes.
-        // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
-        // per-clip clamping folds the whole selection onto t=0, losing the shape AND
-        // stacking clips on one instant, which the renderer rejects as a full overlap.
-        const want = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
-```
-
-Replace just that `const want = ...` line (keep everything else in the block — the vertical/lane logic, the per-member redraw loop — exactly as it is) with:
-
-```js
-        let proposedT = t0 + ds;
-        let dropLane = lane;   // `lane` is updated just below in this same block; read after
-```
-
-Then, immediately AFTER the existing block's lane-tracking code (right after the existing `if (next !== lane) { lane = next; ... }` bit, still before the `const dl = ...` line), insert the resolution call and recompute `want` from its result instead of the old `snap()` call:
-
-```js
-        dropLane = lane;
-        if (!singleMove) {
-          pendingTarget = null;
-        } else if (dropLane !== lane0 && !swapLatchedOff) {
-          swapLatchedOff = true;
+        const proposedT = t0 + ds;
+        // Vertical: one lane per LANE_H of travel. Dropping one row past the
+        // last lane creates a new one, so a clip never needs a button first.
+        const wantLane = lane0 + Math.round((ev.clientY-y0)/LANE_H);
+        const next = Math.max(0, Math.min(laneCount, wantLane));
+        if (next !== lane) {
+          lane = next;
+          document.querySelectorAll('.lane').forEach((L,i) =>
+            L.classList.toggle('target', i===lane));
         }
+        const dropLane = lane;
+        if (singleMove && dropLane !== lane0) swapLatchedOff = true;
         let hoveredClip = null;
         if (singleMove && !swapLatchedOff) {
-          const underPointer = document.elementFromPoint(ev.clientX, ev.clientY);
-          const cardEl = underPointer && underPointer.closest('.clip');
-          hoveredClip = cardEl && cardEl.dataset.uid !== c.uid
-            ? DOC.clips.find(x => x.uid === cardEl.dataset.uid) : null;
+          // elementsFromPoint (plural), not elementFromPoint: the dragged
+          // card itself (.clip.dragging, z-index:20, no pointer-events:none
+          // -- ui.html:214) is always topmost under the pointer, so the
+          // singular form would always return the dragged card and never
+          // see what's underneath it.
+          const stack = document.elementsFromPoint(ev.clientX, ev.clientY);
+          const cardEl = stack.find(n => n.classList && n.closest('.clip')
+                           && n.closest('.clip').dataset.uid !== c.uid);
+          hoveredClip = cardEl
+            ? DOC.clips.find(x => x.uid === cardEl.closest('.clip').dataset.uid) : null;
         }
         pendingTarget = singleMove ? resolveMoveTarget({
-          draggedUid: c.uid, proposedT, dur0: dur(c), lane0, dropLane,
+          draggedUid: c.uid, origT: t0, proposedT, dur0: dur(c), lane0, dropLane,
           swapNeighbors: swapLatchedOff ? {before: null, after: null} : swapNeighbors,
           run, hoveredClip, pxPerSecond: PX, altKey: ev.altKey,
         }) : null;
-        const landedT = pendingTarget && pendingTarget.type === 'seam'
-          ? pendingTarget.landT
-          : (pendingTarget && pendingTarget.type === 'swap'
-              ? proposedT   // swap previews the drag following the pointer; the actual position is decided at commit
-              : (pendingTarget && pendingTarget.type === 'reorder'
-                  ? proposedT   // reorder previews via highlight only, not a live position -- see step 3
-                  : snap(proposedT, ev.altKey)));
+        // A pending swap or reorder still lets the card follow the pointer
+        // (through the same continuous clamp below) for visual feedback --
+        // only a resolved seam-land pins it exactly on the target. Either
+        // way, the COMMIT in onpointerup (Step 4) never trusts wherever the
+        // card ends up visually; swap explicitly reads t0, and reorder's
+        // commitReorder() never reads the dragged clip's t at all.
+        const landedT = (pendingTarget && pendingTarget.type === 'seam')
+          ? pendingTarget.landT : snap(proposedT, ev.altKey);
+        // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
+        // per-clip clamping folds the whole selection onto t=0, losing the shape AND
+        // stacking clips on one instant, which the renderer rejects as a full overlap.
         const want = Math.max(landedT - t0, -minT);
-```
-
-Note: this preserves the existing line `const dt = goodDt = keepIfLegal(want, goodDt, v => { for (const [x, xt] of g0) x.t = xt + v; }, gate);` immediately below, unchanged — seam-land and free placement keep following the pointer continuously through the existing clamp exactly as today; swap and reorder previews do not move the live card (per spec, they're highlight-only until drop), so `want` for those two cases falls back to the raw `proposedT` delta, which the existing continuous `keepIfLegal` gate will still clamp against a full-overlap the same way it does today — that's fine, since the card's on-screen position during a pending swap/reorder is cosmetic and gets overwritten at commit time in Step 3 regardless.
-
-- [ ] **Step 3: Add hover highlighting**
-
-Immediately after the `const want = ...` line from Step 2 (still inside the `mode==='move'` block, before the existing `const dt = ...` line), add:
-
-```js
+        const dt = goodDt = keepIfLegal(want, goodDt,
+          v => { for (const [x, xt] of g0) x.t = xt + v; }, gate);
         document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
         if (pendingTarget && pendingTarget.type === 'swap') {
-          const n = document.querySelector(`[data-uid]`);
+          // Matching on dataset.uid, not interpolating a uid into a
+          // selector, per the existing warning at ui.html:1353-1358 about a
+          // hand-edited uid containing a quote character.
           for (const el of document.querySelectorAll('.clip'))
             if (el.dataset.uid === pendingTarget.clip.uid) el.classList.add('swap-target');
         }
+        // Same clamp on the vertical: the group hits lane 0, not the grabbed clip.
+        const dl = Math.max(lane - lane0, -minLane);
+        for (const [x, xt, xl] of g0) {
+          x.t = xt + dt;
+          if (x === c) continue;                     // the grabbed card is redrawn below
+          const n = document.querySelector(`.clip[data-uid="${CSS.escape(x.uid)}"]`);
+          if (n) { n.style.left = x.t*PX+'px'; n.style.top = (8 + dl*LANE_H) + 'px'; }
+        }
+        d.style.top = (8 + dl*LANE_H) + 'px';
+      }
 ```
 
-(This follows `showSeam()`'s own `mark()` pattern of matching on `dataset.uid` rather than interpolating a uid into a selector, per the existing warning at `ui.html:1353-1358` about a hand-edited uid containing a quote character.)
+- [ ] **Step 3: Add the swap-target CSS**
 
-Add the corresponding CSS near the existing `.clip.seam-l`/`.clip.seam-r` rules (find them with `grep -n "\.seam-l" src/ui.html` and add alongside):
+Add near the existing `.clip.seam-l`/`.clip.seam-r` rules (find them with `grep -n "\.seam-l" src/ui.html` and add alongside):
 
 ```css
 .clip.swap-target { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -1077,22 +1178,24 @@ Add the corresponding CSS near the existing `.clip.seam-l`/`.clip.seam-r` rules 
 
 - [ ] **Step 4: Commit the resolved target in `onpointerup`**
 
-In `src/ui.html`, inside `d.onpointerup = d.onpointercancel = () => {` (`ui.html:1032`), immediately after the existing line `document.querySelectorAll('.lane').forEach(L=>L.classList.remove('target'));` and BEFORE the existing `const dl = ...` line, add:
+In `src/ui.html`, inside `d.onpointerup = d.onpointercancel = () => {` (`ui.html:1032`), the existing body ends with the 3-decimal rounding loop and then `draw(); save(); inspect(c);`. Add the commit **after** that rounding loop and **before** `draw(); save(); inspect(c);` — not earlier in the handler — so `commitReorder()`'s own precise, frame-derived positions are the final values, never re-quantized by the rounding loop afterward (which only touches `group`, i.e. `[c]` for a single move, and would otherwise leave the swap/reorder partner at full precision while `c` gets rounded to 3 decimals, reopening a sub-millisecond gap in what should be an exactly flush pair):
 
 ```js
       document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
       let commitFault = null;
-      // Both branches rely on `c`'s and its swap/reorder target's `t` being
-      // untouched since drag start -- Step 2 made swap and reorder preview
-      // via highlight only (never following the pointer live the way
-      // seam-land and free placement do), so no re-derivation of `run` is
-      // needed here; it's still exactly the run captured at pointerdown.
       if (singleMove && pendingTarget && pendingTarget.type === 'swap') {
+        // Use t0, never live c.t: Step 2 lets the card follow the pointer
+        // during a pending swap, so by the time this runs c.t may not be
+        // t0 any more. `other` (the swap target) is never mutated during
+        // this drag, so its live .t is safe to read as-is.
         const other = pendingTarget.clip;
-        const [earlier, later] = c.t < other.t ? [c, other] : [other, c];
-        const pairRun = {members: [later], start: earlier.t, end: endOf(later)};
+        const [earlier, later] = t0 < other.t ? [c, other] : [other, c];
+        const start = Math.min(t0, other.t);
+        const pairRun = {members: [later], start, end: start + dur(earlier) + dur(later)};
         commitFault = commitWithGate([c, other], () => commitReorder(earlier, pairRun, 1));
       } else if (singleMove && pendingTarget && pendingTarget.type === 'reorder') {
+        // commitReorder() never reads the dragged clip's current t (only
+        // writes it), so no t0-vs-live concern here.
         commitFault = commitWithGate([c, ...pendingTarget.run.members],
           () => commitReorder(c, pendingTarget.run, pendingTarget.newIndex));
       }
@@ -1129,7 +1232,7 @@ This step has no automated test — DOM pointer-drag interaction in this file ha
 6. **Swap does not apply across a gap**: confirm that hovering a clip that is NOT currently flush against the dragged clip's original position never highlights, even if you drag onto its body.
 7. **Reorder**: in a lane with three or more flush clips (e.g. `A`,`B`,`C` all touching), drag `A` toward `C`'s far edge and release. `B` and `C` should shift left by `A`'s duration, `A` should land flush after `C`, and the run's total span should be unchanged (check the clip immediately after the run, if any, hasn't moved).
 8. **Reorder never touches another lane**: with the same setup, add an unrelated clip on a different lane overlapping the same time range, and repeat step 7 — confirm it does not move.
-9. **A cross-lane fault reverts cleanly**: construct (or find) a case where a swap/reorder would nest a clip on another lane (per Task 4's test fixture, adapted to real clips) and confirm the two swapped/reordered clips snap back to their exact starting positions with a warning note, rather than landing in a broken state.
+9. **A cross-lane fault reverts cleanly**: construct (or find) a case where a swap/reorder would nest a clip on another lane (per Task 4's test fixture, adapted to real clips) and confirm both clips end up back at a LEGAL position with a warning note, rather than a broken one. Note this isn't necessarily their exact pre-drag position — `commitWithGate` reverts to whatever `c`'s position was at the moment of drop (which the continuous clamp already guarantees is legal on its own), not to `t0`, since the pointer may have moved between grabbing the clip and triggering the swap/reorder highlight.
 10. Confirm `git status` shows no accidental project-file changes from this manual testing (or discard them) before moving on.
 
 - [ ] **Step 7: Run the full suite**
@@ -1168,7 +1271,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `commitWithGate()` (Task 4); `dur(c)`, `endOf(c)` (global)
-- Produces: `nudgeGroup(group, g0, frames)` → applies a frame-exact, group-delta-clamped nudge to every `[clip, originalT]` pair in `g0` (the same shape the existing drag handler already snapshots at `ui.html:964` — the caller builds a fresh `g0` from each clip's *current* `t` before every single call, exactly once per keypress, never reused across multiple presses), mutating each clip's `.t`. The clamp floor (`0`) is derived from `g0` itself, not passed in separately. Returns nothing — callers read the mutated clips directly, matching `commitReorder()`'s own style.
+- Produces: `nudgeGroup(g0, frames)` → applies a frame-exact, group-delta-clamped nudge to every `[clip, originalT]` pair in `g0` (the same shape the existing drag handler already snapshots at `ui.html:964` — the caller builds a fresh `g0` from each clip's *current* `t` before every single call, exactly once per keypress, never reused across multiple presses), mutating each clip's `.t`. No separate `group` parameter — every clip it needs is already in `g0`. The clamp floor (`0`) is derived from `g0` itself, not passed in separately. Returns nothing — callers read the mutated clips directly, matching `commitReorder()`'s own style.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1205,7 +1308,7 @@ const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 // real keydown handler does -- reusing one stale g0 across many presses
 // would just recompute the identical delta every time and never accumulate.
 const A = DOC.clips[0];
-for (let i = 0; i < 24; i++) nudgeGroup([A], [[A, A.t]], 1);
+for (let i = 0; i < 24; i++) nudgeGroup([[A, A.t]], 1);
 if (Math.abs(A.t - 1.5) > 1e-9) fail('expected exactly 1.5 after 24 frame-presses, got ' + A.t);
 
 // Group clamp: two clips move together; clamping must stop the WHOLE group
@@ -1213,7 +1316,7 @@ if (Math.abs(A.t - 1.5) > 1e-9) fail('expected exactly 1.5 after 24 frame-presse
 DOC.clips = [{uid:'x', t:0.5, in:0, out:2, rate:1, lane:0},
              {uid:'y', t:3,   in:0, out:1, rate:1, lane:0}];
 const X = DOC.clips[0], Y = DOC.clips[1];
-for (let i = 0; i < 48; i++) nudgeGroup([X, Y], [[X, X.t], [Y, Y.t]], -1);
+for (let i = 0; i < 48; i++) nudgeGroup([[X, X.t], [Y, Y.t]], -1);
 if (Math.abs(X.t - 0) > 1e-9) fail('expected X clamped at exactly 0, got ' + X.t);
 if (Math.abs(Y.t - 2.5) > 1e-9)
   fail('expected Y to stay 2.5 ahead of X (shape preserved), got ' + Y.t);
@@ -1244,7 +1347,7 @@ Add inside the `move-target` region, after `commitWithGate()`:
 // decimals every press (the drag commit's own rounding, ui.html:1043) would.
 // The clamp is on the GROUP's delta at its earliest member, exactly
 // ui.html:989-991's own rule, reused rather than reinvented.
-function nudgeGroup(group, g0, frames) {
+function nudgeGroup(g0, frames) {
   const wantDelta = frames / DOC.fps;
   const earliest = Math.min(...g0.map(([, t0]) => t0));
   const delta = Math.max(wantDelta, -earliest);   // floor: earliest member can't go below 0
@@ -1278,16 +1381,24 @@ Add a module-level debounce handle near the other module state (find `let RAF = 
 
 ```js
 let NUDGE_SAVE_TIMER = null;
+// Returns the flush's own promise so a caller that must not race a pending
+// nudge (undoRedo(), a manual history restore) can await it before doing
+// anything else.
 function flushNudgeSave() {
-  if (NUDGE_SAVE_TIMER) { clearTimeout(NUDGE_SAVE_TIMER); NUDGE_SAVE_TIMER = null; save(); }
+  if (!NUDGE_SAVE_TIMER) return Promise.resolve();
+  clearTimeout(NUDGE_SAVE_TIMER);
+  NUDGE_SAVE_TIMER = null;
+  return save();
 }
 ```
 
-Replace the two `ArrowLeft`/`ArrowRight` lines above with:
+**Replace the whole quoted block above** (`ui.html:2052-2058`: the `document.addEventListener('keydown', e => {` line's `INPUT` early-return, through both existing `ArrowLeft`/`ArrowRight` lines) with:
 
 ```js
+document.addEventListener('keydown', e => {
   const tag = document.activeElement.tagName;
-  const nudgeable = SEL && !DRAGGING && tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA';
+  const nudgeable = SEL && !DRAGGING && !e.metaKey && !e.ctrlKey
+    && tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA';
   if (nudgeable && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
     e.preventDefault();
     const dir = e.key === 'ArrowLeft' ? -1 : 1;
@@ -1297,7 +1408,7 @@ Replace the two `ArrowLeft`/`ArrowRight` lines above with:
     // commitWithGate snapshots every clip's t itself, runs the mutation, and
     // reverts on a fault -- nudgeGroup must only ever be called from inside
     // this callback, never applied first and checked after.
-    const fault = commitWithGate(group, () => nudgeGroup(group, g0, frames));
+    const fault = commitWithGate(group, () => nudgeGroup(g0, frames));
     if (fault) note(fault, 'var(--warn)');
     else {
       const f = document.getElementById('f-t');
@@ -1318,11 +1429,18 @@ Replace the two `ArrowLeft`/`ArrowRight` lines above with:
   }
 ```
 
-This removes the need for the manual `before`/restore dance entirely — `commitWithGate` already snapshots and reverts. Use this version, not the first draft above.
+`draw()` re-renders every card from `DOC.clips`, which is safe here since nothing is mid-drag (the `!DRAGGING` guard above already ensures that), unlike the warning at `ui.html:2070-2072` about `draw()` during a live drag. Guarding on `!e.metaKey && !e.ctrlKey` keeps `Cmd+←`/`Cmd+→` (browser back/forward) and `Cmd+⇧+←`/`→`-style combos out of the nudge path.
 
-Also `draw()` re-renders every card from `DOC.clips`, which is safe here since nothing is mid-drag (the `!DRAGGING` guard above already ensures that), unlike the warning at `ui.html:2070-2072` about `draw()` during a live drag.
+**The flush must be awaited, not fired and forgotten**, everywhere a pending nudge could race a `save()` or a history restore:
 
-Then add the debounce-flush call at every point `save()` is already called elsewhere in a way that could race a pending nudge — specifically, in `undoRedo()` (`ui.html:1980`), add `flushNudgeSave();` as the very first line of the function body, and in the `window.addEventListener('blur', ...)` handler from Task 5, add `flushNudgeSave();` alongside the existing `DRAGGING = false;` line.
+- In `undoRedo()` (`ui.html:1980`), change its first line from `if (!DOC || DRAGGING || UNDO_BUSY) return;` to await the flush *before* that guard runs, since the guard itself doesn't care about a pending nudge but the fetch just below it does:
+  ```js
+  async function undoRedo(dir) {
+    await flushNudgeSave();
+    if (!DOC || DRAGGING || UNDO_BUSY) return;
+  ```
+- In `HIST.onchange` (`ui.html:1936`), add `await flushNudgeSave();` as its first line too — a manual history restore calls `invalidateUndo()` and adopts a new document the same way `undoRedo()` does, with the identical exposure to a pending nudge.
+- In the `window.addEventListener('blur', ...)` handler from Task 5, add `flushNudgeSave();` alongside the existing `DRAGGING = false;` line — a `blur` handler can't be `async`, so this one is fire-and-forget by necessity (there's no later code in that handler for it to race).
 
 - [ ] **Step 6: Update the header keyboard tip and the clip card title**
 
@@ -1498,7 +1616,10 @@ In the keydown handler, alongside the existing `Cmd+A` block (`ui.html:2076-2082
       liveUids.add(uid);
       const off = OFFLINE[c.uid];
       const clone = {...c, uid, t: c.t - earliestT + anchor};
-      if (off) OFFLINE[uid] = off;
+      // Spread + override, not a bare reference: OFFLINE[c.uid].uid still
+      // names the deleted source clip, and reusing that object as-is would
+      // carry the wrong uid into the new entry.
+      if (off) OFFLINE[uid] = {...off, uid};
       return clone;
     });
     DOC.clips.push(...fresh);
@@ -1616,13 +1737,15 @@ If a stale count is found, update it to match Step 1's actual final count. (The 
 - Piece 4 (media-pool insert, unchanged) → Task 8.
 - Piece 5 (copy/paste) → Task 7.
 - Piece 6 (testing convention) → threaded through every task's Step 1/2, using the exact existing extraction pattern.
-- Non-goals (no trim magnet, no multi-select swap/reorder, no modifier key, no predictive badge) — Task 5's wiring only ever calls `resolveMoveTarget` for `mode==='move'` with `group.length===1` (`singleMove`), so trim and multi-select are structurally excluded, not just documented as excluded.
+- Non-goals (no trim magnet, no multi-select swap/reorder/magnet, no modifier key, no predictive badge) — Task 5's wiring only ever calls `resolveMoveTarget` for `mode==='move'` with `group.length===1` (`singleMove`), so trim and multi-select are structurally excluded, not just documented as excluded; Task 5 also carries an explicit note on the deliberate choice to withhold the magnet from multi-selection drags too, beyond what the spec's Non-goals states outright.
 
 **Placeholder scan** — no TBD/TODO markers; every code block is complete, runnable JS or Python, not a description of what to write.
 
-**Type/name consistency, checked across tasks** — `magnet()` (Task 1) is called with the exact same four-argument shape in Task 3's `resolveMoveTarget()`. `flushRun()`'s return shape (`{members, start, end}`) is used identically in Task 3 (classification) and Task 4 (`commitReorder()`'s `run` parameter) and Task 5's wiring. `commitWithGate(clips, mutate)`'s signature is used identically in Task 4's own test, Task 5's swap/reorder commit, and Task 6's nudge commit. `pendingTarget`'s three non-null shapes (`{type:'swap',clip}`, `{type:'seam',landT}`, `{type:'reorder',run,newIndex}`) are produced only in Task 3 and consumed only in Task 5 — checked they match field-for-field.
+**Type/name consistency, checked across tasks** — `magnet()` (Task 1) is called with the exact same four-argument shape in Task 3's `resolveMoveTarget()`. `flushRun()`'s return shape (`{members, start, end}`) is used identically in Task 3 (classification), Task 4 (`commitReorder()`'s `run` parameter), and Task 5's wiring. `commitWithGate(clips, mutate)`'s signature (now returning `null` on an already-faulty cut it didn't make worse, not just on success) is used identically in Task 4's own tests, Task 5's swap/reorder commit, and Task 6's nudge commit. `pendingTarget`'s three non-null shapes (`{type:'swap',clip}`, `{type:'seam',landT}`, `{type:'reorder',run,newIndex}`) are produced only in Task 3 and consumed only in Task 5 — checked field-for-field. `resolveMoveTarget`'s `origT` (Task 3, added during review — the classification's `currentIndex` must be computed from the dragged clip's actual original position among its run's members, not from `run.start`, which only coincides with it when the clip happens to be first in its run) is threaded through correctly to Task 5's one call site (`origT: t0`).
 
-**One thing flagged for the implementer, not silently resolved:** Task 5, Step 2's insertion point describes editing the existing move-mode block by inserting code "immediately after" specific existing lines rather than replacing the whole block wholesale, because the existing lane-tracking and per-member redraw code must survive unchanged. Read `ui.html:984-1026` in full before starting Task 5 and confirm exactly where each insertion lands relative to the CURRENT file (line numbers may drift slightly after Tasks 1-4's edits above it) rather than trusting this plan's line numbers as exact — they were correct as of spec commit `bdb8ac4` / plan-writing time, but Tasks 1-4 add lines to the file before Task 5 runs.
+**Two rounds of independent review already folded into this document, not left as open findings:** an earlier draft of Task 5 patched the move-mode block with several separate "insert after this line" edits, which put a `keepIfLegal(want, ...)` call ahead of the `want` it depends on — Task 5 Step 2 now replaces the whole block in one piece specifically to avoid that class of error recurring, with an explicit note not to re-fragment it into partial edits. An earlier draft also read `document.elementFromPoint` for swap hover-detection, which always returns the dragged card itself (topmost, no `pointer-events:none`) and would have made swap permanently unreachable; fixed to `elementsFromPoint` with an explicit skip-self.
+
+**One thing still flagged for the implementer, not silently resolved:** line numbers throughout this plan were correct as of spec commit `bdb8ac4` / plan-writing time, but Tasks 1-4 add real lines to `src/ui.html` above where Task 5 operates. Before starting Task 5, re-locate the `card()` function's drag handler in the CURRENT file rather than trusting this plan's absolute line numbers for it.
 
 ---
 
