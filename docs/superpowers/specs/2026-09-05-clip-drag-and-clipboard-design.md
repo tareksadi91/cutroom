@@ -33,7 +33,7 @@ together.
   clip's *end*. Fixing that is in scope here.
 - **The renderer's overlap check is lane-blind**: two clips blend into a
   crossfade whenever they overlap in time, in one lane or across lanes
-  (header tip, `ui.html:336`). Any operation that changes a clip's `t` can
+  (header tip, `ui.html:331-333`). Any operation that changes a clip's `t` can
   therefore create a fault in a *different* lane than the one being edited,
   even when the edited lane's own arrangement looks fine.
 - **Clamp the delta at the earliest clip, never each clip at zero**
@@ -58,37 +58,62 @@ together.
 Extract the radius math out of `nearestPoint()` into a pure function:
 
 ```
-magnet(t, points, pxPerSecond) -> nearest point within radius, or null
+magnet(t, points, pxPerSecond, secondsCap) -> nearest point within radius, or null
 ```
 
 holding exactly the three rules `nearestPoint()` already enforces — merge
 points closer than one rendered pixel, cap the radius at a share of the
-gap to the next point, cap it in pixels — plus one new rule:
+gap to the next point, cap it at `SEAM_GRAB_PX` pixels — plus one new,
+*optional* rule, active only when a caller passes `secondsCap`:
 
-- **Cap the radius in seconds as well as pixels: `min(existing cap, 0.125s)`.**
-  Plain drags already quantize to the 0.25s grid (`snap()`, `ui.html:409`,
-  applied at `ui.html:992`), so coarse positioning is already solved. The
-  magnet's only job is landing exactly on an edge the grid can't express —
-  a razor seam at 3.041667s, a media duration of 4.37s. At the working
-  zoom levels in `ZOOMS`, the old radius (`SEAM_GRAB_PX` capped only by
-  pixels and gap-share) works out to roughly 1.4 seconds — enough to pull
-  a deliberate 1-second crossfade drag flush and destroy it. Capping at an
-  eighth of a second means the magnet cannot move a release point far
-  enough to eat any crossfade a person would actually author, at any zoom.
+- **`nearestPoint()` passes no `secondsCap` and is byte-for-byte unchanged**
+  — same formula, same radius, same two existing tests
+  (`test_server.py:1767`, `1787`) still pass untouched. Bin-drop keeps its
+  current, already-correct behavior; this design does not touch it.
+- **The move path (piece 2) passes `secondsCap = max(0.125s, 3px worth of
+  seconds at the current zoom)`.** Plain drags already quantize to the
+  0.25s grid (`snap()`, `ui.html:422`, applied at `ui.html:992`), so coarse
+  positioning is already solved — the magnet's only job is landing exactly
+  on an edge the grid can't express (a razor seam at 3.041667s, a media
+  duration of 4.37s). Using the bin-drop radius as-is for this purpose is
+  wrong: at the zoom this tool actually opens to (`fitZoom()`,
+  `ui.html:1892-1897`, picks the widest `ZOOMS` step — `[6, 10, 18, 34, 64,
+  120]` — that fits the whole cut; for anything longer than a couple of
+  minutes that's 6px/s), the existing radius resolves to roughly 1.4
+  seconds — enough to pull a deliberate 1-second crossfade drag flush and
+  destroy it.
 
-`nearestPoint()` keeps its exact name, signature, and `// >>> seam-pick` /
-`// <<< seam-pick` markers (an existing test extracts that region verbatim
-and re-implements `insertPoints()` against it — do not rename or reshape
-either). It becomes a thin wrapper calling `magnet(t, insertPoints(), px)`.
+  A pure seconds cap has the opposite failure at that same low zoom: 0.125s
+  at 6px/s is 0.75px, effectively disabling the magnet. There is no single
+  constant that is both "small enough to never eat a crossfade" and "large
+  enough to be hittable by hand" at every zoom — the two pressures are in
+  real tension at 6px/s, and no fix here removes that. The 3px floor keeps
+  the magnet from being literally inert; it does **not** make precision
+  edge-snapping comfortable at the lowest zoom, and the spec is explicit
+  about that rather than implying one constant solves it: **snapping onto
+  a specific frame-exact seam is a task the tool already expects zoom for**
+  (the razor's own frame-vs-grid distinction, `ui.html:1112-1115`, already
+  assumes this). At 64px/s and above the cap is a clean 0.125s in every
+  case, which is the only zoom range this feature is meant to feel exact
+  at.
 
-The move path (piece 2) calls the same `magnet()` with its own candidate
-set: every non-dragged, non-selected clip's `t` **and** its end
-(`t + dur(c)`), plus 0 and the end of the cut. Candidates are computed
-fresh from `DOC.clips` each call, excluding every uid in `selected()` —
-**not just `SEL`** — so the dragged clip (and the rest of a multi-selection,
-where applicable) is never a candidate for its own magnet. Missing this
-exclusion makes the magnet a no-op that snaps a clip to where it already
-is, since it's always the nearest point to itself.
+`magnet()` is defined **inside** the existing `// >>> seam-pick` /
+`// <<< seam-pick` region (`ui.html:1723-1726` extracts it verbatim for
+testing), placed immediately before `nearestPoint()`, which becomes a thin
+wrapper calling `magnet(t, insertPoints(), px, null)`. It does not get its
+own marker pair — the seam-pick region simply grows to include it, so the
+existing extraction test keeps working with no changes to its harness, and
+a future move-path test (piece 6) that also needs `magnet()` in scope can
+extract the same region.
+
+The move path calls the same `magnet()` with its own candidate set: every
+non-dragged, non-selected clip's `t` **and** its end (`t + dur(c)`), plus 0
+and the end of the cut. Candidates are computed fresh from `DOC.clips`
+each call, excluding every uid in `selected()` — **not just `SEL`** — so
+the dragged clip (and the rest of a multi-selection, where applicable) is
+never a candidate for its own magnet. Missing this exclusion makes the
+magnet a no-op that snaps a clip to where it already is, since it's always
+the nearest point to itself.
 
 `ev.altKey` suppresses the magnet on the move path exactly as it already
 does on the bin-drop path (`ui.html:1404`, `1435`) and inside the move
@@ -101,84 +126,127 @@ Applies to **move mode only** (dragging a clip's body). Trim-left and
 trim-right are unchanged in this design — see Non-goals.
 
 During the move handler's `onpointermove` (`ui.html:984` on), replace the
-plain `snap(t0+ds, ev.altKey)` call with:
+plain `snap(t0+ds, ev.altKey)` call with a per-move resolution that
+decides one of four outcomes — swap, seam-land, reorder, or free — checked
+**in this order** (swap first —
+its hit-test is deliberately broader than the seam magnet's, so it must
+win any case where both would otherwise match), and stores the result in
+a `pendingTarget` variable in the same closure that already holds `c`,
+`mode`, and `group` — read back at `onpointerup` to decide what to commit,
+since that handler takes no event of its own (`ui.html:1032`) and relies
+entirely on state already tracked through `onpointermove`, exactly as the
+existing free-move commit already does for `c.t`:
 
-1. Test both the dragged clip's proposed start and its proposed end
-   against `magnet()`'s move-path candidate set, and take whichever of the
-   two is nearer to a candidate. (Not "whichever edge faces the direction
-   of travel" — that rule breaks down under small jitters and gives the
-   wrong answer for a clip being nudged back toward a seam it just left.)
-2. **If within the capped radius of a seam** (a clip start or end): the
-   clip previews flush so that its nearer edge lands exactly on that seam.
-   On drop, this commits as an ordinary move — `c.t` is set accordingly.
-   No ripple, matching the 2026-08-27 rule: this is the *existing* free
-   move, made precise instead of pixel-guesswork.
-3. **If the pointer is over the body of a clip that is the dragged clip's
-   *original* immediate flush neighbor** (the clip that was, before this
-   drag started, touching the dragged clip's start or end with zero gap
-   and zero overlap, on the same lane) — not any clip dragged near, only
-   one of these two, fixed at drag start like the `g0` snapshot pattern
-   already used for group drags: highlight that neighbor's entire body.
-   On drop, this commits a **swap**: the two clips trade `t`. Each keeps
-   its own `in`/`out`/`rate`/duration.
+1. **Swap candidates are fixed once, at drag start**, the same way `g0` is
+   snapshotted before any movement happens (`ui.html:964`): look up the
+   clip immediately before and the clip immediately after the dragged
+   clip in its *starting* lane, and keep whichever of those (if either) is
+   currently flush against it (zero gap, zero overlap). This gives at most
+   two fixed candidate clips for the whole gesture — never recomputed
+   against whatever the pointer happens to be over as the drag continues.
+   If the pointer is currently over the full body of one of these two
+   fixed candidates: highlight that candidate's entire body, and set
+   `pendingTarget = {type:'swap', clip: thatCandidate}`.
 
-   This is safe by construction for the *same-lane* arrangement: two
-   clips that are flush neighbors occupy a combined span of
-   `A.dur + B.dur` regardless of which one comes first, so nothing else in
-   that lane needs to move, ever. It generalizes the same reasoning as a
-   move onto a distant seam (below) to the smallest possible window — a
-   swap **is** a move-within-lane with a window of one clip, not a
-   separate mechanism.
+   If the drag has moved the clip to a **different lane** than it started
+   in (`lane !== lane0`), swap is never offered for the remainder of that
+   gesture — the fixed candidates belonged to the starting lane, and
+   "swap" has no meaning once the clip is no longer there. Falls through
+   to step 2.
 
-   A clip's body reached by the pointer that is **not** one of the two
-   fixed original-neighbor candidates is never highlighted for swap; it
-   falls back to whichever of that clip's own start/end is within the
-   magnet radius, same as any other seam target, or to free placement if
-   neither is close enough.
+   Only offered when `selected().length === 1`; a multi-selection drag
+   never sets a swap target — see Non-goals.
 
-   Only offered when `selected().length === 1`. A multi-selection drag
-   never triggers swap — see Non-goals.
+2. **Otherwise, test both the dragged clip's proposed start and its
+   proposed end** against `magnet()`'s move-path candidate set (built from
+   the *current* drop lane, not necessarily `lane0`), and take whichever
+   of the two is nearer to a candidate. (Not "whichever edge faces the
+   direction of travel" — that rule breaks down under small jitters and
+   gives the wrong answer for a clip being nudged back toward a seam it
+   just left.) If a candidate is within the capped radius:
+   - If that seam sits at the boundary of the **contiguous flush run**
+     (no gaps, no existing crossfades) that currently contains the
+     dragged clip's own slot — including the trivial case where the seam
+     *is* one of the clip's own current edges, i.e. it hasn't effectively
+     moved — set `pendingTarget = {type:'seam', point}`. On drop this
+     commits as an ordinary move, `c.t` set so the nearer edge lands
+     exactly on the seam. No ripple: this is the *existing* free move,
+     made precise instead of pixel-guesswork.
+   - If that seam is **outside** the clip's current flush run (there's a
+     gap or a crossfade somewhere between the clip's old slot and the
+     target, in that lane), set `pendingTarget = {type:'reorder', point}`
+     — see step 3. A seam on the *far side* of a gap or crossfade cannot
+     be reached by sliding a flush run without also disturbing that gap
+     or crossfade, so reaching it is only meaningful as a reorder, never
+     as a plain seam-land.
+3. **Reorder** (`pendingTarget.type === 'reorder'`, set by step 2): this is
+   the general **move-within-lane** operation swap is a special case of.
+   On drop: extract the clip from its current slot; every clip strictly
+   between the old slot and the target seam, **within the same contiguous
+   flush run the target seam belongs to**, in that same lane only, shifts
+   by exactly the moved clip's duration, in the direction that closes the
+   vacated slot and opens the target one. Clips outside that run, and
+   every clip in every other lane, are untouched — no ripple beyond the
+   run, no change to any other lane's absolute timing. The run's total
+   occupied span does not change, since nothing new was added, only
+   reordered. (A target seam that isn't part of any flush run containing
+   the clip's old slot was already excluded from being a valid target in
+   step 2.)
+4. **Neither swap nor a magnet hit** — `pendingTarget = null`, free
+   placement, byte-identical to today's behavior (subject to the alt-key
+   rule above).
+5. Arrow-key nudge (piece 3) never goes through any of the above — it is
+   always a raw ±1-frame move with no magnet, no swap, and no reorder,
+   which is how a crossfade or a deliberate gap gets authored under this
+   design: mouse drag near another clip always resolves to
+   flush-or-swap-or-reorder-or-free; only the keyboard makes an
+   intentional overlap or gap.
 
-4. **If dropped on a same-lane seam that is not adjacent to the dragged
-   clip's current slot** (i.e., there is at least one other clip between
-   the old slot and the target): this is the general **move-within-lane**
-   reorder that piece 2's swap is a special case of. On drop: extract the
-   clip from its current slot; every clip strictly between the old slot
-   and the target seam, in that same lane only, shifts by exactly the
-   moved clip's duration, in the direction that closes the vacated slot
-   and opens the target one. Clips outside that window, and every clip in
-   every other lane, are untouched — no ripple beyond the window, no
-   change to any other lane's absolute timing. The lane's total occupied
-   span does not change, since nothing new was added, only reordered.
-5. **Neither** — free placement, byte-identical to today's behavior
-   (subject to the alt-key rule above).
-6. Arrow-key nudge (piece 3) never goes through any of the above — it is
-   always a raw ±1-frame move with no magnet and no reorder, which is how
-   a crossfade or a deliberate gap gets authored under this design: mouse
-   drag near another clip always resolves to flush-or-swap-or-far-move;
-   only the keyboard makes an intentional overlap or gap.
+**The swap commit itself**, given clips `A` (moves first, at drop) and `B`
+(currently flush after it, i.e. `B.t == A.t + A.dur` before the swap): the
+result must occupy exactly the same combined span `[A.t, A.t + A.dur +
+B.dur]` as before, in the opposite order. That is **not** "trade `t`" —
+trading raw `t` values only preserves the span when the two durations are
+equal, and this design explicitly expects them not to be. The correct
+commit, from a snapshot of both clips' original `t`/duration taken before
+either is touched: `B.t = A.t_old; A.t = A.t_old + B.dur_old`. (Read
+generally — whichever of the pair sits earlier keeps that earlier clip's
+old start for whichever clip ends up first, and the one that ends up
+second starts immediately after, using the *other* clip's original
+duration. The order in the file above assumed `A` was earlier; if the
+dragged clip was the *later* of the pair, swap the roles.)
 
-Step 2 (seam-land) needs no new gating — it is still a single clip's `t`
-following the pointer, already covered continuously by the existing
-`keepIfLegal()` loop during the drag (`ui.html:1239`), same as any other
-free move.
+`pendingTarget` on `pointercancel` is handled identically to
+`pointerup` — that handler is already shared (`ui.html:1032`) specifically
+so a lost gesture (alt-tab, a touch becoming a scroll) doesn't leave
+`DRAGGING` stuck, and a cancelled plain move already commits wherever it
+last was rather than reverting to the drag's start. Swap and reorder
+follow the same existing convention rather than inventing a new
+revert-on-cancel rule — and are protected the same way a cancelled plain
+move already is, by the legality gate below, which applies regardless of
+which of the two events ends the gesture.
 
-**Steps 3 and 4 (swap, move-within-lane) are a different shape of commit —
-two or more clips' `t` values change at once, at drop, with no
-continuous per-pointermove preview of the combined result — so each needs
-its own gate, the same way `insertAt()` already gates its own commit**
-(`ui.html:1377-1389`): snapshot every `t` about to change, apply all of
-them, call `timelineFault()` once, and on a fault revert every one of them
-and `note()` the reason instead of landing the change. Same-lane
+**Seam-land (step 2's first branch) needs no new gating** — it is still a
+single clip's `t` following the pointer, already covered continuously by
+the existing `keepIfLegal()` loop during the drag (`ui.html:1239`), same
+as any other free move.
+
+**Swap and reorder are a different shape of commit — two or more clips'
+`t` values change at once, at drop, with no continuous per-pointermove
+preview of the combined result — so each needs its own gate, the same way
+`insertAt()` already gates its own commit** (`ui.html:1377-1389`):
+snapshot every `t` about to change, apply all of them, call
+`timelineFault()` once, and on a fault revert every one of them and
+`note()` the reason instead of landing the change. Same-lane
 span-invariance for a swap does not guarantee legality — a swap between
 two different-duration clips can incidentally nest one of them inside an
 unrelated clip on **another** lane, since the renderer's overlap check is
-lane-blind. Move-within-lane (step 4) has the identical exposure for the
-same reason. Free placement (step 5) is already continuously gated by the
-existing `keepIfLegal()` loop during the drag and needs no new gate.
+lane-blind. Reorder has the identical exposure for the same reason. Free
+placement (step 4) is already continuously gated by the existing
+`keepIfLegal()` loop during the drag and needs no new gate.
 
 Hover highlighting cannot call `draw()` — nothing may repaint while a drag
-is live (`ui.html:2086-2088`) — so it is applied and cleared via direct
+is live (`ui.html:2070-2072`) — so it is applied and cleared via direct
 `classList` manipulation on the existing card elements, matching how
 `showSeam()`'s `mark()` already avoids rebuilding a selector out of a uid
 (`ui.html:1353-1358`); follow that pattern, not the drag handler's
@@ -187,14 +255,14 @@ element/label — it must not reuse `showSeam()` as-is, since that function
 hard-codes the text "insert here" and a crossfade-fit badge that are both
 meaningless for a reorder that inserts nothing.
 
-The window `blur` handler that resets `DRAGGING` (`ui.html:2113`) is
+The window `blur` handler that resets `DRAGGING` (`ui.html:2129`) is
 extended to also clear any move-path highlight, so a lost gesture (alt-tab,
 a touch becoming a scroll) never strands one on screen.
 
-After a swap or move-within-lane commits, re-show the clip head for the
-clip that was dragged (`showClipHead`) rather than calling `scrubTo()` —
-`scrubTo()` clears `HEAD_UID` via `paint()` (`ui.html:1613`) and would
-flip the monitor off the clip just placed.
+The existing `onpointerup` already ends with `draw(); save(); inspect(c);`
+(`ui.html:1047`), and `inspect()` already re-shows the clip head
+(`showClipHead`, `ui.html:1840`) — no extra repaint call is needed after a
+swap or reorder commits; it falls out of the handler's existing tail.
 
 ## 3. Arrow-key clip nudge
 
@@ -221,20 +289,31 @@ In the keydown handler (`ui.html:2052` on):
   become the one path that freely builds a nested clip.
 - **Debounce the resulting `save()`** by ~300ms trailing. Every landed
   save writes a server-side snapshot pair (`_commit()`), and the undo list
-  is derived from those snapshots (`ui.html:1940-1960`); holding an arrow
+  is derived from those snapshots (`ui.html:1959-1977`); holding an arrow
   for a second without debouncing would write dozens of undo entries for
   one held gesture, and ⌘Z would then walk back one frame at a time
-  through all of them, permanently, for that project.
+  through all of them, permanently, for that project. `save()` also
+  invalidates the undo cache (`invalidateUndo()`, `ui.html:731`); the
+  debounce must be **flushed** (its trailing save forced through
+  immediately) before ⌘Z/⌘⇧Z can run, before any other code path calls
+  `save()`, and on blur/unload — otherwise an in-flight nudge inside the
+  debounce window can be silently overwritten by a restore.
 - Do not call `inspect()` per keypress — it moves `CLOCK` to the clip and
-  reseeks the monitor (`ui.html:1855-1858`). Update the inspector's
+  reseeks the monitor (`ui.html:1836-1840`). Update the inspector's
   position field (`#f-t`) directly instead.
 - Nudging touches `t` only, so the razor's two-grid constraint on `in`
   at rate ≠ 1 (`seamFor()`, `ui.html:1122-1134`) does not apply here —
   noted so nobody goes looking for it.
-- Update the header's keyboard tip (`ui.html:314`, currently
+- Update the header's keyboard tip (`ui.html:312`, currently
   `← → one frame` unconditionally) and the clip card's `title` string
   (`ui.html:931`) to reflect that arrows move the clip when one is
   selected. The UI's own text is part of this change, not an afterthought.
+- **Known, accepted cost**: with a clip selected, plain-frame playhead
+  scrubbing via the arrow keys is unavailable until the clip is
+  deselected (Escape, or clicking empty timeline) — confirmed as the
+  intended behavior despite this firing often (any click selects a clip;
+  the razor auto-selects the cut's right half after every cut,
+  `ui.html:1167`). Not a gap to fix, a trade-off made knowingly.
 
 ## 4. Media-pool insert
 
@@ -250,18 +329,24 @@ New, independent of pieces 1–4.
 
 - **Cmd+C**, with a selection and not `DRAGGING`: structural-clone every
   own property of each selected clip via `{...c, uid: newUid-withheld}` —
-  not an enumerated field list (`rebaseOnto()`, `ui.html:592`, is the
-  standing example of what an enumerated list costs when a field is added
-  later) — into a module-level `CLIPBOARD` array. No persistence across
+  not an enumerated field list (`razor()`'s own `{...c, uid:newUid(), …}`
+  at `ui.html:1156` is the standing example of a spread-clone; an
+  enumerated list is what breaks silently the next time a clip field is
+  added) — into a module-level `CLIPBOARD` array. No persistence across
   reload, no system-clipboard integration. Do not `preventDefault()` when
   nothing is selected, so a plain Cmd+C with no clip selected still lets
   the browser do whatever it would otherwise do.
 - **Cmd+V**, with a non-empty `CLIPBOARD` and not `DRAGGING`: create fresh
   clips with `newUid()` for each copied clip, keeping their original lanes
-  and relative time offsets from each other. Anchor the earliest copied
-  clip's `t` on `frameSnap(CLOCK)` (not raw `CLOCK`), so the paste lands on
-  the exact frame the monitor is showing and is on-grid both locally and
-  on disk.
+  and relative time offsets from each other. **Anchor on `frameSnap(CLOCK)`,
+  unless that would collide with the exact source clip(s) just copied** —
+  the ordinary case of select, Cmd+C, Cmd+V with the playhead untouched,
+  since selecting a clip parks `CLOCK` on it (`inspect()`, `ui.html:1838`).
+  In that case, anchor instead immediately after the latest end-time among
+  the *originally copied* clips (flush, on the same lane(s)) — matching
+  "duplicate" in most editors: copy something, paste, get an adjacent copy,
+  with no extra step. Copy, move the playhead elsewhere, then paste still
+  anchors at `frameSnap(CLOCK)` as the general case.
   - **Filter against live media before pasting**: a clipboard entry whose
     `mid` no longer exists in `MEDIA` (the source was removed after copy,
     which cascade-deletes clips but not clipboard entries) is dropped from
@@ -287,33 +372,53 @@ New, independent of pieces 1–4.
 
 ## 6. Testing
 
-Mark the shared `magnet()` function and the move-within-lane / swap commit
-logic with their own `// >>> name` / `// <<< name` comment pair(s),
-following the exact convention already used for `seam-pick`
-(`test_server.py:1724-1730` extracts that region verbatim and pipes it
-through `node`, skipping with a printed message if `shutil.which("node")`
-is `None`). Do not touch the existing `seam-pick` markers or
-`nearestPoint()`'s name/signature — an existing test depends on both.
+As established in piece 1, `magnet()` lives inside the existing
+`// >>> seam-pick` / `// <<< seam-pick` region (`test_server.py:1724-1730`
+extracts that region verbatim and pipes it through `node`, skipping with a
+printed message if `shutil.which("node")` is `None`) — no new marker pair
+for it, and the existing test's assertions and harness inputs are
+unchanged since `nearestPoint()`'s name, signature, and behavior are
+unchanged.
+
+The move-path target resolution (the swap/reorder/seam-land decision) and
+the swap/reorder commit logic get their **own** `// >>> move-target` /
+`// <<< move-target` marker pair, placed immediately after the `seam-pick`
+region. Its test harness extracts **both** regions (seam-pick, then
+move-target) and concatenates them before running under `node`, so
+`magnet()` is already in scope for the move-target logic to call.
 
 New coverage needed, run the same way:
 
-- Magnet radius is capped at 0.125s regardless of zoom, at every step in
-  `ZOOMS` — a 0.25s (or larger) deliberate crossfade drag must remain
-  authorable at every zoom level.
-- The dragged clip's own points are excluded from its candidate set.
-- Swap of two flush, unequal-duration same-lane clips leaves nothing
-  after them moved, in that lane or any other.
+- At the lowest zoom (`PX = 6`), the move-path magnet radius is small
+  (pixel-floored, not zero) but a 0.25s or larger deliberate crossfade
+  drag still lands as a crossfade, not a flush snap. At 64px/s and above,
+  the radius is a clean 0.125s.
+- `nearestPoint()` (bin-drop) is unaffected: `test_server.py:1767` and
+  `1787`'s existing assertions still hold with no changes.
+- The dragged clip's own points are excluded from the move-path candidate
+  set.
+- Swap of two flush, unequal-duration same-lane clips: verify the actual
+  commit formula (`B.t = A.t_old; A.t = A.t_old + B.dur_old`), not just
+  that "nothing after them moved" — a wrong formula that still happens to
+  leave the tail alone should still fail this test on the swapped clips'
+  own positions.
 - Swap that would nest one clip inside a clip on another lane is refused
   and reverted, with both original `t` values intact afterward.
-- Move-within-lane to a distant seam shifts only the clips strictly
-  between old and new position, in that lane, and leaves every other lane
-  untouched.
+- Reorder to a distant seam within the same flush run shifts only the
+  clips strictly between old and new position, in that lane, and leaves
+  every other lane untouched.
+- A seam beyond a gap or an existing crossfade (outside the current flush
+  run) is never offered as a reorder target.
 - Nudge arithmetic stays exactly on the frame grid after many consecutive
   presses (no float drift).
 - Nudge respects the group-delta clamp (doesn't stack a group at zero).
+- Paste anchors flush after the copied clip(s) when the playhead is still
+  parked on the source; anchors at `frameSnap(CLOCK)` when the playhead
+  has moved elsewhere.
 - Paste drops a clipboard entry whose media was removed, with a note.
-- Paste of a clip onto its own former instant is refused (video) /
-  permitted (audio stem), matching `timelineFault()`'s existing rule.
+- Paste of a clip onto its own former instant (general case, playhead
+  moved back to that instant) is refused (video) / permitted (audio stem),
+  matching `timelineFault()`'s existing rule.
 
 ## Non-goals (this design)
 
