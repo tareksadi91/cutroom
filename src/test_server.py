@@ -1811,6 +1811,111 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_magnet_seconds_cap_is_optional_and_tighter_wins():
+    """magnet() is nearestPoint()'s radius math pulled out to a pure function,
+    plus one new optional rule: a caller can also cap the radius in seconds,
+    and whichever of the pixel/gap-share/seconds caps is tightest wins.
+
+    nearestPoint() must keep calling it with no seconds cap at all, so its own
+    radius is completely unchanged — this test proves the new parameter is
+    opt-in, not a change to the existing formula.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> seam-pick")
+    b = html.index("// <<< seam-pick")
+    region = html[a:b]
+    assert "function magnet(" in region, "magnet() must live inside the seam-pick region"
+    assert "function nearestPoint" in region, "the seam-pick markers moved"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; magnet() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 6;
+let DOC = {fps: 24, clips: []};
+function insertPoints() { return []; }   // unused by this test, magnet() only
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Two points 10 seconds apart, at 10px/s (100px apart on screen).
+const points = [{t: 0, tag: 'a'}, {t: 10, tag: 'b'}];
+
+// No secondsCap: behaves exactly like today's fixed pixel/gap-share math.
+// SEAM_GRAB_PX=14, gap-share=0.25 of 100px=25px -> radius is 14px = 1.4s.
+let r = magnet(1.3, points, 10, null);
+if (!r || r.tag !== 'a') fail('no-cap: expected to snap to a within 1.4s, got ' + JSON.stringify(r));
+r = magnet(1.5, points, 10, null);
+if (r !== null) fail('no-cap: 1.5s away should be outside the 1.4s pixel-cap radius');
+
+// secondsCap = 0.125: even though the pixel/gap-share caps would allow 1.4s,
+// the seconds cap is tighter and must win.
+r = magnet(0.1, points, 10, 0.125);
+if (!r || r.tag !== 'a') fail('secondsCap: expected to snap within 0.125s, got ' + JSON.stringify(r));
+r = magnet(0.2, points, 10, 0.125);
+if (r !== null) fail('secondsCap: 0.2s away should be outside a 0.125s cap');
+
+// At a high enough zoom the pixel cap (14px) is tighter than a 0.125s seconds
+// cap (0.125*120=15px) -- whichever is tighter wins, not always the seconds
+// one. Prove it by bracketing the PIXEL cap's own edge (14px), not the
+// seconds cap's -- a point outside 14px but still inside 15px must be null,
+// or the seconds cap would be winning instead of the pixel one.
+r = magnet(13.5/120, points, 120, 0.125);   // 13.5px away, inside the 14px pixel cap
+if (!r) fail('13.5px should be inside the 14px pixel cap');
+r = magnet(14.5/120, points, 120, 0.125);   // 14.5px away: outside 14px, inside 15px
+if (r !== null) fail('14.5px should be null -- the tighter 14px pixel cap must bind, not the 15px seconds cap');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "magnet.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_move_magnet_cap_matches_every_zoom_step():
+    """The move-path's own radius (max(0.125s, 3px worth of seconds)), worked
+    out against every real ZOOMS step. See the design spec piece 1 for why
+    these exact numbers: 6px/s and 10px/s exceed one grid cell (0.25s) on
+    purpose -- Alt-held-drag is the safety net there, not this radius.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> seam-pick")
+    b = html.index("// <<< seam-pick")
+    region = html[a:b]
+    assert "function moveMagnetCap(" in region, "moveMagnetCap() must live inside the seam-pick region"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; moveMagnetCap() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 6;
+let DOC = {fps: 24, clips: []};
+function insertPoints() { return []; }
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+const ZOOMS = [6, 10, 18, 34, 64, 120];
+const expected = [0.5, 0.3, 0.16666666666666666, 0.125, 0.125, 0.125];
+ZOOMS.forEach((px, i) => {
+  const got = moveMagnetCap(px);
+  if (Math.abs(got - expected[i]) > 1e-9)
+    fail(`at ${px}px/s expected cap ${expected[i]}, got ${got}`);
+});
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "cap.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     """Run the real clamp out of ui.html, against the real fault check.
 

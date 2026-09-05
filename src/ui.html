@@ -1305,27 +1305,36 @@ const SEAM_GRAB_PX = 14;
 // bounding a gap claim half of it between them and the middle half is free —
 // the rule stated in one sentence, and it holds at every zoom.
 const SEAM_GRAB_SHARE = 0.25;
-function nearestPoint(t, pxPerSecond) {
+// The pure radius rule nearestPoint() already enforces (merge points inside
+// one rendered pixel, cap by a share of the gap to the next point, cap by
+// SEAM_GRAB_PX), plus one optional rule: a caller can ALSO cap the radius in
+// seconds. Passing no secondsCap reproduces nearestPoint()'s exact existing
+// radius -- this function must not change what nearestPoint() does.
+function magnet(t, points, pxPerSecond, secondsCap) {
   const px = pxPerSecond || PX;
-  // Two insert points closer together than one rendered pixel are the same
-  // place as far as a cursor is concerned. Left separate they drive each
-  // other's radius toward zero and BOTH become untargetable — a cut with two
-  // clips a single frame apart had a seam that could not be hit at all. The
-  // earlier of the two wins, so the choice is deterministic.
-  const pts = insertPoints()
-    .sort((a,b)=>a.t-b.t)
-    .filter((p,i,all) => i === 0 || (p.t - all[i-1].t) * px > 1);
+  const pts = points
+    .slice()
+    .sort((a, b) => a.t - b.t)
+    .filter((p, i, all) => i === 0 || (p.t - all[i - 1].t) * px > 1);
   if (!pts.length) return null;
-  const near = pts.reduce((a,b)=> Math.abs(b.t-t) < Math.abs(a.t-t) ? b : a);
-  // ⚠️ A FIXED PIXEL RADIUS IS NOT ENOUGH ON ITS OWN. Zoomed out to 6px/s the
-  // cut's seams sit about 28px apart, so two 14px radii meet in the middle and
-  // every point on the timeline still belongs to some seam — the same bug in a
-  // narrower coat. Cap the radius at a share of the distance to the next seam
-  // so a free zone always exists, however far out the zoom goes.
+  const near = pts.reduce((a, b) => Math.abs(b.t - t) < Math.abs(a.t - t) ? b : a);
   const gapPx = pts.reduce((m, p) =>
     p === near ? m : Math.min(m, Math.abs(p.t - near.t) * px), Infinity);
-  const radius = Math.min(SEAM_GRAB_PX, gapPx * SEAM_GRAB_SHARE);
+  let radius = Math.min(SEAM_GRAB_PX, gapPx * SEAM_GRAB_SHARE);
+  if (secondsCap != null) radius = Math.min(radius, secondsCap * px);
   return Math.abs(near.t - t) * px <= radius ? near : null;
+}
+// The move path's own radius cap, in seconds: see the design spec piece 1 for
+// the full derivation. 0.125s (half the 0.25s drag grid) is the target from
+// 18px/s up; a 3px pixel floor keeps the magnet from going fully inert at the
+// low zoom this tool actually opens a multi-minute cut to (6-10px/s), at the
+// KNOWN, ACCEPTED cost that a small deliberate crossfade needs Alt held at
+// those zooms -- see Task 5's wiring of ev.altKey.
+function moveMagnetCap(pxPerSecond) {
+  return Math.max(0.125, 3 / pxPerSecond);
+}
+function nearestPoint(t, pxPerSecond) {
+  return magnet(t, insertPoints(), pxPerSecond || PX, null);
 }
 // <<< seam-pick
 function clearSeam() {
