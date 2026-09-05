@@ -1916,6 +1916,138 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_move_candidates_excludes_selection_and_uses_non_selected_end():
+    """The move-path candidate set is scoped to one lane, excludes every
+    selected clip (not just the lead), and its 'end of the lane' synthetic
+    point is the latest end among the clips that remain -- never totalLen(),
+    which would make the dragged clip's own moving end a candidate against
+    itself whenever it's the last clip in the cut.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function moveCandidates(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; moveCandidates() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: [
+  {uid:'a', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'b', t:2, in:0, out:3, rate:1, lane:0},
+  {uid:'c', t:5, in:0, out:1, rate:1, lane:0},          // last clip in lane 0
+  {uid:'x', t:0, in:0, out:9, rate:1, lane:1},           // different lane
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Dragging 'c' (the last clip): its own moving end must NOT be a candidate.
+const cands = moveCandidates(new Set(['c']), 0);
+if (cands.some(p => p.clip && p.clip.uid === 'c'))
+  fail('dragged clip must be excluded from its own candidate set');
+const endCand = cands.find(p => p.clip === null && p.edge === null && p.t > 0);
+if (!endCand || Math.abs(endCand.t - 5) > 1e-9)
+  fail('end-of-lane candidate must be the latest end among non-dragged clips (5), got ' +
+       (endCand && endCand.t));
+
+// Only lane 0's clips are candidates -- lane 1's clip must not appear.
+if (cands.some(p => p.clip && p.clip.uid === 'x'))
+  fail('candidates must be scoped to the current drop lane only');
+
+// Every remaining clip contributes both a start and an end candidate.
+const aStarts = cands.filter(p => p.clip && p.clip.uid === 'a' && p.edge === 'start');
+const aEnds   = cands.filter(p => p.clip && p.clip.uid === 'a' && p.edge === 'end');
+if (aStarts.length !== 1 || aEnds.length !== 1)
+  fail('expected exactly one start and one end candidate per remaining clip');
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "candidates.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_flush_run_chains_outward_and_stops_at_a_gap_or_crossfade():
+    """A flush run is the maximal chain of same-lane clips touching the
+    dragged clip's own original span with zero gap and zero overlap in
+    either direction -- a gap OR an existing crossfade both break the chain,
+    since both are excluded by the spec ('no gaps, no existing crossfades').
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function flushRun(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; flushRun() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+// A[0,2] flush B[2,5] flush C[5,6], then a GAP, then D[8,9] flush E[9,10].
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:2, in:0, out:3, rate:1, lane:0},
+  {uid:'C', t:5, in:0, out:1, rate:1, lane:0},
+  {uid:'D', t:8, in:0, out:1, rate:1, lane:0},
+  {uid:'E', t:9, in:0, out:1, rate:1, lane:0},
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Dragging B (t=2, dur=3): the run must include A and C but stop before the
+// gap at 6-8, and must NOT include D or E.
+const run = flushRun(2, 3, 0, 'B');
+const ids = run.members.map(c => c.uid).sort();
+if (ids.join(',') !== 'A,C') fail('expected members [A,C], got [' + ids.join(',') + ']');
+if (Math.abs(run.start - 0) > 1e-9 || Math.abs(run.end - 6) > 1e-9)
+  fail('expected run bounds [0,6], got [' + run.start + ',' + run.end + ']');
+
+// Dragging D (t=8, dur=1): its run is just itself + E, independent of the
+// first run across the gap.
+const run2 = flushRun(8, 1, 0, 'D');
+if (run2.members.map(c=>c.uid).join(',') !== 'E')
+  fail('expected members [E], got [' + run2.members.map(c=>c.uid).join(',') + ']');
+if (Math.abs(run2.start - 8) > 1e-9 || Math.abs(run2.end - 10) > 1e-9)
+  fail('expected run bounds [8,10], got [' + run2.start + ',' + run2.end + ']');
+
+// A clip with no flush neighbor at all is a run of one.
+DOC.clips = [{uid:'lone', t:3, in:0, out:2, rate:1, lane:0}];
+const run3 = flushRun(3, 2, 0, 'lone');
+if (run3.members.length !== 0) fail('a lone clip must have zero members');
+if (Math.abs(run3.start - 3) > 1e-9 || Math.abs(run3.end - 5) > 1e-9)
+  fail('a lone clip run must be exactly its own span');
+
+// An existing CROSSFADE (overlap) between the dragged clip and a neighbor
+// breaks the chain just like a gap does.
+DOC.clips = [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:1.5, in:0, out:3, rate:1, lane:0},   // overlaps A by 0.5s
+];
+const run4 = flushRun(1.5, 3, 0, 'B');
+if (run4.members.length !== 0)
+  fail('an existing crossfade must break the flush chain, got members ' +
+       run4.members.map(c=>c.uid).join(','));
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "flushrun.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     """Run the real clamp out of ui.html, against the real fault check.
 

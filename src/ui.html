@@ -1337,6 +1337,54 @@ function nearestPoint(t, pxPerSecond) {
   return magnet(t, insertPoints(), pxPerSecond || PX, null);
 }
 // <<< seam-pick
+// >>> move-target
+// ── existing-clip drag: snap-to-abut, swap, and same-lane reorder ─────────
+// See docs/superpowers/specs/2026-09-05-clip-drag-and-clipboard-design.md.
+//
+// Every clip's start and end, in ONE lane, excluding the clips currently
+// being dragged. Two synthetic points -- 0, and the latest end among the
+// clips that remain -- round the set out the same way insertPoints() adds
+// an append point. ⚠️ NEVER totalLen(): it maxes over EVERY clip including
+// the dragged one, which would make a clip's own moving end a zero-distance
+// candidate against itself whenever it is the last clip in the lane.
+function moveCandidates(excludeUids, lane) {
+  const rest = DOC.clips.filter(c => c.lane === lane && !excludeUids.has(c.uid));
+  const pts = [];
+  for (const c of rest) {
+    pts.push({t: c.t, clip: c, edge: 'start'});
+    pts.push({t: endOf(c), clip: c, edge: 'end'});
+  }
+  pts.push({t: 0, clip: null, edge: null});
+  const latestEnd = rest.length ? Math.max(...rest.map(endOf)) : 0;
+  pts.push({t: latestEnd, clip: null, edge: null});
+  return pts;
+}
+// The maximal chain of same-lane clips touching the dragged clip's own
+// ORIGINAL span with zero gap and zero overlap, extended outward in both
+// directions. A gap OR an existing crossfade both break the chain -- this
+// mirrors "no gaps, no existing crossfades" in the design spec exactly.
+// `members` never includes the dragged clip itself (it is not a real,
+// unmoved member of anything during its own drag); `start`/`end` DO include
+// its original span, since that is where the chain starts growing from.
+function flushRun(originalT, originalDur, lane, excludeUid) {
+  const E = 1e-6;
+  const rest = DOC.clips.filter(c => c.lane === lane && c.uid !== excludeUid)
+                        .sort((a, b) => a.t - b.t);
+  const members = [];
+  let start = originalT, end = originalT + originalDur;
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const c of rest) {
+      if (members.includes(c)) continue;
+      if (Math.abs(c.t - end) < E) { members.push(c); end = endOf(c); grew = true; }
+      else if (Math.abs(endOf(c) - start) < E) { members.push(c); start = c.t; grew = true; }
+    }
+  }
+  members.sort((a, b) => a.t - b.t);
+  return {members, start, end};
+}
+// <<< move-target
 function clearSeam() {
   SEAM = null;
   document.querySelectorAll('.seam').forEach(n=>n.remove());
