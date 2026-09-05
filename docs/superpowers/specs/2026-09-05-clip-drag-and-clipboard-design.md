@@ -67,9 +67,11 @@ gap to the next point, cap it at `SEAM_GRAB_PX` pixels — plus one new,
 *optional* rule, active only when a caller passes `secondsCap`:
 
 - **`nearestPoint()` passes no `secondsCap` and is byte-for-byte unchanged**
-  — same formula, same radius, same two existing tests
-  (`test_server.py:1767`, `1787`) still pass untouched. Bin-drop keeps its
-  current, already-correct behavior; this design does not touch it.
+  — same formula, same radius; both assertions in the existing
+  `test_a_bin_drop_only_snaps_to_a_seam_you_are_pointing_at`
+  (`test_server.py:1714`, its two checks at `1767` and `1787`) still pass
+  untouched. Bin-drop keeps its current, already-correct behavior; this
+  design does not touch it.
 - **The move path (piece 2) passes `secondsCap = max(0.125s, 3px worth of
   seconds at the current zoom)`.** Plain drags already quantize to the
   0.25s grid (`snap()`, `ui.html:422`, applied at `ui.html:992`), so coarse
@@ -93,27 +95,34 @@ gap to the next point, cap it at `SEAM_GRAB_PX` pixels — plus one new,
   about that rather than implying one constant solves it: **snapping onto
   a specific frame-exact seam is a task the tool already expects zoom for**
   (the razor's own frame-vs-grid distinction, `ui.html:1112-1115`, already
-  assumes this). At 64px/s and above the cap is a clean 0.125s in every
-  case, which is the only zoom range this feature is meant to feel exact
-  at.
+  assumes this). Between 64px/s and 100px/s the cap is a clean 0.125s. At
+  120px/s — the top `ZOOMS` step — 0.125s of screen space is 15px, one
+  more than `SEAM_GRAB_PX` (14px, `ui.html:1292`), so the existing pixel
+  cap binds there instead and the effective radius is 14/120 ≈ 0.117s, not
+  0.125s. Both caps stay in force at every zoom; whichever is tighter at
+  that zoom wins.
 
 `magnet()` is defined **inside** the existing `// >>> seam-pick` /
-`// <<< seam-pick` region (`ui.html:1723-1726` extracts it verbatim for
-testing), placed immediately before `nearestPoint()`, which becomes a thin
-wrapper calling `magnet(t, insertPoints(), px, null)`. It does not get its
-own marker pair — the seam-pick region simply grows to include it, so the
-existing extraction test keeps working with no changes to its harness, and
-a future move-path test (piece 6) that also needs `magnet()` in scope can
-extract the same region.
+`// <<< seam-pick` region (`test_server.py:1723-1726` extracts it verbatim
+for testing), placed immediately before `nearestPoint()`, which becomes a
+thin wrapper calling `magnet(t, insertPoints(), px, null)`. It does not
+get its own marker pair — the seam-pick region simply grows to include
+it, so the existing extraction test keeps working with no changes to its
+harness, and a future move-path test (piece 6) that also needs `magnet()`
+in scope can extract the same region.
 
 The move path calls the same `magnet()` with its own candidate set: every
-non-dragged, non-selected clip's `t` **and** its end (`t + dur(c)`), plus 0
-and the end of the cut. Candidates are computed fresh from `DOC.clips`
-each call, excluding every uid in `selected()` — **not just `SEL`** — so
-the dragged clip (and the rest of a multi-selection, where applicable) is
-never a candidate for its own magnet. Missing this exclusion makes the
-magnet a no-op that snaps a clip to where it already is, since it's always
-the nearest point to itself.
+clip's `t` **and** its end (`t + dur(c)`) **for clips in the current drop
+lane**, plus 0 and the latest end-time among those same non-selected,
+same-lane clips (**not** `totalLen()`, which maxes over every clip
+including the dragged one — using it verbatim would make the dragged
+clip's own moving end a zero-distance candidate against itself whenever
+it's the last clip in the cut, pinning it in place). Candidates are
+computed fresh from `DOC.clips` each call, excluding every uid in
+`selected()` — **not just `SEL`** — so the dragged clip (and the rest of a
+multi-selection, where applicable) is never a candidate for its own
+magnet. Missing this exclusion makes the magnet a no-op that snaps a clip
+to where it already is, since it's always the nearest point to itself.
 
 `ev.altKey` suppresses the magnet on the move path exactly as it already
 does on the bin-drop path (`ui.html:1404`, `1435`) and inside the move
@@ -148,37 +157,45 @@ existing free-move commit already does for `c.t`:
    fixed candidates: highlight that candidate's entire body, and set
    `pendingTarget = {type:'swap', clip: thatCandidate}`.
 
-   If the drag has moved the clip to a **different lane** than it started
-   in (`lane !== lane0`), swap is never offered for the remainder of that
-   gesture — the fixed candidates belonged to the starting lane, and
-   "swap" has no meaning once the clip is no longer there. Falls through
-   to step 2.
+   The **first** time a gesture's drop lane differs from `lane0`, latch
+   swap off for the rest of that gesture (a sticky flag, checked once it
+   trips — not re-evaluated as `lane !== lane0` on every pointermove,
+   which would silently re-offer swap if the pointer wanders back to
+   `lane0` later in the same drag). The fixed candidates belonged to the
+   starting lane and may no longer be flush against anything by the time
+   the pointer returns. Once latched off, falls through to step 2 for the
+   remainder of the gesture.
 
    Only offered when `selected().length === 1`; a multi-selection drag
    never sets a swap target — see Non-goals.
 
 2. **Otherwise, test both the dragged clip's proposed start and its
    proposed end** against `magnet()`'s move-path candidate set (built from
-   the *current* drop lane, not necessarily `lane0`), and take whichever
-   of the two is nearer to a candidate. (Not "whichever edge faces the
-   direction of travel" — that rule breaks down under small jitters and
-   gives the wrong answer for a clip being nudged back toward a seam it
-   just left.) If a candidate is within the capped radius:
-   - If that seam sits at the boundary of the **contiguous flush run**
-     (no gaps, no existing crossfades) that currently contains the
-     dragged clip's own slot — including the trivial case where the seam
-     *is* one of the clip's own current edges, i.e. it hasn't effectively
-     moved — set `pendingTarget = {type:'seam', point}`. On drop this
-     commits as an ordinary move, `c.t` set so the nearer edge lands
-     exactly on the seam. No ripple: this is the *existing* free move,
-     made precise instead of pixel-guesswork.
-   - If that seam is **outside** the clip's current flush run (there's a
-     gap or a crossfade somewhere between the clip's old slot and the
-     target, in that lane), set `pendingTarget = {type:'reorder', point}`
-     — see step 3. A seam on the *far side* of a gap or crossfade cannot
-     be reached by sliding a flush run without also disturbing that gap
-     or crossfade, so reaching it is only meaningful as a reorder, never
-     as a plain seam-land.
+   clips in the *current* drop lane only — reorder and seam-land are both
+   single-lane operations; a drop near a seam in some other lane is
+   covered by case (a) below), and take whichever of the two is nearer to
+   a candidate. (Not "whichever edge faces the direction of travel" — that
+   rule breaks down under small jitters and gives the wrong answer for a
+   clip being nudged back toward a seam it just left.) If a candidate is
+   within the capped radius, classify it against the **contiguous flush
+   run** (no gaps, no existing crossfades) that currently contains the
+   dragged clip's own slot in `lane0`:
+   - **(a) The seam is one of the clip's own current edges** (it hasn't
+     effectively moved), **or it lies outside that run entirely** — beyond
+     a gap or an existing crossfade, or the drop lane isn't `lane0` at all:
+     set `pendingTarget = {type:'seam', point}`. On drop this commits as
+     an ordinary move, `c.t` set so the nearer edge lands exactly on the
+     seam. No ripple: this is the *existing* free move, made precise
+     instead of pixel-guesswork.
+   - **(b) The seam is a slot boundary *inside* that run**, other than the
+     clip's own current edges — i.e. there's at least one other clip
+     between the dragged clip's old slot and this seam, all still within
+     the same unbroken flush run: set `pendingTarget = {type:'reorder',
+     point}` — see step 3. This is the ordinary case the feature exists
+     for: reordering within an already-tight run of clips.
+
+   (The earlier draft of this spec had these two cases backwards — flagged
+   and fixed before implementation.)
 3. **Reorder** (`pendingTarget.type === 'reorder'`, set by step 2): this is
    the general **move-within-lane** operation swap is a special case of.
    On drop: extract the clip from its current slot; every clip strictly
@@ -189,9 +206,9 @@ existing free-move commit already does for `c.t`:
    every clip in every other lane, are untouched — no ripple beyond the
    run, no change to any other lane's absolute timing. The run's total
    occupied span does not change, since nothing new was added, only
-   reordered. (A target seam that isn't part of any flush run containing
-   the clip's old slot was already excluded from being a valid target in
-   step 2.)
+   reordered. (A target seam outside the run the clip's old slot belongs
+   to — beyond a gap, beyond a crossfade, or in another lane — is
+   classified as case (a) in step 2, a plain seam-land, never a reorder.)
 4. **Neither swap nor a magnet hit** — `pendingTarget = null`, free
    placement, byte-identical to today's behavior (subject to the alt-key
    rule above).
@@ -268,13 +285,16 @@ swap or reorder commits; it falls out of the handler's existing tail.
 
 In the keydown handler (`ui.html:2052` on):
 
-- If `SEL` is set, focus is not on `INPUT`, `SELECT`, or `TEXTAREA`
-  (widened from the current `INPUT`-only check — the inspector's tool
-  dropdown and the header's history dropdown are both reachable while a
-  clip is selected), and not `DRAGGING`: ArrowLeft/ArrowRight move the
-  selected clip and its whole `MULTI` group by one frame; Shift+Arrow
-  moves by one second's worth of frames (`DOC.fps` frames). No `SEL` →
-  arrows keep scrubbing the playhead exactly as today, unchanged.
+- If `SEL` is set, focus is not on `INPUT`, `SELECT`, or `TEXTAREA`, and
+  not `DRAGGING`: ArrowLeft/ArrowRight move the selected clip and its
+  whole `MULTI` group by one frame; Shift+Arrow moves by one second's
+  worth of frames (`DOC.fps` frames). No `SEL` → arrows keep scrubbing the
+  playhead exactly as today, unchanged. **This focus check is local to the
+  new nudge branch only** — a widened condition checked before deciding
+  whether to nudge, not a change to the handler's existing top-level
+  `document.activeElement.tagName==='INPUT'` early return (`ui.html:2053`).
+  Widening that shared guard would also change Space/zoom/razor/⌘Z/⌘A
+  behavior whenever a `<select>` has focus, which is out of scope here.
 - **Frame-exact arithmetic, not repeated float addition**: each press
   computes `t = (Math.round(t * DOC.fps) + dir) / DOC.fps` per clip (dir
   is ±1 or ±DOC.fps frames for Shift), rounded to 6 decimals to match
@@ -385,14 +405,19 @@ the swap/reorder commit logic get their **own** `// >>> move-target` /
 `// <<< move-target` marker pair, placed immediately after the `seam-pick`
 region. Its test harness extracts **both** regions (seam-pick, then
 move-target) and concatenates them before running under `node`, so
-`magnet()` is already in scope for the move-target logic to call.
+`magnet()` is already in scope for the move-target logic to call. The
+swap/reorder commit also calls `timelineFault()`, which is neither region
+— splice it in the same way `test_a_drag_stops_at_a_full_overlap_instead_of_nesting`
+already does (`test_server.py:1830-1831`), rather than re-deriving it.
 
 New coverage needed, run the same way:
 
 - At the lowest zoom (`PX = 6`), the move-path magnet radius is small
   (pixel-floored, not zero) but a 0.25s or larger deliberate crossfade
-  drag still lands as a crossfade, not a flush snap. At 64px/s and above,
-  the radius is a clean 0.125s.
+  drag still lands as a crossfade, not a flush snap. Between 64px/s and
+  100px/s the radius is exactly 0.125s; at 120px/s it's bounded by
+  `SEAM_GRAB_PX` instead, ≈0.117s — assert the tighter of the two caps
+  wins at every `ZOOMS` step, not a single constant everywhere.
 - `nearestPoint()` (bin-drop) is unaffected: `test_server.py:1767` and
   `1787`'s existing assertions still hold with no changes.
 - The dragged clip's own points are excluded from the move-path candidate
@@ -404,11 +429,13 @@ New coverage needed, run the same way:
   own positions.
 - Swap that would nest one clip inside a clip on another lane is refused
   and reverted, with both original `t` values intact afterward.
-- Reorder to a distant seam within the same flush run shifts only the
-  clips strictly between old and new position, in that lane, and leaves
-  every other lane untouched.
-- A seam beyond a gap or an existing crossfade (outside the current flush
-  run) is never offered as a reorder target.
+- Reorder to a seam that is *inside* the clip's own flush run (case (b))
+  shifts only the clips strictly between old and new position, in that
+  lane, and leaves every other lane untouched.
+- A seam beyond a gap, beyond an existing crossfade, or in another lane
+  (case (a)) always classifies as a plain seam-land, never a reorder —
+  including when it's further from the clip's old slot than an in-run
+  seam would be.
 - Nudge arithmetic stays exactly on the frame grid after many consecutive
   presses (no float drift).
 - Nudge respects the group-delta clamp (doesn't stack a group at zero).
