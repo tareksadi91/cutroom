@@ -2048,6 +2048,172 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_find_swap_neighbors_requires_exact_flushness():
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function findSwapNeighbors(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; findSwapNeighbors() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: [
+  {uid:'A', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:2, in:0, out:3, rate:1, lane:0},     // flush after A's original slot
+  {uid:'C', t:5.1, in:0, out:1, rate:1, lane:0},   // 0.1s gap after B -- NOT flush
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Dragging B (t=2, dur=3): before=A (flush), after=C should be null (gapped).
+const n = findSwapNeighbors(2, 3, 0);
+if (!n.before || n.before.uid !== 'A') fail('expected before=A, got ' + JSON.stringify(n.before));
+if (n.after !== null) fail('expected after=null across a 0.1s gap, got ' + JSON.stringify(n.after));
+
+// Dragging A (t=0, dur=2): no clip before it at all.
+const n2 = findSwapNeighbors(0, 2, 0);
+if (n2.before !== null) fail('expected before=null at the head of the lane');
+if (!n2.after || n2.after.uid !== 'B') fail('expected after=B, got ' + JSON.stringify(n2.after));
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "neighbors.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_resolve_move_target_classification():
+    """The full swap / seam-land / reorder / free decision, against the
+    exact worked example from the design spec: run X[0,2], B[2,5], C[5,6].
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    # resolveMoveTarget() calls magnet()/moveMagnetCap(), which live in
+    # seam-pick, not move-target -- both regions must be in scope together.
+    sa, sb = html.index("// >>> seam-pick"), html.index("// <<< seam-pick")
+    ma, mb = html.index("// >>> move-target"), html.index("// <<< move-target")
+    region = html[sa:sb] + html[ma:mb]
+    assert "function resolveMoveTarget(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; resolveMoveTarget() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 34;   // a zoom step where the move-magnet cap is a clean 0.125s
+let DOC = {fps: 24, clips: [
+  {uid:'X', t:0, in:0, out:2, rate:1, lane:0},
+  {uid:'B', t:2, in:0, out:3, rate:1, lane:0},
+  {uid:'C', t:5, in:0, out:1, rate:1, lane:0},
+]};
+function insertPoints() { return []; }   // unused here, resolveMoveTarget never calls nearestPoint
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+const dur0 = 2, lane0 = 0, origT = 0;
+const swapNeighbors = findSwapNeighbors(origT, dur0, lane0);   // X has no 'before', 'after'=B
+const run = flushRun(origT, dur0, lane0, 'X');                  // members [B,C], bounds [0,6]
+
+// 1) Hovering B's body (the fixed swap neighbor) -> swap, regardless of the
+//    nearby magnet candidates.
+let res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 2.4, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: DOC.clips[1], pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'swap' || res.clip.uid !== 'B')
+  fail('expected swap with B, got ' + JSON.stringify(res));
+
+// 2) Proposed start near C's start (t=5), NOT hovering B's body -> this is a
+//    slot boundary INSIDE the run (C is a member) other than X's own edge ->
+//    reorder, landing X immediately before C (newIndex counts run members
+//    with original t < 5: just B -> newIndex=1).
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'reorder' || res.newIndex !== 1)
+  fail('expected reorder at newIndex 1, got ' + JSON.stringify(res));
+
+// 3) Proposed start near the run's own end (t=6, appending after C) ->
+//    reorder, newIndex = run.members.length (2): dragged clip goes last.
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 6.03, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'reorder' || res.newIndex !== 2)
+  fail('expected reorder at newIndex 2 (append), got ' + JSON.stringify(res));
+
+// 4) Proposed start near X's OWN original position (t=0, its own edge, run
+//    boundary equal to where it already is) -> this is a no-op reorder
+//    (newIndex identical to X's current index, 0) -- classify as 'seam',
+//    a plain positional move, never a multi-clip commit for a no-op.
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 0.02, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'seam')
+  fail('expected a plain seam-land landing back on its own original slot, got ' +
+       JSON.stringify(res));
+
+// 5) A seam candidate belonging to a DIFFERENT run entirely (across a gap)
+//    always classifies as 'seam', never 'reorder', regardless of distance.
+DOC.clips.push({uid:'D', t:9, in:0, out:1, rate:1, lane:0});   // isolated, gap after C
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 8.97, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'seam')
+  fail('a seam outside the run must classify as seam-land, got ' + JSON.stringify(res));
+
+// 6) Nothing in radius, nothing hovered -> free (null).
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 20, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (res !== null) fail('expected free placement (null), got ' + JSON.stringify(res));
+
+// 7) altKey suppresses the magnet (and therefore reorder/seam-land), but
+//    NOT swap -- swap is a deliberate whole-body hover, not a proximity
+//    magnet, and altKey never touched it in the spec.
+res = resolveMoveTarget({
+  draggedUid: 'X', origT, proposedT: 4.95, dur0, lane0, dropLane: lane0, swapNeighbors, run,
+  hoveredClip: null, pxPerSecond: PX, altKey: true});
+if (res !== null) fail('altKey must suppress the seam/reorder magnet, got ' + JSON.stringify(res));
+
+// 8) THE CASE THAT CATCHES A WRONG currentIndex FORMULA: drag the LAST, and
+// SHORTEST, member of a 3-clip run toward an EARLIER slot boundary. A[0,4],
+// B[4,4.5], C[4.5,5] flush; dragging C (dur0=0.5, origT=4.5) to land at t=4
+// (B's own start) is a real reorder -- C moves from index 2 to index 1 among
+// its run's members [A,B]. A formula that derives "current index" from
+// run.start and dur0 instead of from origT gets this wrong (it would count
+// only A, matching newIndex=1, and wrongly call it a no-op).
+DOC.clips = [
+  {uid:'A', t:0,   in:0, out:4,   rate:1, lane:0},
+  {uid:'B', t:4,   in:0, out:0.5, rate:1, lane:0},
+  {uid:'C', t:4.5, in:0, out:0.5, rate:1, lane:0},
+];
+const dur0c = 0.5, origTc = 4.5;
+const runC = flushRun(origTc, dur0c, 0, 'C');           // members [A,B], bounds [0,5]
+const swapNeighborsC = findSwapNeighbors(origTc, dur0c, 0);
+res = resolveMoveTarget({
+  draggedUid: 'C', origT: origTc, proposedT: 3.97, dur0: dur0c, lane0: 0, dropLane: 0,
+  swapNeighbors: swapNeighborsC, run: runC, hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'reorder' || res.newIndex !== 1)
+  fail('dragging the last, shortest run member to an earlier slot must reorder '
+       + '(newIndex 1), got ' + JSON.stringify(res));
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "resolve.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     """Run the real clamp out of ui.html, against the real fault check.
 

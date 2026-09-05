@@ -1384,6 +1384,68 @@ function flushRun(originalT, originalDur, lane, excludeUid) {
   members.sort((a, b) => a.t - b.t);
   return {members, start, end};
 }
+// The clip immediately before/after the dragged clip's ORIGINAL slot in
+// `lane`, kept only if it is exactly flush (zero gap, zero overlap) --
+// fixed from the drag's starting position, never recomputed against
+// wherever the pointer currently is, per the design spec.
+function findSwapNeighbors(originalT, originalDur, lane) {
+  const E = 1e-6;
+  const rest = DOC.clips.filter(c => c.lane === lane);
+  const before = rest.find(c => Math.abs(endOf(c) - originalT) < E) || null;
+  const after  = rest.find(c => Math.abs(c.t - (originalT + originalDur)) < E) || null;
+  return {before, after};
+}
+// How many places forward the dragged clip would move if reindexed to land
+// at `landT` among its own run's members (used by both the classification
+// below and commitReorder(), Task 4, so the two never compute it differently).
+function reorderIndexFor(landT, run) {
+  const E = 1e-6;
+  return run.members.filter(c => c.t < landT - E).length;
+}
+// The full swap / seam-land / reorder / free decision for one pointermove.
+// Nothing here touches the DOM or DOC beyond reading it -- `hoveredClip` is
+// supplied by the caller from its own hit-test.
+function resolveMoveTarget({draggedUid, origT, proposedT, dur0, lane0, dropLane, swapNeighbors,
+                             run, hoveredClip, pxPerSecond, altKey}) {
+  const E = 1e-6;
+  // 1) Swap: only the two fixed original neighbors, only same lane, only
+  // when the pointer is over that neighbor's own body right now.
+  if (dropLane === lane0 && hoveredClip &&
+      ((swapNeighbors.before && hoveredClip === swapNeighbors.before) ||
+       (swapNeighbors.after  && hoveredClip === swapNeighbors.after))) {
+    return {type: 'swap', clip: hoveredClip};
+  }
+  if (altKey) return null;
+  // 2) Otherwise, magnet on both of the dragged clip's proposed edges,
+  // whichever is nearer wins. The dragged clip's own uid is excluded here --
+  // without this, its own live (moving) t would be a candidate against
+  // itself, exactly the no-op-magnet bug moveCandidates() was built to avoid.
+  const cap = moveMagnetCap(pxPerSecond);
+  const cands = moveCandidates(new Set([draggedUid]), dropLane);
+  const hitStart = magnet(proposedT, cands, pxPerSecond, cap);
+  const hitEnd   = magnet(proposedT + dur0, cands, pxPerSecond, cap);
+  let hit = null, landT = null;
+  if (hitStart && hitEnd) {
+    hit = Math.abs(hitStart.t - proposedT) <= Math.abs(hitEnd.t - (proposedT + dur0))
+      ? hitStart : hitEnd;
+  } else hit = hitStart || hitEnd;
+  if (!hit) return null;
+  landT = (hit === hitStart) ? hit.t : hit.t - dur0;
+  // 3) Classify: is the landing point inside the dragged clip's own run?
+  if (dropLane !== lane0 || (landT < run.start - E) || (landT > run.end + E)) {
+    return {type: 'seam', landT};
+  }
+  const newIndex = reorderIndexFor(landT, run);
+  // How many of the run's OTHER members currently sit before the dragged
+  // clip's own ORIGINAL position -- NOT run.start, which only coincides with
+  // origT when the dragged clip happens to be first in its run. Using
+  // run.start here silently misclassifies a real reorder as a no-op
+  // whenever the dragged clip is 2nd-or-later in its run (see Task 3's own
+  // regression test for the concrete case this was wrong on).
+  const currentIndex = run.members.filter(c => c.t < origT - E).length;
+  if (newIndex === currentIndex) return {type: 'seam', landT};
+  return {type: 'reorder', run, newIndex};
+}
 // <<< move-target
 function clearSeam() {
   SEAM = null;
