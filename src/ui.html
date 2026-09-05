@@ -307,7 +307,8 @@
       <p><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> one frame ·
          <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> one second ·
          <kbd>home</kbd><kbd>end</kbd> jump ·
-         <kbd>-</kbd><kbd>=</kbd> zoom · <kbd>delete</kbd> remove a clip.</p>
+         <kbd>-</kbd><kbd>=</kbd> zoom · <kbd>delete</kbd> remove a clip ·
+         <kbd>⌘z</kbd> undo · <kbd>⇧⌘z</kbd> redo.</p>
     </span></span>
   </div>
   <div class="zone grow">
@@ -721,6 +722,7 @@ function reselect() {
     '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>';
 }
 async function save() {
+  invalidateUndo();   // a real edit — the redo half of any frozen list is now stale
   // An unresolved conflict blocks every save: the director can go on dragging
   // and nothing is lost, but the page will not write over a file it knows it
   // has not seen until "keep mine" says so.
@@ -1887,6 +1889,7 @@ HIST.onchange = async () => {
   const stamp = HIST.value;
   HIST.selectedIndex = 0;
   if (!stamp || stamp === 'history…') return;
+  invalidateUndo();   // a manual jump is a new baseline, same as any edit
   try {
     const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST', headers: wHeaders()});
     const b = await r.json();
@@ -1898,6 +1901,67 @@ HIST.onchange = async () => {
     note('restored ' + stamp, 'var(--accent)');
   } catch (e) { note('restore failed — ' + e.message, 'var(--danger)'); }
 };
+
+// >>> undo-redo
+// ── undo / redo (⌘Z / ⇧⌘Z) ──────────────────────────────────────────────
+// _commit() in server.py snapshots BOTH the state a write replaces (stamped
+// "<n>-prior") and the state that landed (stamped "<n>") — and the prior
+// snapshot is byte-identical to the PREVIOUS commit's plain one, since both
+// are just the file's content at the same instant. So the plain (non
+// "-prior") stamps alone are a complete, deduplicated, chronological list of
+// every state this project has held — exactly an undo chain, one entry per
+// commit, with no extra bookkeeping the server needs to do.
+//
+// The list is frozen the moment undo starts, not re-fetched on every press:
+// restore() is itself a normal version-guarded write, so it appends two MORE
+// snapshot entries of its own. Re-deriving the list from scratch on every
+// keypress would make undo and redo the same operation — toggling between
+// the two most recent states — instead of walking arbitrarily far back. A
+// real edit (through save()) or a manual pick from the history dropdown
+// invalidates the freeze, same as any editor drops its redo stack once you
+// diverge from it.
+let UNDO_LIST = null, UNDO_POS = -1, UNDO_BUSY = false;
+function invalidateUndo() { UNDO_LIST = null; UNDO_POS = -1; }
+
+async function undoRedo(dir) {
+  if (!DOC || DRAGGING || UNDO_BUSY) return;
+  // An open conflict means the local cut has already diverged from disk in a
+  // way nothing has resolved yet. restore() is version-guarded against
+  // whatever is ACTUALLY on disk (not DOC.version), so it would have quietly
+  // succeeded here and cleared THEIRS as a side effect — undoing your last
+  // action while silently also resolving someone else's conflict against you,
+  // with no banner, no choice, and no way to tell it happened. Same rule
+  // save() already follows: a conflict blocks until the director picks.
+  if (THEIRS) return note('resolve the open conflict before undo/redo', 'var(--warn)');
+  // Two Cmd+Z in quick succession both used to read the same UNDO_POS before
+  // either fetch resolved, so both restored the SAME stamp instead of walking
+  // back two steps — measured: three fast presses landed on one state, not
+  // three. A busy flag serialises undo/redo the way SAVING serialises save().
+  UNDO_BUSY = true;
+  try {
+    if (!UNDO_LIST) {
+      let snapshots;
+      try { ({snapshots} = await (await fetch('/history')).json()); }
+      catch (e) { return note('could not read history — ' + e.message, 'var(--danger)'); }
+      UNDO_LIST = snapshots.filter(s => !s.endsWith('-prior'));   // ascending, oldest first
+      UNDO_POS = UNDO_LIST.length - 1;   // the live document, before any undo this session
+    }
+    const next = UNDO_POS + dir;
+    if (next < 0 || next >= UNDO_LIST.length) {
+      return note(dir < 0 ? 'nothing earlier to undo' : 'nothing later to redo', 'var(--ink-3)');
+    }
+    const stamp = UNDO_LIST[next];
+    try {
+      const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST', headers: wHeaders()});
+      const b = await r.json();
+      if (!r.ok) return note((b.problems || [(dir < 0 ? 'undo' : 'redo') + ' failed'])[0], 'var(--danger)');
+      UNDO_POS = next;   // only advance the cursor once the restore actually landed
+      adopt(b); scrubTo(CLOCK);
+      note(dir < 0 ? 'undo' : 'redo');
+    } catch (e) { note((dir < 0 ? 'undo' : 'redo') + ' failed — ' + e.message, 'var(--danger)'); }
+  } finally { UNDO_BUSY = false; }
+}
+// <<< undo-redo
 // Scrub by dragging — from anywhere on the ruler, or by the playhead handle.
 // Playing stops on grab: a playhead that keeps running while you drag it lies
 // about where you put it.
@@ -1945,6 +2009,9 @@ document.addEventListener('keydown', e => {
   }
   if (e.key==='Home') scrubTo(0);
   if (e.key==='End')  scrubTo(totalLen());
+  if ((e.key==='z'||e.key==='Z') && (e.metaKey||e.ctrlKey) && !DRAGGING) {
+    e.preventDefault(); undoRedo(e.shiftKey ? 1 : -1); return;
+  }
   // ⚠️ Anything that calls draw() while a drag is live replaces the card the drag
   // is bound to; the pointerup then never fires, so the move is neither committed
   // nor undone. Selection keys wait until the hand is off the mouse.

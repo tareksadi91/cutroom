@@ -1115,6 +1115,7 @@ const el = (t, c) => ({tag: t, textContent: '', onclick: null});
 let DOC = null, SEL = null, DRAWS = 0;
 function draw() { DRAWS++; }
 function inspect() {}
+function invalidateUndo() {}
 __REGION__
 // --- the sequence ------------------------------------------------------------
 DOC = {version: 3, clips: [{uid: 'c000', t: 0}]};
@@ -1203,6 +1204,7 @@ const MULTI = new Set();
 function draw() { DRAWS++; }
 function inspect() {}
 function clearSel() { SEL = null; }
+function invalidateUndo() {}
 __REGION__
 const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 
@@ -1427,6 +1429,124 @@ console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
         js = pathlib.Path(d) / "rebase.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_undo_redo_walks_the_deduplicated_history_chain():
+    """§ Cmd+Z / Cmd+Shift+Z, run against the real undoRedo() lifted out of
+    ui.html — same convention as the save-loop tests above.
+
+    Every commit snapshots both what it replaced ("<n>-prior") and what
+    landed ("<n>"), and a "-prior" snapshot is byte-identical to the
+    PREVIOUS commit's plain one. undoRedo() relies on that to treat the
+    plain stamps alone as a deduplicated, linear undo chain — this proves
+    the walk is correct at both ends and that repeated undo (not just one
+    toggle) reaches all the way back, which a naive "restore whatever's
+    newest" implementation would not do.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> undo-redo")
+    b = html.index("// <<< undo-redo")
+    region = html[a:b]
+    assert "async function undoRedo" in region and "function invalidateUndo" in region, \
+        "the undo-redo markers no longer wrap the undo/redo code"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; undo/redo is JS)")
+        return
+
+    harness = r"""
+let DOC = {version: 9}, DRAGGING = false, THEIRS = null, CLOCK = 0;
+const NOTES = [];
+function note(m) { NOTES.push(m); }
+function wHeaders() { return {}; }
+const ADOPTED = [];
+function adopt(p) { ADOPTED.push(p); }
+function scrubTo() {}
+let historyCalls = 0, restoreCalls = 0, lastRestoreStamp = null;
+globalThis.fetch = async (url) => {
+  if (url === '/history') {
+    historyCalls++;
+    // "s1-prior" is byte-identical to the commit before it and must be
+    // filtered out; ordering here matches what server.py's history() (sorted
+    // ascending) actually returns.
+    return {json: async () => ({snapshots: ['s1', 's1-prior', 's2', 's3']})};
+  }
+  const stamp = decodeURIComponent(url.slice('/history/'.length));
+  restoreCalls++; lastRestoreStamp = stamp;
+  return {ok: true, json: async () => ({version: 100 + restoreCalls, stamp})};
+};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// walk back to the start of the chain
+await undoRedo(-1);
+if (lastRestoreStamp !== 's2') fail('first undo did not restore s2: ' + lastRestoreStamp);
+if (NOTES.at(-1) !== 'undo') fail('first undo did not note "undo": ' + NOTES.at(-1));
+await undoRedo(-1);
+if (lastRestoreStamp !== 's1') fail('second undo did not restore s1: ' + lastRestoreStamp);
+if (historyCalls !== 1) fail('re-fetched history mid-walk (' + historyCalls + ' calls)');
+
+// one more undo past the start: refused, no wasted restore
+const callsBefore = restoreCalls;
+await undoRedo(-1);
+if (restoreCalls !== callsBefore) fail('undo past the start still restored something');
+if (NOTES.at(-1) !== 'nothing earlier to undo') fail('wrong note at the start: ' + NOTES.at(-1));
+
+// walk all the way back forward
+await undoRedo(1);
+if (lastRestoreStamp !== 's2') fail('first redo did not restore s2: ' + lastRestoreStamp);
+if (NOTES.at(-1) !== 'redo') fail('first redo did not note "redo": ' + NOTES.at(-1));
+await undoRedo(1);
+if (lastRestoreStamp !== 's3') fail('second redo did not restore s3: ' + lastRestoreStamp);
+
+// one more redo past the tip: refused
+const callsBefore2 = restoreCalls;
+await undoRedo(1);
+if (restoreCalls !== callsBefore2) fail('redo past the tip still restored something');
+if (NOTES.at(-1) !== 'nothing later to redo') fail('wrong note at the tip: ' + NOTES.at(-1));
+
+// a real edit (or a manual history pick) drops the frozen list
+invalidateUndo();
+await undoRedo(-1);
+if (historyCalls !== 2) fail('invalidateUndo() did not force a fresh /history fetch');
+// one adopt() per successful restore: s2, s1, s2, s3, then s2 again after
+// the fresh freeze — 5 successful restores total, 2 blocked ones with none.
+if (ADOPTED.length !== 5) fail('adopt() was not called once per successful restore (' + ADOPTED.length + ')');
+
+// an open conflict blocks undo/redo instead of silently resolving it —
+// restore() is version-guarded against whatever is ACTUALLY on disk, so
+// without this guard undo would have quietly succeeded and cleared THEIRS
+// as a side effect: undoing your last action while ALSO discarding an
+// unresolved conflict with someone else's concurrent write, with no banner
+// and no choice.
+THEIRS = {version: 999};
+const restoreBeforeConflict = restoreCalls;
+await undoRedo(-1);
+if (restoreCalls !== restoreBeforeConflict) fail('undo restored something while a conflict was open');
+if (NOTES.at(-1) !== 'resolve the open conflict before undo/redo')
+  fail('wrong note with an open conflict: ' + NOTES.at(-1));
+if (THEIRS === null) fail('undo cleared an unresolved conflict instead of blocking on it');
+THEIRS = null;
+
+// rapid re-press before the first restore lands: two Cmd+Z fired back to
+// back (no await between them) both used to read the same UNDO_POS before
+// either fetch resolved, so both restored the SAME stamp instead of walking
+// back two steps. The busy flag must make the second call a no-op.
+UNDO_POS = UNDO_LIST.length - 1;   // back at the tip, a known starting point
+const restoreBeforeRace = restoreCalls;
+const p1 = undoRedo(-1), p2 = undoRedo(-1);   // p2 fires while p1's fetch is in flight
+await Promise.all([p1, p2]);
+if (restoreCalls !== restoreBeforeRace + 1)
+  fail('a concurrent Cmd+Z was not ignored (' + (restoreCalls - restoreBeforeRace) + ' restores, expected 1)');
+if (lastRestoreStamp !== 's2') fail('the one restore that ran targeted the wrong stamp: ' + lastRestoreStamp);
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "undoredo.mjs"
         js.write_text(harness.replace("__REGION__", region))
         r = subprocess.run([node, str(js)], capture_output=True, text=True)
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
