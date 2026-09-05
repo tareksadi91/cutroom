@@ -2205,6 +2205,21 @@ if (!res || res.type !== 'reorder' || res.newIndex !== 1)
   fail('dragging the last, shortest run member to an earlier slot must reorder '
        + '(newIndex 1), got ' + JSON.stringify(res));
 
+// 9) THE CASE THAT CATCHES A BARE `run.start` currentIndex FORMULA (as
+// opposed to case 8, which only catches `run.start + dur0`): same fixture,
+// but land C back at the run's own HEAD (t=0). Correct: C moves from index 2
+// to index 0 among [A,B] -- a real reorder. A formula that derives
+// currentIndex from bare run.start (always giving 0, since no run member
+// has t < run.start) would ALSO see newIndex=0 here and wrongly call this a
+// no-op ('seam'), whereas case 8's landT=4 can't tell bare-run.start (0)
+// apart from run.start+dur0 (1) because neither equals newIndex (1) there.
+res = resolveMoveTarget({
+  draggedUid: 'C', origT: origTc, proposedT: 0.02, dur0: dur0c, lane0: 0, dropLane: 0,
+  swapNeighbors: swapNeighborsC, run: runC, hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'reorder' || res.newIndex !== 0)
+  fail('dragging the last run member to the run head must reorder (newIndex 0), got '
+       + JSON.stringify(res));
+
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:
