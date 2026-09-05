@@ -1617,12 +1617,21 @@ function playMedia(el) {
   const attempt = el.cutroomPlayPending = {};
   el.play().then(() => {
     if (el.cutroomPlayPending === attempt) el.cutroomPlayPending = false;
-  }, () => {
+  }, (err) => {
     // ⚠️ NOT a bare .catch(()=>{}). Autoplay policy refuses an UNMUTED element
     // until the page has been interacted with, and retrying inside the frame
     // loop spins that refusal sixty times a second, silently, forever.
     if (el.cutroomPlayPending !== attempt) return;   // a scrub cancelled it
     el.cutroomPlayPending = false;
+    // park()/preloadNext() routinely pause() or reload .src on this same
+    // element a tick after playMedia() called .play() on it — that interrupts
+    // the pending promise with AbortError, not a real refusal. Latching
+    // cutroomPlayBlocked on THAT turned a routine race into permanent
+    // playback loss: the slot never natively played again, and paint()'s
+    // 0.2s drift-correction kept yanking currentTime forward instead —
+    // visible as constant stutter. Only a genuine autoplay policy refusal
+    // (NotAllowedError) should latch the block.
+    if (err && err.name === 'AbortError') return;
     el.cutroomPlayBlocked = true;
     if (!PLAY_BLOCKED) {
       PLAY_BLOCKED = true;
