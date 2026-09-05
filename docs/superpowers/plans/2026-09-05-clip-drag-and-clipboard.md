@@ -968,9 +968,15 @@ const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
 
 const A = DOC.clips[0], B = DOC.clips[1];
 if (!timelineFault()) fail('the fixture must start faulty for this test to mean anything');
-const fault = commitWithGate([B], () => { B.t = 5; });
+// B.t=0.5 leaves the cut STILL faulty (ov = endOf(A)-B.t = 1.5 > min(2,1)=1)
+// -- deliberately not a full repair. Without the wasFaulty exception, a
+// plain "revert on any fault" would undo this and leave B.t back at 0,
+// which is exactly the bug this test needs to catch; a fixture that fully
+// repairs itself (e.g. B.t=5) passes identically whether or not the
+// exception exists and proves nothing.
+const fault = commitWithGate([B], () => { B.t = 0.5; });
 if (fault) fail('a commit on an already-faulty cut must not be refused, got: ' + fault);
-if (B.t !== 5) fail('the mutation must be kept, not reverted, on an already-faulty cut');
+if (B.t !== 0.5) fail('the mutation must be kept, not reverted, on an already-faulty cut');
 
 console.log('js ok');
 """
