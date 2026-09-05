@@ -155,6 +155,7 @@
   /* The two clips the drop will land between. */
   .clip.seam-l { box-shadow:inset -3px 0 0 0 var(--accent, #7fd1ff); }
   .clip.seam-r { box-shadow:inset  3px 0 0 0 var(--accent, #7fd1ff); }
+  .clip.swap-target { outline: 2px solid var(--accent); outline-offset: -2px; }
   .xf { position:absolute; border-radius:4px;
         background:repeating-linear-gradient(135deg,
           oklch(0.918 0.010 85 / 0.10) 0 3px,
@@ -967,6 +968,20 @@ function card(c) {
     let goodDt = 0, goodEdge = {t: c.t, in: c.in, out: c.out};
     const minLane = Math.min(...g0.map(([,,L]) => L));
     const minT    = Math.min(...g0.map(([,T]) => T));
+    // Only meaningful for a single-clip move: swap/reorder never apply to a
+    // multi-selection (see spec Non-goals). Computed once, from the ORIGINAL
+    // position, exactly like g0 above -- other clips in lane0 are never
+    // mutated during this drag (only `group`'s own members are), so nothing
+    // here needs to be recomputed mid-gesture.
+    const singleMove = mode === 'move' && group.length === 1;
+    const swapNeighbors = singleMove ? findSwapNeighbors(t0, dur(c), lane0) : null;
+    const run = singleMove ? flushRun(t0, dur(c), lane0, c.uid) : null;
+    // Latched off the first time the drop lane differs from lane0 -- a
+    // sticky flag, not re-evaluated as `lane !== lane0` on every
+    // pointermove (see spec piece 2), since re-checking live would silently
+    // re-offer swap if the pointer wanders back to lane0 later in the drag.
+    let swapLatchedOff = false;
+    let pendingTarget = null;
     // ⚠️ A CLIP ALREADY ON THE TIMELINE DRAGS FREELY — no seam, no ripple, on purpose.
     // Rippling was tried and removed 2026-08-27: dragging one clip ONTO another is how
     // a crossfade gets made here, and that is the common act. Snapping every drag to the
@@ -986,12 +1001,7 @@ function card(c) {
       if (mode==='move') {
         // The grabbed clip sets the delta; everyone else follows it, so the shape of
         // the selection is rigid and only its position changes.
-        // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
-        // per-clip clamping folds the whole selection onto t=0, losing the shape AND
-        // stacking clips on one instant, which the renderer rejects as a full overlap.
-        const want = Math.max(snap(t0+ds, ev.altKey) - t0, -minT);
-        const dt = goodDt = keepIfLegal(want, goodDt,
-          v => { for (const [x, xt] of g0) x.t = xt + v; }, gate);
+        const proposedT = t0 + ds;
         // Vertical: one lane per LANE_H of travel. Dropping one row past the
         // last lane creates a new one, so a clip never needs a button first.
         const wantLane = lane0 + Math.round((ev.clientY-y0)/LANE_H);
@@ -1000,6 +1010,48 @@ function card(c) {
           lane = next;
           document.querySelectorAll('.lane').forEach((L,i) =>
             L.classList.toggle('target', i===lane));
+        }
+        const dropLane = lane;
+        if (singleMove && dropLane !== lane0) swapLatchedOff = true;
+        let hoveredClip = null;
+        if (singleMove && !swapLatchedOff) {
+          // elementsFromPoint (plural), not elementFromPoint: the dragged
+          // card itself (.clip.dragging, z-index:20, no pointer-events:none
+          // -- ui.html:214) is always topmost under the pointer, so the
+          // singular form would always return the dragged card and never
+          // see what's underneath it.
+          const stack = document.elementsFromPoint(ev.clientX, ev.clientY);
+          const cardEl = stack.find(n => n.classList && n.closest('.clip')
+                           && n.closest('.clip').dataset.uid !== c.uid);
+          hoveredClip = cardEl
+            ? DOC.clips.find(x => x.uid === cardEl.closest('.clip').dataset.uid) : null;
+        }
+        pendingTarget = singleMove ? resolveMoveTarget({
+          draggedUid: c.uid, origT: t0, proposedT, dur0: dur(c), lane0, dropLane,
+          swapNeighbors: swapLatchedOff ? {before: null, after: null} : swapNeighbors,
+          run, hoveredClip, pxPerSecond: PX, altKey: ev.altKey,
+        }) : null;
+        // A pending swap or reorder still lets the card follow the pointer
+        // (through the same continuous clamp below) for visual feedback --
+        // only a resolved seam-land pins it exactly on the target. Either
+        // way, the COMMIT in onpointerup (Step 4) never trusts wherever the
+        // card ends up visually; swap explicitly reads t0, and reorder's
+        // commitReorder() never reads the dragged clip's t at all.
+        const landedT = (pendingTarget && pendingTarget.type === 'seam')
+          ? pendingTarget.landT : snap(proposedT, ev.altKey);
+        // ⚠️ Clamp the DELTA at the earliest clip, never each clip at zero on its own:
+        // per-clip clamping folds the whole selection onto t=0, losing the shape AND
+        // stacking clips on one instant, which the renderer rejects as a full overlap.
+        const want = Math.max(landedT - t0, -minT);
+        const dt = goodDt = keepIfLegal(want, goodDt,
+          v => { for (const [x, xt] of g0) x.t = xt + v; }, gate);
+        document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
+        if (pendingTarget && pendingTarget.type === 'swap') {
+          // Matching on dataset.uid, not interpolating a uid into a
+          // selector, per the existing warning at ui.html:1353-1358 about a
+          // hand-edited uid containing a quote character.
+          for (const el of document.querySelectorAll('.clip'))
+            if (el.dataset.uid === pendingTarget.clip.uid) el.classList.add('swap-target');
         }
         // Same clamp on the vertical: the group hits lane 0, not the grabbed clip.
         const dl = Math.max(lane - lane0, -minLane);
@@ -1044,6 +1096,26 @@ function card(c) {
       // An emptied trailing lane disappears rather than lingering as a gap.
       const used = DOC.clips.length ? Math.max(...DOC.clips.map(x=>x.lane))+1 : 1;
       EXTRA = Math.min(EXTRA, used + 1);
+      document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
+      let commitFault = null;
+      if (singleMove && pendingTarget && pendingTarget.type === 'swap') {
+        // Use t0, never live c.t: the pointermove handler lets the card
+        // follow the pointer during a pending swap, so by the time this runs
+        // c.t may not be t0 any more. `other` (the swap target) is never
+        // mutated during this drag, so its live .t is safe to read as-is.
+        const other = pendingTarget.clip;
+        const [earlier, later] = t0 < other.t ? [c, other] : [other, c];
+        const start = Math.min(t0, other.t);
+        const pairRun = {members: [later], start, end: start + dur(earlier) + dur(later)};
+        commitFault = commitWithGate([c, other], () => commitReorder(earlier, pairRun, 1));
+      } else if (singleMove && pendingTarget && pendingTarget.type === 'reorder') {
+        // commitReorder() never reads the dragged clip's current t (only
+        // writes it), so no t0-vs-live concern here.
+        commitFault = commitWithGate([c, ...pendingTarget.run.members],
+          () => commitReorder(c, pendingTarget.run, pendingTarget.newIndex));
+      }
+      if (commitFault) note(commitFault, 'var(--warn)');
+      pendingTarget = null;
       draw(); save(); inspect(c);
     };
   };
@@ -2276,7 +2348,10 @@ window.addEventListener('dragover', e => {
 });
 // Backstop: whatever happens to a gesture, losing the window ends it. Without this
 // a single missed pointerup leaves the keyboard half-dead until a reload.
-window.addEventListener('blur', () => { DRAGGING = false; });
+window.addEventListener('blur', () => {
+  DRAGGING = false;
+  document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
+});
 window.addEventListener('dragend', () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop',    () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop', e => e.preventDefault());
