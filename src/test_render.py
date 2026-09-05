@@ -293,6 +293,23 @@ def test_offline_reports_an_unknown_mid_too():
     assert render.offline(p) == [("a", "unknown media 'ghost'")], render.offline(p)
 
 
+def test_missing_media_catches_a_file_no_clip_names():
+    """offline() answers this per CLIP — a media item nothing on the
+    timeline currently references fell through it entirely, and the bin
+    just tried and failed to load its thumbnail. missing_media() is the
+    same cheap stat, indexed by media instead of by clip."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        real = d / "real.mp4"
+        real.write_bytes(b"x")
+        p = proj(media=[
+            {"mid": "m01", "path": str(real), "label": "real", "dur": 1.0, "w": 1, "h": 1},
+            {"mid": "m02", "path": str(d / "ghost.mp4"), "label": "ghost",
+             "dur": 1.0, "w": 1, "h": 1},
+        ])
+        assert render.missing_media(p) == ["m02"], render.missing_media(p)
+
+
 # ----------------------------------------------------------------- the fixtures
 
 def _lavfi(path, colour, seconds=2.0, size="720x1280", vf=None):

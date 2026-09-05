@@ -361,6 +361,32 @@ def test_restore_bumps_the_version_so_an_open_page_reloads():
         assert payload["version"] == 5, payload
 
 
+def test_restoring_past_a_media_removal_brings_the_media_back_too():
+    """write_project() (the PUT /project path) hard-codes
+    merged["media"] = current["media"] — deliberately, so a client body can
+    never smuggle {"mid": "leak", "path": "/etc/passwd"} onto the allowlist.
+    restore() used to reuse write_project() for its own writes, but a
+    snapshot is not client input — it is cutroom's own past output — so that
+    guard was wrong for it: undoing past a media removal restored the old
+    clips with the CURRENT (already-shrunk) media list, and a clip naming
+    since-removed media failed validate() with "not in this project's
+    media" — a restore of a document that was perfectly valid when it was
+    written, refused by the very act of trying to bring it back."""
+    with project() as (name, root):
+        src = synth(root / "src" / "a.mp4")
+        server.add_media(name, [str(src)])
+        server.edit_project(name, lambda p: p["clips"].append(clip("c1", 0.0, "m01")))
+        with_media_stamp = [s for s in server.history(name) if not s.endswith("-prior")][-1]
+
+        status, payload = server.remove_media(name, "m01")
+        assert status == 200, payload
+
+        status, payload = server.restore(name, with_media_stamp)
+        assert status == 200, (status, payload)
+        assert [m["mid"] for m in payload["media"]] == ["m01"], payload["media"]
+        assert [c["uid"] for c in payload["clips"]] == ["c1"], payload["clips"]
+
+
 def test_a_history_stamp_cannot_escape_the_snapshot_directory():
     with project() as (name, root):
         status, payload = server.restore(name, "../../../../etc/passwd")
@@ -798,6 +824,38 @@ def test_add_media_does_not_re_probe_an_already_tracked_path():
         assert payload["added"][0]["path"] == str(other), payload
 
 
+def test_remove_media_drops_the_entry_and_any_clip_naming_it():
+    """Manual media removal: the file is never touched — only the project's
+    own reference to it and any clip left pointing at a mid that would
+    otherwise read as "unknown media" instead of the clip just going away
+    with its media, the way removing a clip already works."""
+    with project() as (name, root):
+        a, b = synth(root / "src" / "a.mp4"), synth(root / "src" / "b.mp4")
+        status, payload = server.add_media(name, [str(a), str(b)])
+        assert status == 200, payload
+        mid_a, mid_b = (m["mid"] for m in payload["added"])
+
+        server.edit_project(name, lambda p: p["clips"].extend([
+            clip("c1", 0.0, mid_a), clip("c2", 1.0, mid_a), clip("c3", 2.0, mid_b)]))
+
+        status, payload = server.remove_media(name, mid_a)
+        assert status == 200, payload
+        assert payload["removed_clips"] == 2, payload
+        doc = payload["project"]
+        assert [m["mid"] for m in doc["media"]] == [mid_b], doc["media"]
+        assert [c["uid"] for c in doc["clips"]] == ["c3"], doc["clips"]
+
+        # the file on disk is untouched — this only edited the project
+        assert a.is_file() and b.is_file()
+
+        # an unknown mid is refused, not a silent no-op
+        status, payload = server.remove_media(name, "nope")
+        assert status == 400 and "no media" in payload["problems"][0], payload
+
+        # reversible: it is one commit, and every commit is snapshotted
+        assert len(server.history(name)) >= 2
+
+
 def test_the_media_endpoint_adds_and_the_cli_adds_the_same_way():
     with project() as (name, root):
         a, b = synth(root / "src" / "a.mp4"), synth(root / "src" / "b.mp4")
@@ -814,6 +872,33 @@ def test_the_media_endpoint_adds_and_the_cli_adds_the_same_way():
         server.main(["add", name, str(b)])
         doc = json.loads(server.project_path(name).read_text())
         assert [m["path"] for m in doc["media"]] == [str(a), str(b)], doc["media"]
+
+
+def test_the_media_remove_route_and_the_missing_media_field():
+    with project() as (name, root):
+        a = synth(root / "src" / "a.mp4")
+        server.add_media(name, [str(a)])
+        srv, port = start_server(name)
+        try:
+            # GET /project already flags a media item no clip references —
+            # the gap the bin's broken thumbnail icon came from
+            a.unlink()
+            status, raw, _ = request(port, "GET", "/project")
+            body = json.loads(raw)
+            assert status == 200 and body["missing_media"] == ["m01"], body
+
+            bad, _ = post(port, "/media/remove", {"mid": "nope"})
+            missing_mid, _ = post(port, "/media/remove", {})
+            wrong_type, _ = post(port, "/media/remove", {"mid": 7})
+            ok, payload = post(port, "/media/remove", {"mid": "m01"})
+        finally:
+            stop_server(srv)
+        assert bad == 400, bad
+        assert missing_mid == 400, missing_mid
+        assert wrong_type == 400, wrong_type
+        assert ok == 200 and payload["project"]["media"] == [], payload
+        doc = json.loads(server.project_path(name).read_text())
+        assert doc["media"] == [], doc["media"]
 
 
 def test_media_is_served_by_mid_with_range_support():
@@ -1463,7 +1548,7 @@ const NOTES = [];
 function note(m) { NOTES.push(m); }
 function wHeaders() { return {}; }
 const ADOPTED = [];
-function adopt(p) { ADOPTED.push(p); }
+function adopt(p, replaceClips) { ADOPTED.push(p); if (!replaceClips) fail('undoRedo() must adopt(b, true) — a restored version with no clips must not leave the old ones on screen'); }
 function scrubTo() {}
 let historyCalls = 0, restoreCalls = 0, lastRestoreStamp = null;
 globalThis.fetch = async (url) => {
@@ -2812,6 +2897,18 @@ if (DOC.clips[0] !== mine) fail('clip objects were swapped out from under the ha
 if (DOC.media.length !== 2) fail('the new media did not arrive');
 if (MEDIA.length !== 2) fail('the bin was not rebuilt from the new media');
 if (DOC.version !== 5) fail('the version was not taken (next save would 409)');
+
+// replaceClips=true is the deliberate exception: a history restore, an
+// undo/redo, or a media removal that cascade-deletes clips are each asking
+// for a SPECIFIC clip arrangement to become current, not protecting an
+// in-flight local edit against it. Measured before this existed: the
+// history dropdown called plain adopt() and the version/media updated while
+// the visible timeline silently kept showing the pre-restore clips.
+adopt({version: 6, media: [{mid:'m01'}], clips: []}, true);
+if (DOC.clips.length !== 0)
+  fail('adopt(doc, true) did not replace clips — restore/undo would render stale');
+if (DOC.version !== 6) fail('adopt(doc, true) lost the version update');
+
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:

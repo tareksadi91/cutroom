@@ -357,6 +357,19 @@ def offline(project):
     return out
 
 
+def missing_media(project):
+    """[mid, ...] for every media entry whose file cannot be read now.
+
+    offline() answers this per CLIP, so a media item with no clip on the
+    timeline naming it right now — a bin entry nothing is currently using —
+    fell through it entirely: not wrong exactly, but not caught either. The
+    bin still tried to load its thumbnail, which 404s. Same cheap stat as
+    offline(), just indexed by media instead of by clip.
+    """
+    return [m["mid"] for m in project.get("media", [])
+            if not pathlib.Path(m["path"]).is_file()]
+
+
 def shape_problems(project):
     """Is this a project AT ALL — the question that comes before validate().
 

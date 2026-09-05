@@ -116,6 +116,11 @@
   #bin .sub { font:400 11px/1.4 var(--mono); color:var(--ink-3); }
   #bin .odd { color:var(--warn); }
   #bin .gone { color:var(--danger); }
+  #bin .row .rm { flex:none; opacity:0; background:none; border:none;
+                  color:var(--ink-3); font:400 18px/1 var(--sans); cursor:pointer;
+                  padding:4px 6px; transition:opacity .15s var(--ease), color .15s var(--ease); }
+  #bin .row:hover .rm, #bin .row .rm:focus-visible { opacity:1; }
+  #bin .row .rm:hover { color:var(--danger); }
   #add { margin:14px 16px 8px; }
   #add button { width:100%; }
 
@@ -388,6 +393,7 @@ const LANE_H = 76;          // keep in step with .lane height
 let ZI = 1, PX = ZOOMS[ZI];
 const SNAP = 0.25;
 let DOC = null, MEDIA = [], PASSES = [], OFFLINE = {}, SEL = null, EXTRA = 0;
+let MISSING_MEDIA = new Set();
 // SEL is the clip the INSPECTOR is bound to; MULTI is everything else that is
 // selected with it. Kept apart on purpose: the inspector edits exactly one clip's
 // fields, and a set of one would have made every field ambiguous.
@@ -757,6 +763,14 @@ function drawBin() {
   document.getElementById('pick').onclick = pickMedia;
 
   for (const m of MEDIA) {
+    // A file that is not on disk at all can never be dragged in again, and
+    // the bin used to try to load its thumbnail anyway — a native broken-
+    // image icon, forever, for an item nothing can be done with from here.
+    // A clip on the TIMELINE still naming this mid keeps its own separate
+    // OFFLINE treatment (see markOffline()/the .clip.offline styling) —
+    // that stays, on purpose: it is the thing blocking export, and hiding
+    // it would hide the reason export is blocked.
+    if (MISSING_MEDIA.has(m.mid)) continue;
     // has_video is undefined on media added before audio existed; only an
     // explicit false means "this has no picture".
     const soundOnly = m.has_video === false;
@@ -774,7 +788,9 @@ function drawBin() {
       <div style="min-width:0">
         <div class="stem">${esc(m.label)}</div>
         <div class="sub">${sub}</div>
-      </div>`;
+      </div>
+      <button class="rm" draggable="false"
+              title="remove from this project — the file on disk is untouched, and this is one ⌘Z away from undone">×</button>`;
     r.title = `drag onto a lane to add to the cut · ${m.path}`;
     r.ondragstart = e => {
       e.dataTransfer.setData('text/plain', 'mid:' + m.mid);
@@ -784,6 +800,7 @@ function drawBin() {
       DRAG_MID = m.mid;
     };
     r.ondragend = () => { DRAG_MID = null; clearSeam(); };
+    r.querySelector('.rm').onclick = e => { e.stopPropagation(); removeMedia(m.mid); };
     box.append(r);
   }
   const binEl = document.getElementById('bin');
@@ -815,9 +832,30 @@ async function pickMedia() {
     note(`picker failed — ${e.message || e}`, 'var(--danger)');
   }
 }
+// Drops one entry from the allowlist and any clip that named it. No confirm
+// dialog — same as removing a clip, which has never had one either — because
+// the file on disk is untouched and every commit is snapshotted: this is one
+// ⌘Z away from undone, not a decision that needs a modal in front of it.
+async function removeMedia(mid) {
+  try {
+    const r = await fetch('/media/remove', {method: 'POST',
+      headers: wHeaders({'Content-Type': 'application/json'}),
+      body: JSON.stringify({mid})});
+    const b = await r.json();
+    if (!r.ok) return note((b.problems || ['remove failed'])[0], 'var(--danger)');
+    // Only once it actually landed — an unknown mid or a dropped request
+    // never touched the project, and must not throw away a frozen undo/redo
+    // list over nothing.
+    invalidateUndo();
+    THEIRS = null;
+    adopt(b.project, true);   // the cascade-deleted clips are the point, not a hazard
+    note(b.removed_clips ? `removed — ${b.removed_clips} clip${b.removed_clips===1?'':'s'} went with it`
+                          : 'removed');
+  } catch (e) { note('remove failed — ' + e.message, 'var(--danger)'); }
+}
 // >>> adopt (extracted verbatim by test_server.py — keep both markers)
 // Take a whole new document from the server (add media, run a pass) and rebind.
-function adopt(project) {
+function adopt(project, replaceClips) {
   if (!project) return;
   // The media list and the version NUMBER, never the object graph — the same
   // rule the save loop states for a 200, and for the same reason. Every card's
@@ -825,8 +863,18 @@ function adopt(project) {
   // DOC.clips; `DOC = project` swaps those out from under them. It also bins
   // outright any drag, trim or cut made while the request was away, and a
   // copy-in of 45 clips is a second or more of exactly that window.
+  //
+  // replaceClips is the deliberate exception, for the one class of caller
+  // where NOT taking the new clips is itself the bug: a history restore, an
+  // undo/redo, or a media removal that cascade-deletes clips are each asking
+  // FOR a specific clip arrangement to become current — discarding the local
+  // one is the entire point, not a hazard to protect against. Measured: the
+  // history dropdown called plain adopt() and the version number and media
+  // list updated while the visible timeline silently stayed on the old
+  // clips, with no reload prompt telling anyone why.
   DOC.media = project.media || [];
   DOC.version = project.version;
+  if (replaceClips) DOC.clips = project.clips || [];
   baseline();
   MEDIA = DOC.media.map(m => ({...m}));
   markOffline(); drawBin(); draw(); reselect();
@@ -1889,15 +1937,21 @@ HIST.onchange = async () => {
   const stamp = HIST.value;
   HIST.selectedIndex = 0;
   if (!stamp || stamp === 'history…') return;
-  invalidateUndo();   // a manual jump is a new baseline, same as any edit
   try {
     const r = await fetch('/history/' + encodeURIComponent(stamp), {method: 'POST', headers: wHeaders()});
     const b = await r.json();
     if (!r.ok) return note((b.problems || ['restore failed'])[0], 'var(--danger)');
+    // Only once it actually landed — a failed restore never touched the
+    // project and must not throw away a frozen undo/redo list over nothing.
+    invalidateUndo();   // a manual jump is a new baseline, same as any edit
     // A restore IS a choice about which state wins, so it also settles any
     // open conflict — otherwise THEIRS would go on blocking every save.
     THEIRS = null;
-    adopt(b); scrubTo(CLOCK);
+    // true: a restore is explicitly asking for a specific clip arrangement
+    // to become current. Measured without this — the timeline silently kept
+    // showing the pre-restore clips while the version number and media list
+    // updated underneath it, with nothing telling anyone a reload was needed.
+    adopt(b, true); scrubTo(CLOCK);
     note('restored ' + stamp, 'var(--accent)');
   } catch (e) { note('restore failed — ' + e.message, 'var(--danger)'); }
 };
@@ -1956,7 +2010,8 @@ async function undoRedo(dir) {
       const b = await r.json();
       if (!r.ok) return note((b.problems || [(dir < 0 ? 'undo' : 'redo') + ' failed'])[0], 'var(--danger)');
       UNDO_POS = next;   // only advance the cursor once the restore actually landed
-      adopt(b); scrubTo(CLOCK);
+      adopt(b, true);   // an undo/redo IS the clips changing — that's the whole point
+      scrubTo(CLOCK);
       note(dir < 0 ? 'undo' : 'redo');
     } catch (e) { note((dir < 0 ? 'undo' : 'redo') + ' failed — ' + e.message, 'var(--danger)'); }
   } finally { UNDO_BUSY = false; }
@@ -2093,6 +2148,7 @@ async function boot() {
     PASSES = b.passes || [];
     OFFLINE = {};
     for (const o of b.offline) OFFLINE[o.uid] = o;
+    MISSING_MEDIA = new Set(b.missing_media || []);
     markOffline();
     document.getElementById('film').textContent = DOC.name;
     document.getElementById('tip-res').innerHTML =

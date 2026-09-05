@@ -674,15 +674,27 @@ def save_pending(name, body):
 
 
 def restore(name, stamp):
-    """Restore a snapshot, bumping version so any open page sees a conflict."""
+    """Restore a snapshot, bumping version so any open page sees a conflict.
+
+    Goes through edit_project(), NOT write_project(): write_project() hard-
+    codes `merged["media"] = current["media"]`, because a PUT body is
+    arbitrary client input and letting it set `media` is how
+    {"mid": "leak", "path": "/etc/passwd"} gets on the allowlist. A snapshot
+    is not that — it is cutroom's own past output, written by _commit() and
+    nothing else — so restoring one MUST bring its media list back too, not
+    silently keep whatever is on the allowlist right now. Measured: undo
+    past a media removal restored the old clips with the CURRENT (already
+    shrunk) media list, and a clip naming since-removed media failed
+    validate() with "not in this project's media" — the restore itself
+    never landed, on a document that used to be perfectly valid.
+    """
     if not re.fullmatch(r"[0-9A-Za-z._-]+", str(stamp or "")):
         return 400, {"problems": [f"bad snapshot name {stamp!r}"]}
     snap = snapshot_dir(name) / f"{stamp}.json"
     if not snap.is_file():
         return 404, {"problems": [f"no snapshot {stamp}"]}
     body = json.loads(snap.read_text())
-    body["version"] = json.loads(project_path(name).read_text())["version"]
-    return write_project(name, body)
+    return edit_project(name, lambda project: body)
 
 
 # --------------------------------------------------------------------- media
@@ -828,6 +840,38 @@ def add_media(name, paths, label=None):
     if status != 200:
         return status, payload
     return 200, {"added": added, "already": already, "project": payload}
+
+
+def remove_media(name, mid):
+    """Drop one entry from the media allowlist, and every clip that named it.
+
+    The file on disk is never touched — this edits the project's own
+    reference to it, exactly like removing a clip already does, through the
+    same edit_project() door and the same version-guarded, snapshotted write.
+    Nothing here is a new kind of danger: it is one Cmd+Z away from undone,
+    same as any other edit.
+
+    A clip left pointing at a removed mid would read as "unknown media" —
+    worse than the "missing <path>" a moved-but-still-listed file gets — so
+    the clip goes with its media, not just the allowlist entry.
+    """
+    current = json.loads(project_path(name).read_text())
+    if not any(m.get("mid") == mid for m in current.get("media", [])):
+        return 400, {"problems": [f"no media {mid!r} in this project"]}
+
+    removed_clips = [0]
+
+    def mutate(project):
+        project["media"] = [m for m in project.get("media", []) if m.get("mid") != mid]
+        clips = project.get("clips", [])
+        kept = [c for c in clips if c.get("mid") != mid]
+        removed_clips[0] = len(clips) - len(kept)
+        project["clips"] = kept
+
+    status, payload = edit_project(name, mutate)
+    if status != 200:
+        return status, payload
+    return 200, {"removed_clips": removed_clips[0], "project": payload}
 
 
 def copy_into_new(src, dst):
@@ -1388,6 +1432,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "project": project,
                     "offline": [{"uid": u, "why": w}
                                 for u, w in render_mod.offline(project)],
+                    "missing_media": render_mod.missing_media(project),
                     # From --passes-dir, NEVER from the project document. The
                     # page shows what this server can actually run.
                     "passes": pass_names()})
@@ -1500,6 +1545,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if route == "/media/pick":
                 return self._send(*pick_media(name, bool(body.get("copy"))))
+
+            if route == "/media/remove":
+                mid = body.get("mid")
+                if not isinstance(mid, str) or not mid:
+                    return self._send(400, {"problems": ["mid must be a non-empty string"]})
+                return self._send(*remove_media(name, mid))
 
             if route == "/pass":
                 uid, pass_name = body.get("uid"), body.get("pass")
