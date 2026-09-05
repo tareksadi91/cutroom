@@ -6,3 +6,7 @@ __pycache__/
 # the director keeps it. This repository holds a program. That separation is
 # the whole point of the rewrite — read SPEC.md.
 .gstack/
+
+# Scratch workspace for subagent-driven-development execution (ledgers,
+# task briefs, review packages) -- not part of the project.
+.superpowers/
