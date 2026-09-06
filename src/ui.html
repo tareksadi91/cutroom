@@ -310,7 +310,7 @@
       <p><em>cutroom never writes to, moves or deletes your media.</em> It reads.
          A pass writes a new file into the project's own <kbd>derived/</kbd>
          folder and re-points the clip at it.</p>
-      <p><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> one frame ·
+      <p><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> one frame (moves selected clip) ·
          <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> one second ·
          <kbd>home</kbd><kbd>end</kbd> jump ·
          <kbd>-</kbd><kbd>=</kbd> zoom · <kbd>delete</kbd> remove a clip ·
@@ -413,6 +413,16 @@ function paintSelection() {
   }
 }
 let RAF = null, T0 = 0, CLOCK = 0;
+let NUDGE_SAVE_TIMER = null;
+// Returns the flush's own promise so a caller that must not race a pending
+// nudge (undoRedo(), a manual history restore) can await it before doing
+// anything else.
+function flushNudgeSave() {
+  if (!NUDGE_SAVE_TIMER) return Promise.resolve();
+  clearTimeout(NUDGE_SAVE_TIMER);
+  NUDGE_SAVE_TIMER = null;
+  return save();
+}
 const MON = {};
 let DRAG_MID = null, SEAM = null;   // media in flight from the bin, and where it would land
 
@@ -929,7 +939,7 @@ function card(c) {
                  <span class="id">${esc(c.label)}</span><span class="dur">${dur(c).toFixed(2)}s</span>
                  <div class="h l"></div><div class="h r"></div>`;
   const m = mediaOf(c.mid);
-  d.title = `drag to move · drag edges to trim · ${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
+  d.title = `arrow keys to nudge · drag to move · drag edges to trim · ${c.label} · ${dur(c).toFixed(2)}s · ${off ? 'OFFLINE — ' + (OFFLINE[c.uid].why)
                                                        : (m ? m.path : c.mid)}`;
   d.dataset.uid = c.uid;
   d.onpointerdown = e => {
@@ -1549,6 +1559,22 @@ function commitWithGate(clips, mutate) {
   }
   return null;
 }
+// One arrow-key press for a selected clip (and its whole MULTI group).
+// `frames` is signed (±1 for a plain press, ±DOC.fps for Shift). Frame-INTEGER
+// arithmetic, not repeated float addition on a running value, so many presses
+// never drift off the frame grid the way rounding a running float to 3
+// decimals every press (the drag commit's own rounding, ui.html:1043) would.
+// The clamp is on the GROUP's delta at its earliest member, exactly
+// ui.html:989-991's own rule, reused rather than reinvented.
+function nudgeGroup(g0, frames) {
+  const wantDelta = frames / DOC.fps;
+  const earliest = Math.min(...g0.map(([, t0]) => t0));
+  const delta = Math.max(wantDelta, -earliest);   // floor: earliest member can't go below 0
+  for (const [clip, t0] of g0) {
+    const frameIndex = Math.round(t0 * DOC.fps) + Math.round(delta * DOC.fps);
+    clip.t = Math.round((frameIndex / DOC.fps) * 1e6) / 1e6;
+  }
+}
 // <<< move-target
 function clearSeam() {
   SEAM = null;
@@ -2156,6 +2182,7 @@ HIST.onmousedown = async () => {
   } catch (e) { note('could not list history — ' + e.message, 'var(--danger)'); }
 };
 HIST.onchange = async () => {
+  await flushNudgeSave();
   const stamp = HIST.value;
   HIST.selectedIndex = 0;
   if (!stamp || stamp === 'history…') return;
@@ -2200,6 +2227,7 @@ let UNDO_LIST = null, UNDO_POS = -1, UNDO_BUSY = false;
 function invalidateUndo() { UNDO_LIST = null; UNDO_POS = -1; }
 
 async function undoRedo(dir) {
+  await flushNudgeSave();
   if (!DOC || DRAGGING || UNDO_BUSY) return;
   // An open conflict means the local cut has already diverged from disk in a
   // way nothing has resolved yet. restore() is version-guarded against
@@ -2272,12 +2300,37 @@ function beginScrub(e, fromHandle) {
 document.getElementById('ruler').onpointerdown = e => beginScrub(e, false);
 document.getElementById('ph-grab').onpointerdown = e => beginScrub(e, true);
 document.addEventListener('keydown', e => {
+  const tag = document.activeElement.tagName;
+  const nudgeable = SEL && !DRAGGING && !e.metaKey && !e.ctrlKey
+    && tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA';
+  if (nudgeable && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    e.preventDefault();
+    const dir = e.key === 'ArrowLeft' ? -1 : 1;
+    const frames = dir * (e.shiftKey ? DOC.fps : 1);
+    const group = selected();
+    const g0 = group.map(x => [x, x.t]);   // fresh snapshot, this press only
+    // commitWithGate snapshots every clip's t itself, runs the mutation, and
+    // reverts on a fault -- nudgeGroup must only ever be called from inside
+    // this callback, never applied first and checked after.
+    const fault = commitWithGate(group, () => nudgeGroup(g0, frames));
+    if (fault) note(fault, 'var(--warn)');
+    else {
+      const f = document.getElementById('f-t');
+      if (f && SEL) f.value = DOC.clips.find(x => x.uid === SEL).t;
+      draw();
+      if (NUDGE_SAVE_TIMER) clearTimeout(NUDGE_SAVE_TIMER);
+      NUDGE_SAVE_TIMER = setTimeout(() => { NUDGE_SAVE_TIMER = null; save(); }, 300);
+    }
+    return;
+  }
   if (document.activeElement.tagName==='INPUT') return;
   if (e.code==='Space') { e.preventDefault(); document.getElementById('play').click(); }
   if (e.key==='='||e.key==='+') zoom(1);
   if (e.key==='-') zoom(-1);
-  if (e.key==='ArrowLeft')  { e.preventDefault(); scrubTo(CLOCK - (e.shiftKey?1:1/DOC.fps)); }
-  if (e.key==='ArrowRight') { e.preventDefault(); scrubTo(CLOCK + (e.shiftKey?1:1/DOC.fps)); }
+  if (!SEL) {
+    if (e.key==='ArrowLeft')  { e.preventDefault(); scrubTo(CLOCK - (e.shiftKey?1:1/DOC.fps)); }
+    if (e.key==='ArrowRight') { e.preventDefault(); scrubTo(CLOCK + (e.shiftKey?1:1/DOC.fps)); }
+  }
   if (e.key==='s'||e.key==='S') { e.preventDefault(); razor(); }
   // Not while a clip is in hand: setLayout() redraws the lanes, which detaches
   // the card holding pointer capture and strands the edit uncommitted.
@@ -2351,6 +2404,7 @@ window.addEventListener('dragover', e => {
 window.addEventListener('blur', () => {
   DRAGGING = false;
   document.querySelectorAll('.clip.swap-target').forEach(n => n.classList.remove('swap-target'));
+  flushNudgeSave();
 });
 window.addEventListener('dragend', () => { DRAG_MID = null; clearSeam(); });
 window.addEventListener('drop',    () => { DRAG_MID = null; clearSeam(); });

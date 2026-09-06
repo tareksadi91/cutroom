@@ -1550,6 +1550,11 @@ function wHeaders() { return {}; }
 const ADOPTED = [];
 function adopt(p, replaceClips) { ADOPTED.push(p); if (!replaceClips) fail('undoRedo() must adopt(b, true) — a restored version with no clips must not leave the old ones on screen'); }
 function scrubTo() {}
+// undoRedo() awaits this before its own guard runs, but the flush itself
+// lives outside the undo-redo region (alongside the keydown nudge wiring),
+// same as note()/scrubTo()/adopt() above -- stub it so this isolated
+// harness matches ui.html's real global surface.
+function flushNudgeSave() { return Promise.resolve(); }
 let historyCalls = 0, restoreCalls = 0, lastRestoreStamp = null;
 globalThis.fetch = async (url) => {
   if (url === '/history') {
@@ -2462,6 +2467,60 @@ console.log('js ok');
         js.write_text(
             harness.replace("__REGION_TIMELINEFAULT__", tf_region)
                    .replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def test_nudge_group_is_frame_exact_and_clamps_the_group_not_each_clip():
+    """Frame-integer arithmetic (no float drift after many presses), and the
+    group clamps at its EARLIEST member, never each clip at zero on its own
+    -- the same rule the existing drag handler already follows
+    (ui.html:989-991), reused here rather than reinvented.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function nudgeGroup(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; nudgeGroup() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: [
+  {uid:'a', t:0.5, in:0, out:2, rate:1, lane:0},
+  {uid:'b', t:3, in:0, out:1, rate:1, lane:1},
+]};
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// 24 single-frame presses at 24fps must land EXACTLY 1.0s later, not drift.
+// Each press rebuilds g0 fresh from the clip's CURRENT t, exactly like the
+// real keydown handler does -- reusing one stale g0 across many presses
+// would just recompute the identical delta every time and never accumulate.
+const A = DOC.clips[0];
+for (let i = 0; i < 24; i++) nudgeGroup([[A, A.t]], 1);
+if (Math.abs(A.t - 1.5) > 1e-9) fail('expected exactly 1.5 after 24 frame-presses, got ' + A.t);
+
+// Group clamp: two clips move together; clamping must stop the WHOLE group
+// at the earliest member's zero, not fold each clip to its own zero.
+DOC.clips = [{uid:'x', t:0.5, in:0, out:2, rate:1, lane:0},
+             {uid:'y', t:3,   in:0, out:1, rate:1, lane:0}];
+const X = DOC.clips[0], Y = DOC.clips[1];
+for (let i = 0; i < 48; i++) nudgeGroup([[X, X.t], [Y, Y.t]], -1);
+if (Math.abs(X.t - 0) > 1e-9) fail('expected X clamped at exactly 0, got ' + X.t);
+if (Math.abs(Y.t - 2.5) > 1e-9)
+  fail('expected Y to stay 2.5 ahead of X (shape preserved), got ' + Y.t);
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "nudge.mjs"
+        js.write_text(harness.replace("__REGION__", region))
         r = subprocess.run([node, str(js)], capture_output=True, text=True)
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
