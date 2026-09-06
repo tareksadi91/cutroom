@@ -399,6 +399,9 @@ let MISSING_MEDIA = new Set();
 // selected with it. Kept apart on purpose: the inspector edits exactly one clip's
 // fields, and a set of one would have made every field ambiguous.
 let MULTI = new Set(), DRAGGING = false;
+// Cmd+C/Cmd+V clipboard. In-memory only, this tab, this load -- no system-
+// clipboard integration and no persistence across reload.
+let CLIPBOARD = [];
 const isSel = uid => uid === SEL || MULTI.has(uid);
 const selected = () => DOC.clips.filter(c => isSel(c.uid));
 function clearSel() { SEL = null; MULTI.clear(); }
@@ -1575,6 +1578,20 @@ function nudgeGroup(g0, frames) {
     clip.t = Math.round((frameIndex / DOC.fps) * 1e6) / 1e6;
   }
 }
+// Where a paste's earliest clip should land. Selecting a clip parks CLOCK on
+// it (inspect(), ui.html:2086), so the ordinary select/Cmd+C/Cmd+V gesture
+// with the playhead untouched would otherwise try to paste exactly on top
+// of the source it just copied and get refused. Anchor flush after the
+// copied clip(s) instead in exactly that case; anchor at the playhead
+// (frame-snapped) in the general case of copy, move the playhead, paste.
+function pasteAnchor(copiedClips, clock) {
+  const earliestT = Math.min(...copiedClips.map(c => c.t));
+  const snapped = frameSnap(clock);
+  if (Math.abs(snapped - earliestT) < 1e-6) {
+    return Math.max(...copiedClips.map(endOf));
+  }
+  return snapped;
+}
 // <<< move-target
 function clearSeam() {
   SEAM = null;
@@ -2358,6 +2375,49 @@ document.addEventListener('keydown', e => {
     SEL = all[0] || null; MULTI = new Set(all.slice(1));
     draw(); if (SEL) inspect(DOC.clips.find(c=>c.uid===SEL));
     note(`${all.length} clips selected`); return;
+  }
+  if ((e.key==='c'||e.key==='C') && (e.metaKey||e.ctrlKey) && !DRAGGING) {
+    const sel = selected();
+    if (!sel.length) return;   // let the browser's own copy happen when nothing is selected
+    e.preventDefault();
+    CLIPBOARD = sel.map(c => ({...c}));
+    note(`${sel.length} clip${sel.length>1?'s':''} copied`);
+    return;
+  }
+  if ((e.key==='v'||e.key==='V') && (e.metaKey||e.ctrlKey) && !DRAGGING && CLIPBOARD.length) {
+    e.preventDefault();
+    const known = new Set(MEDIA.map(m => m.mid));
+    const usable = CLIPBOARD.filter(c => known.has(c.mid));
+    const dropped = CLIPBOARD.length - usable.length;
+    if (!usable.length) { note('nothing to paste — the copied media no longer exists', 'var(--warn)'); return; }
+    const anchor = pasteAnchor(usable, CLOCK);
+    const earliestT = Math.min(...usable.map(c => c.t));
+    const liveUids = new Set(DOC.clips.map(x => x.uid));
+    const fresh = usable.map(c => {
+      let uid = newUid();
+      while (liveUids.has(uid)) uid = newUid();
+      liveUids.add(uid);
+      const off = OFFLINE[c.uid];
+      const clone = {...c, uid, t: c.t - earliestT + anchor};
+      // Spread + override, not a bare reference: OFFLINE[c.uid].uid still
+      // names the deleted source clip, and reusing that object as-is would
+      // carry the wrong uid into the new entry.
+      if (off) OFFLINE[uid] = {...off, uid};
+      return clone;
+    });
+    DOC.clips.push(...fresh);
+    const fault = timelineFault();
+    if (fault) {
+      for (const f of fresh) { DOC.clips.pop(); if (OFFLINE[f.uid]) delete OFFLINE[f.uid]; }
+      note(`${fault}. Nothing was pasted.`, 'var(--warn)');
+      return;
+    }
+    clearSel();
+    SEL = fresh[0].uid; MULTI = new Set(fresh.slice(1).map(f => f.uid));
+    draw(); save(); inspect(DOC.clips.find(x => x.uid === SEL));
+    note(`pasted ${fresh.length} clip${fresh.length>1?'s':''}`
+         + (dropped ? ` · ${dropped} skipped, source media no longer exists` : ''));
+    return;
   }
   if ((e.key==='Backspace'||e.key==='Delete') && SEL) {
     // Removes the CLIP from the timeline. The file it names stays in the

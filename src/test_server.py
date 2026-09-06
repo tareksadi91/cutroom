@@ -2528,6 +2528,52 @@ console.log('js ok');
         assert r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def test_paste_anchor_lands_after_the_source_when_playhead_is_untouched():
+    """Selecting a clip parks the playhead on it (inspect() sets
+    CLOCK = c.t). The ordinary select/copy/paste gesture must not dead-end
+    by trying to paste exactly on top of the clip it copied -- it anchors
+    flush after the copied clip(s) instead. Moving the playhead first still
+    anchors at the playhead, unchanged.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> move-target")
+    b = html.index("// <<< move-target")
+    region = html[a:b]
+    assert "function pasteAnchor(" in region
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; pasteAnchor() is JS)")
+        return
+
+    harness = r"""
+const dur = c => (c.out - c.in) / c.rate;
+const endOf = c => c.t + dur(c);
+let PX = 10;
+let DOC = {fps: 24, clips: []};
+function frameSnap(t) { return Math.round(t * DOC.fps) / DOC.fps; }
+__REGION__
+const fail = m => { console.error('FAIL: ' + m); process.exit(1); };
+
+// Playhead untouched (still parked on the copied clip's own t): anchor
+// flush after the LATEST end among the copied clips.
+const copied = [{t: 2, in:0, out:5, rate:1}, {t: 2, in:0, out:2, rate:1}];  // two lanes, same start, ends at 7 and 4
+let anchor = pasteAnchor(copied, 2);
+if (Math.abs(anchor - 7) > 1e-9) fail('expected anchor at latest end (7), got ' + anchor);
+
+// Playhead moved elsewhere: anchor there instead.
+anchor = pasteAnchor(copied, 10.3);
+if (Math.abs(anchor - frameSnap(10.3)) > 1e-9)
+  fail('expected anchor at frameSnap(clock), got ' + anchor);
+
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "pasteanchor.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def test_a_drag_stops_at_a_full_overlap_instead_of_nesting():
     """Run the real clamp out of ui.html, against the real fault check.
 
