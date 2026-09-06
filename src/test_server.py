@@ -2228,6 +2228,29 @@ if (!res || res.type !== 'reorder' || res.newIndex !== 0)
   fail('dragging the last run member to the run head must reorder (newIndex 0), got '
        + JSON.stringify(res));
 
+// 10) THE EDGE-ALIASING CASE: dur0 (0.2) is smaller than 2x the move-magnet
+// cap at PX=34 (cap=0.125, so 2x=0.25), so a single nearby candidate can be
+// within radius of BOTH the proposed start and proposed end -- hitStart and
+// hitEnd become the exact same object reference. Candidate N sits at t=5.11,
+// proposedT=5.0 (dStart=0.11) and proposedT+dur0=5.2 (dEnd=0.09): the END
+// edge is strictly nearer, so landT must be hit.t - dur0 = 4.91, NOT
+// hit.t = 5.11 (which is what `hit === hitStart` wrongly computes, since
+// hitStart and hitEnd alias to the same candidate object even though the
+// ternary picked hitEnd on distance).
+DOC.clips = [
+  {uid:'S', t:0,    in:0, out:0.2, rate:1, lane:0},   // dragged, dur0=0.2
+  {uid:'N', t:5.11, in:0, out:1,   rate:1, lane:0},   // isolated candidate
+];
+const dur0d = 0.2, origTd = 0;
+const runD = flushRun(origTd, dur0d, 0, 'S');                 // isolated, no members
+const swapNeighborsD = findSwapNeighbors(origTd, dur0d, 0);   // none
+res = resolveMoveTarget({
+  draggedUid: 'S', origT: origTd, proposedT: 5.0, dur0: dur0d, lane0: 0, dropLane: 0,
+  swapNeighbors: swapNeighborsD, run: runD, hoveredClip: null, pxPerSecond: PX, altKey: false});
+if (!res || res.type !== 'seam' || Math.abs(res.landT - 4.91) > 1e-9)
+  fail('expected the nearer END edge to win with landT=hit.t-dur0=4.91, got '
+       + JSON.stringify(res));
+
 console.log('js ok');
 """
     with tempfile.TemporaryDirectory() as d:

@@ -742,6 +742,15 @@ function reselect() {
     '<p class="empty">Select a clip to trim it, retime it, or run a post pass on its source.</p>';
 }
 async function save() {
+  // Any OTHER save path (paste, delete, drag commit, inspector edit) should
+  // cancel a pending debounced nudge-save timer rather than leave it to fire
+  // a redundant save 300ms later. NUDGE_SAVE_TIMER is declared outside this
+  // region (ui.html:419) -- guarded with typeof so the save-loop region stays
+  // self-contained for test_server.py's own extracted-region harnesses.
+  if (typeof NUDGE_SAVE_TIMER !== 'undefined' && NUDGE_SAVE_TIMER) {
+    clearTimeout(NUDGE_SAVE_TIMER);
+    NUDGE_SAVE_TIMER = null;
+  }
   invalidateUndo();   // a real edit — the redo half of any frozen list is now stale
   // An unresolved conflict blocks every save: the director can go on dragging
   // and nothing is lost, but the page will not write over a file it knows it
@@ -1106,6 +1115,14 @@ function card(c) {
       if (top >= laneCount) EXTRA = top + 1;         // dropped past the last lane
       for (const x of (mode==='move' ? group : [c]))
         for (const k of ['t','in','out']) x[k]=Math.round(x[k]*1000)/1000;
+      // The 3-decimal rounding above is fine for a value that came from free
+      // placement, but a seam-land target was computed precisely by the
+      // magnet -- rounding it can reopen a gap bigger than flushRun()'s 1e-6
+      // epsilon, silently disabling swap/reorder for the clip just snapped
+      // flush. Restore the exact landed t after rounding.
+      if (singleMove && pendingTarget && pendingTarget.type === 'seam') {
+        c.t = pendingTarget.landT;
+      }
       // An emptied trailing lane disappears rather than lingering as a gap.
       const used = DOC.clips.length ? Math.max(...DOC.clips.map(x=>x.lane))+1 : 1;
       EXTRA = Math.min(EXTRA, used + 1);
@@ -1128,6 +1145,10 @@ function card(c) {
           () => commitReorder(c, pendingTarget.run, pendingTarget.newIndex));
       }
       if (commitFault) note(commitFault, 'var(--warn)');
+      else if (pendingTarget && pendingTarget.type === 'swap')
+        note(`swapped ${c.label} and ${pendingTarget.clip.label}`);
+      else if (pendingTarget && pendingTarget.type === 'reorder')
+        note(`reordered — ${pendingTarget.run.members.length + 1} clips repositioned`);
       pendingTarget = null;
       draw(); save(); inspect(c);
     };
@@ -1509,13 +1530,16 @@ function resolveMoveTarget({draggedUid, origT, proposedT, dur0, lane0, dropLane,
   const cands = moveCandidates(new Set([draggedUid]), dropLane);
   const hitStart = magnet(proposedT, cands, pxPerSecond, cap);
   const hitEnd   = magnet(proposedT + dur0, cands, pxPerSecond, cap);
-  let hit = null, landT = null;
-  if (hitStart && hitEnd) {
-    hit = Math.abs(hitStart.t - proposedT) <= Math.abs(hitEnd.t - (proposedT + dur0))
-      ? hitStart : hitEnd;
-  } else hit = hitStart || hitEnd;
-  if (!hit) return null;
-  landT = (hit === hitStart) ? hit.t : hit.t - dur0;
+  // Track which edge actually won explicitly -- `hit === hitStart` is NOT a
+  // safe way to tell, because when both edges snap to the SAME candidate
+  // (happens whenever dur0 is smaller than roughly 2x the magnet cap) the two
+  // are the same object reference even when the ternary below picked hitEnd.
+  const dStart = hitStart ? Math.abs(hitStart.t - proposedT) : Infinity;
+  const dEnd   = hitEnd   ? Math.abs(hitEnd.t - (proposedT + dur0)) : Infinity;
+  if (dStart === Infinity && dEnd === Infinity) return null;
+  const useStart = dStart <= dEnd;
+  const hit = useStart ? hitStart : hitEnd;
+  const landT = useStart ? hit.t : hit.t - dur0;
   // 3) Classify: is the landing point inside the dragged clip's own run?
   if (dropLane !== lane0 || (landT < run.start - E) || (landT > run.end + E)) {
     return {type: 'seam', landT};
@@ -2412,6 +2436,10 @@ document.addEventListener('keydown', e => {
       note(`${fault}. Nothing was pasted.`, 'var(--warn)');
       return;
     }
+    // A second Cmd+V should chain after what was JUST pasted, not collide
+    // with the original copy source -- update the clipboard to the fresh
+    // paste so pasteAnchor()'s next collision check compares against these.
+    CLIPBOARD = fresh.map(c => ({...c}));
     clearSel();
     SEL = fresh[0].uid; MULTI = new Set(fresh.slice(1).map(f => f.uid));
     draw(); save(); inspect(DOC.clips.find(x => x.uid === SEL));
