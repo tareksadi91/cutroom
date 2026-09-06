@@ -1120,7 +1120,8 @@ function card(c) {
       // magnet -- rounding it can reopen a gap bigger than flushRun()'s 1e-6
       // epsilon, silently disabling swap/reorder for the clip just snapped
       // flush. Restore the exact landed t after rounding.
-      if (singleMove && pendingTarget && pendingTarget.type === 'seam') {
+      if (singleMove && pendingTarget && pendingTarget.type === 'seam'
+          && Math.abs(c.t - pendingTarget.landT) <= 5e-4) {
         c.t = pendingTarget.landT;
       }
       // An emptied trailing lane disappears rather than lingering as a gap.
