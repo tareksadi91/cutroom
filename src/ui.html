@@ -2227,22 +2227,26 @@ let UNDO_LIST = null, UNDO_POS = -1, UNDO_BUSY = false;
 function invalidateUndo() { UNDO_LIST = null; UNDO_POS = -1; }
 
 async function undoRedo(dir) {
-  await flushNudgeSave();
   if (!DOC || DRAGGING || UNDO_BUSY) return;
-  // An open conflict means the local cut has already diverged from disk in a
-  // way nothing has resolved yet. restore() is version-guarded against
-  // whatever is ACTUALLY on disk (not DOC.version), so it would have quietly
-  // succeeded here and cleared THEIRS as a side effect — undoing your last
-  // action while silently also resolving someone else's conflict against you,
-  // with no banner, no choice, and no way to tell it happened. Same rule
-  // save() already follows: a conflict blocks until the director picks.
-  if (THEIRS) return note('resolve the open conflict before undo/redo', 'var(--warn)');
   // Two Cmd+Z in quick succession both used to read the same UNDO_POS before
   // either fetch resolved, so both restored the SAME stamp instead of walking
   // back two steps — measured: three fast presses landed on one state, not
   // three. A busy flag serialises undo/redo the way SAVING serialises save().
   UNDO_BUSY = true;
   try {
+    // Claim the busy flag SYNCHRONOUSLY, before this await, or two fast Cmd+Z
+    // presses can both observe UNDO_BUSY === false while this await is in
+    // flight and both proceed — reopening the exact race the flag above
+    // exists to close, just moved earlier by one tick.
+    await flushNudgeSave();
+    // An open conflict means the local cut has already diverged from disk in a
+    // way nothing has resolved yet. restore() is version-guarded against
+    // whatever is ACTUALLY on disk (not DOC.version), so it would have quietly
+    // succeeded here and cleared THEIRS as a side effect — undoing your last
+    // action while silently also resolving someone else's conflict against you,
+    // with no banner, no choice, and no way to tell it happened. Same rule
+    // save() already follows: a conflict blocks until the director picks.
+    if (THEIRS) return note('resolve the open conflict before undo/redo', 'var(--warn)');
     if (!UNDO_LIST) {
       let snapshots;
       try { ({snapshots} = await (await fetch('/history')).json()); }

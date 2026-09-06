@@ -1550,10 +1550,13 @@ function wHeaders() { return {}; }
 const ADOPTED = [];
 function adopt(p, replaceClips) { ADOPTED.push(p); if (!replaceClips) fail('undoRedo() must adopt(b, true) — a restored version with no clips must not leave the old ones on screen'); }
 function scrubTo() {}
-// undoRedo() awaits this before its own guard runs, but the flush itself
-// lives outside the undo-redo region (alongside the keydown nudge wiring),
-// same as note()/scrubTo()/adopt() above -- stub it so this isolated
-// harness matches ui.html's real global surface.
+// undoRedo() awaits this INSIDE its try block, after the guard and
+// UNDO_BUSY = true have already run synchronously (a race review caught:
+// awaiting before the busy flag is claimed let two fast Cmd+Z presses both
+// see UNDO_BUSY === false). The flush itself lives outside the undo-redo
+// region (alongside the keydown nudge wiring), same as note()/scrubTo()/
+// adopt() above -- stub it so this isolated harness matches ui.html's real
+// global surface.
 function flushNudgeSave() { return Promise.resolve(); }
 let historyCalls = 0, restoreCalls = 0, lastRestoreStamp = null;
 globalThis.fetch = async (url) => {
