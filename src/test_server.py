@@ -4183,6 +4183,242 @@ def test_reading_is_still_open_to_the_page_that_asks():
         assert root_ == 200 and proj == 200, (root_, proj)
 
 
+def test_the_page_follows_the_file_but_only_when_it_has_nothing_to_lose():
+    """The live refresh: an agent edits the cut and the open page picks it up.
+
+    ⚠️ This is NOT the 409 path. rebaseable() asks whether the page's own
+    unsaved work can be merged with somebody else's, and it requires the same
+    clip set on both sides — so an agent that ADDS a clip fails it and raises
+    the conflict banner. The poll answers a different question: the page has no
+    unsaved work at all, so the file simply wins.
+
+    Everything asserted here is a way the refresh could destroy work instead:
+    an unsaved drag, a request already in the air whose success path writes to a
+    clip object it captured before it left, a half-typed inspector field, and —
+    the one that survives every check made BEFORE the request — a drag that
+    starts while the request is away.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> live-refresh")
+    b = html.index("// <<< live-refresh")
+    region = html[a:b]
+    assert "function pollBusy" in region and "async function pollOnce" in region, \
+        "the live-refresh markers no longer wrap the poll"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the live refresh is JS)")
+        return
+
+    harness = r"""
+// --- the smallest page the live refresh touches ------------------------------
+const STATUS = {textContent: '', style: {}};
+const STAGE = {scrollLeft: 0};
+let ACTIVE = null;
+const PLAYHEAD = {style: {}};
+const document = {
+  getElementById: id => id === 'status' ? STATUS
+                      : id === 'stage' ? STAGE
+                      : id === 'playhead' ? PLAYHEAD : null,
+  get activeElement() { return ACTIVE; },
+  addEventListener() {}, hidden: false};
+const window = {addEventListener() {}};
+let DOC = null, BASE = null, MEDIA = [], OFFLINE = {}, MISSING_MEDIA = new Set();
+let THEIRS = null, SAVING = false, INFLIGHT = 0, UNDO_BUSY = false;
+let DRAGGING = false, DRAG_MID = null, NUDGE_SAVE_TIMER = null, RAF = null;
+let CLOCK = 0, DREW = 0, BINS = 0, UNDO_KILLED = 0;
+// The browser clamps scrollLeft when draw() narrows the content, so a stub
+// that leaves it alone makes the restore assertion pass for free.
+function draw() { DREW++; STAGE.scrollLeft = 0; }
+function drawBin() { BINS++; }
+// ⚠️ The real reselect() runs inspect(), and inspect() MOVES THE PLAYHEAD to the
+// selected clip and shows that clip's own first frame. Stubbing it as a no-op is
+// what hid the playhead jump: the refresh has to survive its own reselect().
+let SEL = null, HEAD_UID = null, SHOWN_HEAD = null, PX = 64;
+function reselect() {
+  const c = SEL && DOC.clips.find(x => x.uid === SEL);
+  if (c) { CLOCK = Math.max(0, c.t); HEAD_UID = c.uid; } }
+function showClipHead(c) { HEAD_UID = c.uid; SHOWN_HEAD = c.uid; }
+function markOffline() {}
+function invalidateUndo() { UNDO_KILLED++; }
+function scrubTo(t) { CLOCK = t; }
+function note(m, col) { STATUS.textContent = m; STATUS.style.color = col || 'var(--ink-3)'; }
+function baseline() { BASE = DOC ? JSON.parse(JSON.stringify(DOC)) : null; }
+function totalLen() { return DOC.clips.length ? Math.max(...DOC.clips.map(c => c.t + 1)) : 0; }
+// Stand-ins for the two comparisons the save-loop region owns. Shape, not
+// arithmetic: what is under test here is the GATE, not the epsilon.
+const sameUidSet = (x, y) => {
+  const p = (x.clips||[]).map(c=>c.uid), q = (y.clips||[]).map(c=>c.uid);
+  return p.length === q.length && p.every((u, i) => u === q[i]); };
+const changedUids = (from, to) => {
+  const was = new Map((from.clips||[]).map(c => [c.uid, c]));
+  const out = new Set();
+  for (const c of (to.clips||[])) {
+    const old = was.get(c.uid);
+    if (!old || JSON.stringify(old) !== JSON.stringify(c)) out.add(c.uid); }
+  return out; };
+let SERVER = null, HANG = null;
+async function getJSON(url) {
+  if (HANG) await HANG();          // a chance to change the page mid-flight
+  return JSON.parse(JSON.stringify(SERVER)); }
+__REGION__
+// --- the sequence ------------------------------------------------------------
+function fail(m) { console.error('FAIL: ' + m); process.exit(1); }
+const shell = {fps: 24, resolution: [1920, 1080], name: 'f'};
+DOC = Object.assign({version: 3, clips: [{uid: 'c1', t: 0}], media: []}, shell);
+baseline();
+SERVER = {project: Object.assign({version: 4, media: [],
+            clips: [{uid: 'c1', t: 0}, {uid: 'c2', t: 5}]}, shell),
+          offline: [], missing_media: []};
+
+// A version has to survive one whole tick before it is taken: an agent mid-way
+// through a batch of edits would otherwise be followed through every one.
+await pollOnce();
+if (DOC.clips.length !== 1) fail('applied a version that had not settled');
+await pollOnce();
+if (DOC.clips.length !== 2) fail('never applied the settled version');
+if (DOC.version !== 4) fail('took the clips but not the version');
+if (UNDO_KILLED !== 1) fail('the frozen undo list survived a refresh');
+// An ADD is exactly what the 409 merge cannot do. It must not raise a banner.
+if (THEIRS) fail('a refresh raised a conflict');
+
+// An unsaved drag is never overwritten, however new the file is.
+DOC.clips[0].t = 9;
+SERVER.project.version = 5;
+await pollOnce(); await pollOnce();
+if (DOC.clips[0].t !== 9) fail('a refresh overwrote an unsaved local edit');
+
+// A request already in the air will adopt() a whole project when it lands, and
+// its success path writes to clip objects captured BEFORE it left.
+DOC.clips[0].t = 0; baseline();
+INFLIGHT = 1;
+await pollOnce(); await pollOnce();
+if (DOC.version !== 4) fail('refreshed while a request that ends in adopt() was in flight');
+INFLIGHT = 0;
+const bins = BINS;
+await pollOnce(); await pollOnce();
+if (DOC.version !== 5) fail('did not resume once the request landed');
+if (BINS !== bins) fail('re-rendered the bin for a change that never touched media');
+
+// A half-typed inspector value is unsaved work the DOCUMENT cannot see.
+ACTIVE = {tagName: 'INPUT'};
+SERVER.project.version = 6;
+await pollOnce(); await pollOnce();
+if (DOC.version !== 5) fail('refreshed while a field was being typed into');
+ACTIVE = null;
+
+// ⚠️⚠️ THE ONE THE PRE-FLIGHT CHECK CANNOT CATCH: the gate is clean on the way
+// out, and the director starts a drag while the request is away.
+await pollOnce();                                  // settle tick, clean
+HANG = async () => { DRAGGING = true; };
+await pollOnce();
+if (DOC.version !== 5) fail('the gate was not re-checked after the await');
+HANG = null; DRAGGING = false;
+
+// fps, resolution and name are what the frame math and the fault check are
+// written against: taking new clips against an old fps is not a half-refresh,
+// it is a page that disagrees with the renderer.
+SERVER.project.version = 7; SERVER.project.fps = 30;
+await pollOnce(); await pollOnce();
+if (DOC.version !== 5) fail('half-applied clips against a changed fps');
+if (!/reload/.test(STATUS.textContent)) fail('no reload notice for a shell change');
+
+// Our own newer write must never be walked backwards onto an older file.
+SERVER.project.fps = 24; SERVER.project.version = 1;
+await pollOnce(); await pollOnce();
+if (DOC.version !== 5) fail('walked backwards onto an older version');
+
+// EVERY flag in the gate, one at a time. An independent review mutation-tested
+// this harness and found six of them asserted by nothing at all: the test read
+// as thorough while the logic under it could be deleted wholesale.
+async function mustNotApply(what, on, off) {
+  const before = DOC.version;
+  SERVER.project.version = before + 1;
+  on(); await pollOnce(); await pollOnce(); off();
+  if (DOC.version !== before) fail('refreshed while ' + what);
+  SERVER.project.version = before; POLL_SEEN = null;
+}
+await mustNotApply('a save was in flight', () => SAVING = true, () => SAVING = false);
+await mustNotApply('a conflict was open', () => THEIRS = {}, () => THEIRS = null);
+await mustNotApply('undo/redo was in flight', () => UNDO_BUSY = true, () => UNDO_BUSY = false);
+await mustNotApply('a bin drag was in flight', () => DRAG_MID = 'm01', () => DRAG_MID = null);
+await mustNotApply('a nudge save was pending', () => NUDGE_SAVE_TIMER = 1, () => NUDGE_SAVE_TIMER = null);
+await mustNotApply('the cut was playing', () => RAF = 1, () => RAF = null);
+
+// ⚠️ An unsaved DELETE, not an add. changedUids() walks the clips in DOC, so an
+// ADD shows up there — but a delete leaves every surviving clip identical and is
+// invisible to it. sameUidSet is the only half that sees one.
+const cut = DOC.clips.pop();
+await mustNotApply('an unsaved local DELETE was on the timeline', () => {}, () => {});
+DOC.clips.push(cut);
+
+// Two polls must never be in the air at once.
+let air = 0, mostAir = 0;
+HANG = async () => { air++; mostAir = Math.max(mostAir, air);
+                     await new Promise(r => setTimeout(r, 5)); air--; };
+SERVER.project.version = DOC.version + 1;
+await Promise.all([pollOnce(), pollOnce(), pollOnce()]);
+HANG = null;
+if (mostAir > 1) fail('two polls were in the air at once');
+POLL_SEEN = null; SERVER.project.version = DOC.version;
+
+// ⚠️ THE PLAYHEAD. reselect() moves it to the selected clip, so a refresh that
+// does not carry the transport across throws the monitor to a different moment
+// of the film — while faithfully restoring the scroll, which then holds the view
+// where the playhead no longer is.
+CLOCK = 3; SEL = 'c2'; HEAD_UID = null; STAGE.scrollLeft = 240;   // c2 is at t=5
+SERVER.project.version = DOC.version + 1;
+await pollOnce(); await pollOnce();
+if (DOC.version === 5) fail('the refresh never applied');
+if (CLOCK !== 3) fail('the refresh moved the playhead to the selected clip');
+if (STAGE.scrollLeft !== 240) fail('the refresh lost the stage scroll');
+SEL = null;
+
+// absorb() owns OFFLINE and MISSING_MEDIA now: they used to be set ONLY in
+// boot(), which is the whole reason it exists as a shared path. A file going
+// missing also has to redraw the bin — the media list is byte-identical, but
+// every row's `gone` state comes from these two.
+const binsBefore = BINS;
+SERVER.offline = [{uid: 'c1', why: 'missing'}];
+SERVER.missing_media = ['m09'];
+SERVER.project.clips[1].t = 7;      // a stale BASE is invisible unless clips move
+SERVER.project.version = DOC.version + 1;
+await pollOnce(); await pollOnce();
+if (!OFFLINE.c1) fail('absorb() did not take the offline list');
+if (!MISSING_MEDIA.has('m09')) fail('absorb() did not take the missing media list');
+if (BINS === binsBefore) fail('the bin was not redrawn when a file went missing');
+// ⚠️ Asserted DIRECTLY, not via changedUids(BASE, DOC): the harness calls
+// baseline() itself further up to simulate a save, and that masked a missing
+// baseline() inside absorb() well enough for the mutant to survive. Without it
+// the next poll reads the document it just took as unsaved local work and the
+// page never refreshes again.
+if (JSON.stringify(BASE.clips) !== JSON.stringify(DOC.clips))
+  fail('absorb() left BASE stale');
+
+// A shell mismatch is permanent — absorb() never takes the shell — so the
+// notice has to be said once per NEW version, not once per session.
+SERVER.project.version = DOC.version + 1; SERVER.project.fps = 30;
+await pollOnce(); await pollOnce();
+STATUS.textContent = 'saved';                 // a later save paints over it
+SERVER.project.version = DOC.version + 2;
+await pollOnce(); await pollOnce();
+if (!/reload/.test(STATUS.textContent)) fail('the reload notice was said only once');
+SERVER.project.fps = 24;
+
+// And a file that has not moved is not a redraw.
+SERVER.project.version = DOC.version;
+const drew = DREW;
+await pollOnce(); await pollOnce();
+if (DREW !== drew) fail('redrew when nothing had changed');
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "liverefresh.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+        assert "js ok" in r.stdout, r.stdout
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

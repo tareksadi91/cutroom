@@ -429,6 +429,21 @@ function flushNudgeSave() {
 const MON = {};
 let DRAG_MID = null, SEAM = null;   // media in flight from the bin, and where it would land
 
+// How many requests are in the air that will hand back a whole project and
+// adopt() it. The live poll must not fire while one is: a pass runs ffmpeg for
+// seconds or minutes and its success path then writes `c.mid` on a clip object
+// captured BEFORE the request went out. Swap DOC.clips underneath that closure
+// and the re-point lands on an orphan — the pass appears to do nothing, and the
+// timeline goes on showing the old source with no error anywhere.
+//
+// It is a counter and not a flag because the picker can be open while a pass
+// finishes; the poll may only run when the count is back to zero.
+let INFLIGHT = 0;
+const held = fn => async (...a) => {
+  INFLIGHT++;
+  try { return await fn(...a); } finally { INFLIGHT--; }
+};
+
 const el=(t,c)=>{const e=document.createElement(t); if(c) e.className=c; return e;};
 const dur = c => (c.out - c.in) / c.rate;
 const endOf = c => c.t + dur(c);
@@ -783,7 +798,7 @@ function drawBin() {
   const add = el('div'); add.id = 'add';
   add.innerHTML = `<button id="pick" title="choose files and copy them into this project">Add media…</button>`;
   box.append(add);
-  document.getElementById('pick').onclick = pickMedia;
+  document.getElementById('pick').onclick = held(pickMedia);
 
   for (const m of MEDIA) {
     // A file that is not on disk at all can never be dragged in again, and
@@ -823,7 +838,7 @@ function drawBin() {
       DRAG_MID = m.mid;
     };
     r.ondragend = () => { DRAG_MID = null; clearSeam(); };
-    r.querySelector('.rm').onclick = e => { e.stopPropagation(); removeMedia(m.mid); };
+    r.querySelector('.rm').onclick = e => { e.stopPropagation(); held(removeMedia)(m.mid); };
     box.append(r);
   }
   const binEl = document.getElementById('bin');
@@ -2142,7 +2157,7 @@ function inspect(c) {
       c.audio ? "this clip's sound is in the film" : "this clip is silent in the film");
     save(); syncAudio(CLOCK, false); };
   const run = document.getElementById('runpass');
-  if (run) run.onclick = async () => {
+  if (run) run.onclick = held(async () => {
     note('running…', 'var(--warn)');
     const r = await fetch('/pass', {
       method: 'POST', headers: wHeaders({'Content-Type': 'application/json'}),
@@ -2172,7 +2187,7 @@ function inspect(c) {
     draw(); inspect(c);
     note(`pass done · ${b.media.label} · ${(b.media.dur||0).toFixed(2)}s`, 'var(--accent)');
     scrubTo(CLOCK);
-  };
+  });
 }
 
 function zoom(d) { ZI = Math.max(0, Math.min(ZOOMS.length-1, ZI+d));
@@ -2223,7 +2238,7 @@ HIST.onmousedown = async () => {
       .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
   } catch (e) { note('could not list history — ' + e.message, 'var(--danger)'); }
 };
-HIST.onchange = async () => {
+HIST.onchange = held(async () => {
   await flushNudgeSave();
   const stamp = HIST.value;
   HIST.selectedIndex = 0;
@@ -2245,7 +2260,7 @@ HIST.onchange = async () => {
     adopt(b, true); scrubTo(CLOCK);
     note('restored ' + stamp, 'var(--accent)');
   } catch (e) { note('restore failed — ' + e.message, 'var(--danger)'); }
-};
+});
 
 // >>> undo-redo
 // ── undo / redo (⌘Z / ⇧⌘Z) ──────────────────────────────────────────────
@@ -2510,18 +2525,198 @@ async function getJSON(url) {
   if (!r.ok) throw new Error(url + ' → ' + r.status);
   return r.json();
 }
+// >>> live-refresh (extracted verbatim by test_server.py — keep both markers)
+// The page follows the file. An agent editing the cut beside the director is
+// the normal way this tool gets used, and until now the only way to see that
+// edit was a manual browser reload.
+//
+// ⚠️⚠️ THIS IS NOT THE 409 PATH AND MUST NOT REUSE IT. rebaseable() answers a
+// different question — "can I merge MY unsaved work with theirs" — and it
+// requires the same clip set on both sides, so an agent that ADDS or DELETES a
+// clip fails it and raises the conflict banner. Here there is nothing to merge:
+// the poll runs only when the page holds no unsaved work at all, and then
+// taking the file wholesale is the honest answer, not a conflict.
+const POLL_MS = 3000;
+let POLL_SEEN = null;      // the version seen last tick, for the settle check
+let POLL_BUSY = false;     // one poll in the air at a time
+let SHELL_WARNED_AT = null;   // the version the reload notice was last said for
+// Everything that is not the clip list is a whole-cut property: the grid, the
+// frame math and timelineFault() are all written against fps and resolution.
+// ⚠️ Named the same way rebaseable()'s shell() names it — by EXCLUSION, not by
+// listing three keys — so a top-level field an agent adds cannot be quietly
+// taken and reverted by a poll that did not know to look at it. Sorted, because
+// two documents can carry the same fields in a different order.
+const shellOf = d => JSON.stringify(Object.entries(d)
+  .filter(([k]) => k !== 'clips' && k !== 'version' && k !== 'media')
+  .sort(([a], [c]) => a < c ? -1 : a > c ? 1 : 0));
+
+// Take a fresh /project envelope into the page's state. Shared by the first
+// load and every live refresh so there is one load path and not two that drift.
+// Returns whether the MEDIA list actually moved: drawBin() re-issues a /thumb
+// request per item, and an agent retiming one clip should not cost fifty.
+function absorb(b) {
+  const p = b.project;
+  // ⚠️ NOT just the media list. The bin draws each row's `gone` state from
+  // OFFLINE and MISSING_MEDIA, so a file that goes missing — or comes back —
+  // changes what the bin must show while the media list stays byte-identical.
+  // Gating the redraw on the list alone leaves a 404 thumbnail sitting there,
+  // or keeps a recovered file hidden, until somebody reloads.
+  const sortedJoin = xs => xs.slice().sort().join(',');
+  const binStale = !DOC
+    || JSON.stringify(p.media || []) !== JSON.stringify(DOC.media || [])
+    || sortedJoin((b.offline || []).map(o => o.uid)) !== sortedJoin(Object.keys(OFFLINE))
+    || sortedJoin(b.missing_media || []) !== sortedJoin([...MISSING_MEDIA]);
+  if (!DOC) DOC = p;                 // first load: the shell comes with it
+  else {
+    // The clip objects ARE replaced here, which orphans every closure holding
+    // one — that is precisely what pollBusy() exists to prevent, and why
+    // reselect() has to run after this. The shell is never taken this way.
+    DOC.clips = p.clips || [];
+    DOC.media = p.media || [];
+    DOC.version = p.version;
+  }
+  baseline();
+  MEDIA = (DOC.media || []).map(m => ({...m}));
+  OFFLINE = {};
+  for (const o of (b.offline || [])) OFFLINE[o.uid] = o;
+  MISSING_MEDIA = new Set(b.missing_media || []);
+  markOffline();
+  return binStale;
+}
+
+// Is there anything on this page a refresh could destroy?
+//
+// Every condition here is a SKIP, and a skip degrades to exactly the behaviour
+// that existed before this feature: reload by hand. Only the apply path can
+// lose work, which is why the gate is asked again after the await.
+function pollBusy() {
+  if (!DOC || !BASE) return true;
+  if (THEIRS || SAVING || INFLIGHT || UNDO_BUSY) return true;
+  // ⚠️ DRAG_MID is the drag from the BIN and it does not set DRAGGING. draw()
+  // replaces every lane, so refreshing mid-drag drops the media onto a detached
+  // node: no error, no clip, nothing.
+  if (DRAGGING || DRAG_MID || NUDGE_SAVE_TIMER) return true;
+  if (RAF) return true;                    // playing — wait for the stop
+  // ⚠️ A half-typed inspector value is unsaved work the DOCUMENT cannot see:
+  // DOC still matches BASE, so every other test here reads "clean" while
+  // reselect() is about to rebuild the field and bin what was typed.
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName || '')) return true;
+  // Unsaved local edits. sameUidSet catches an add or a delete, which
+  // changedUids alone cannot — it only walks the clips that are still there.
+  if (!sameUidSet(BASE, DOC) || changedUids(BASE, DOC).size) return true;
+  return false;
+}
+
+function applyRefresh(b) {
+  // ⚠️ The frozen undo list is a walk back through snapshot stamps taken before
+  // this write existed, so keeping it would let the next Cmd+Z step straight
+  // over the edit that just arrived. Dropping it means the director's next
+  // Cmd+Z undoes the AGENT'S edit — the same as after a manual reload, which is
+  // the thing this replaces.
+  invalidateUndo();
+  const stage = document.getElementById('stage');
+  const keepScroll = stage ? stage.scrollLeft : 0;
+  // ⚠️⚠️ SAVE THE TRANSPORT, NOT JUST THE SCROLL. reselect() runs inspect(),
+  // and inspect() MOVES THE PLAYHEAD to the selected clip and shows that clip's
+  // own first frame. That is right when a human clicks a clip and wrong here,
+  // where nobody asked: parked at 100s with a clip at 12s selected, an agent
+  // renaming a label would throw the monitor to 12s — and the scroll restore
+  // below would then faithfully hold the view where the playhead no longer is.
+  const keepClock = CLOCK, keepHead = HEAD_UID;
+  if (absorb(b)) drawBin();
+  draw(); reselect();
+  // draw() leaves #stage itself in place, but a cut that got shorter narrows
+  // the content and the browser clamps the scroll — put it back, and let the
+  // clamp stand where the new cut really is that short.
+  if (stage) stage.scrollLeft = keepScroll;
+  CLOCK = Math.min(keepClock, totalLen());
+  const ph = document.getElementById('playhead');
+  if (ph) ph.style.left = CLOCK * PX + 'px';
+  // A clip-head view is a question about ONE clip ("show me its first frame"),
+  // and it outlives a refresh as long as that clip does. Only fall back to
+  // painting the timeline when it does not.
+  const head = keepHead && DOC.clips.find(c => c.uid === keepHead);
+  if (head) showClipHead(head); else scrubTo(CLOCK);
+  POLL_SEEN = null;
+  // Never over a red one: those are about the state of the cut, this is only
+  // about where it came from.
+  const s = document.getElementById('status');
+  if (!s || s.style.color !== 'var(--danger)') note('updated from the cut room');
+}
+
+async function pollOnce() {
+  if (POLL_BUSY || pollBusy()) return;
+  POLL_BUSY = true;
+  try {
+    let b;
+    // A poll failure is not an event. The server being down, asleep or
+    // restarting must never paint the status line, or a closed laptop wakes to
+    // a red banner over whatever the page actually had to say.
+    try { b = await getJSON('/project'); } catch (e) { return; }
+    if (!b || !b.project || !DOC) return;
+    const v = b.project.version;
+    if (v === DOC.version) { POLL_SEEN = null; return; }
+    if (v < DOC.version) return;   // our own newer write; never walk backwards
+    // Settle. An agent doing thirty edit_project() calls in a row would
+    // otherwise be followed through all thirty — a full redraw each time, and
+    // each landing on a state it is about to replace. Take a version only once
+    // it has survived a whole tick unchanged.
+    if (POLL_SEEN !== v) { POLL_SEEN = v; return; }
+    // Half-applying new clips against the old fps would put the page's own
+    // fault check out of step with the renderer, so a shell change is the one
+    // thing the poll refuses to take by itself.
+    if (shellOf(b.project) !== shellOf(DOC)) {
+      // ⚠️ ONCE PER VERSION, NOT ONCE PER SESSION. absorb() never takes the
+      // shell, so from the first mismatch onward this branch is the only path
+      // left — a one-shot latch would say "reload" a single time, let the next
+      // save() paint "saved" over it, and leave the page silently twenty
+      // versions behind while still claiming to be current. The whole value of
+      // the feature is that being current is a guarantee; when it stops being
+      // one, that has to keep being said.
+      if (SHELL_WARNED_AT !== v) {
+        note('the project settings changed — reload to pick them up', 'var(--warn)');
+        SHELL_WARNED_AT = v;
+      }
+      return;
+    }
+    // ⚠️⚠️ THE GATE AGAIN, AFTER THE AWAIT. A drag can start, a save can land
+    // and Cmd+Z can be pressed while the request is away — the same window the
+    // save loop documents for its own PUT.
+    if (pollBusy()) return;
+    applyRefresh(b);
+  } finally { POLL_BUSY = false; }
+}
+// <<< live-refresh
+
+function startPolling() {
+  // A chain, not setInterval: a slow tick or a sleeping laptop would otherwise
+  // stack requests that all land at once on the way back up.
+  const loop = async () => {
+    try { await pollOnce(); } finally { setTimeout(loop, POLL_MS); }
+  };
+  setTimeout(loop, POLL_MS);
+  // A hidden tab has its timers throttled to roughly one a minute, so coming
+  // back to the tab is both when the page is most stale and when it is least
+  // likely to be about to poll. Ask on the way in.
+  //
+  // ⚠️⚠️ VISIBILITY ONLY — NOT `focus`. The blur backstop two hundred lines
+  // below sets DRAGGING = false unconditionally, so a window-level focus
+  // listener would poll at the one instant the gate has been told a live drag
+  // is over: press on a clip, switch app, come back with the button still
+  // down, and the refresh replaces the very clip objects the drag is holding.
+  // A visible-but-unfocused tab is not throttled, so the 3s loop already covers
+  // that case and this listener is not worth the hole.
+  document.addEventListener('visibilitychange',
+    () => { if (!document.hidden) pollOnce(); });
+}
+
 async function boot() {
   updateMasterAudio();
   try {
     const b = await getJSON('/project');
-    DOC = b.project;
-    baseline();
-    MEDIA = (DOC.media || []).map(m => ({...m}));
+    absorb(b);
     PASSES = b.passes || [];
-    OFFLINE = {};
-    for (const o of b.offline) OFFLINE[o.uid] = o;
-    MISSING_MEDIA = new Set(b.missing_media || []);
-    markOffline();
     document.getElementById('film').textContent = DOC.name;
     document.getElementById('tip-res').innerHTML =
       DOC.resolution[0] + '&times;' + DOC.resolution[1];
@@ -2535,6 +2730,9 @@ async function boot() {
     if (Object.keys(OFFLINE).length)
       note(Object.keys(OFFLINE).length + ' clip(s) OFFLINE — the cut is intact, '
            + 'export is blocked until the files are back', 'var(--danger)');
+    // Only once the page is actually loaded. A boot that failed has no DOC to
+    // refresh onto and nothing worth polling for.
+    startPolling();
   } catch (e) {
     note('could not load the cut — ' + e.message, 'var(--danger)');
     document.getElementById('insp').innerHTML =
