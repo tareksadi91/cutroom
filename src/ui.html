@@ -1876,41 +1876,50 @@ function showClipHead(c) {
 }
 // <<< clip-head
 // >>> monitor-feed (extracted verbatim by test_server.py — keep both markers)
-// ⚠️⚠️ A SEEK IS NOT A FREE CORRECTION, AND THE OLD RULE ASSUMED IT WAS.
+// ⚠️⚠️ A SEEK IS NOT A FREE CORRECTION, AND THE FIRST RULE HERE ASSUMED IT WAS.
 // "Seek whenever the element is more than 0.2s off the playhead" is a feedback
 // loop on any source heavy enough that a seek costs more than 0.2s of decode:
 // the seek stalls playback, the stall rebuilds the drift, the drift seeks
-// again — about four times a second, forever, because each correction re-
-// creates the condition that triggers it. ready() then blanks the picture for
-// every one of those seeks (correctly — mid-seek the element holds a stale
-// frame), so the cut strobes black between frames.
+// again — ~4 times a second, forever. ready() blanks the picture for each one
+// (correctly: mid-seek an element holds a stale frame), so the cut strobed.
+// Measured: 64 of 300 painted frames black.
 //
-// Measured on a 12-17 Mbps 720p cut, in a real browser: 64 of 300 painted
-// frames black, 42 on/off flips, ~4.3 seeks a second.
+// ⚠️⚠️ AND CORRECTING IT CONTINUOUSLY ON RATE WAS ALSO WRONG, for two reasons
+// measured on real footage:
+//   1. Writing playbackRate every frame fired 1233 `ratechange` events in 22s.
+//      Each one re-configures the audio pipeline, and the sound breaks up —
+//      the strobe was gone and the audio was worse.
+//   2. Proportional correction alone holds a PERMANENT error: it settles where
+//      the nudge exactly offsets the decode deficit, so a machine that sustains
+//      95% of real-time parks the picture 0.105s behind for good, silently,
+//      with no seek and no symptom. Past the cap it does not settle at all —
+//      measured running away to -0.70s while pinned at +15%.
 //
-// ⚠️ RAISING THE THRESHOLD IS NOT THE FIX. At 0.75s the strobe stops and the
-// picture simply sits 0.54s BEHIND the playhead for good — nothing ever trips
-// the correction again. Measured, and worse for cutting than the flicker.
-//
-// So while PLAYING, catch up on RATE. A few percent is inaudible, costs no
-// stall and no blank frame, and it converges: -0.225s to -0.004s over six
-// seconds, zero black frames in 600. A seek is kept only for a jump, which is
-// not drift at all.
-// ±15%. Measured on real footage: at ±5% the nudge PINS at the cap and never
-// converges — the picture just sits 0.1-0.5s behind, which is the same fault as
-// raising the seek threshold, only slower. At ±15% drift closes from -0.22s to
-// -0.01s in about 2.5s. ±30% measured identical, because the 0.5 gain below is
-// what actually governs, so this cap only bounds the pitch wobble after a cut.
-const NUDGE = 0.15;
-const JUMP  = 1.0;    // past this it is a scrub or a cut, not drift
+// So: PREVENT the error rather than chase it. A slot handed a clip it was not
+// positioned for lands exactly, once. The incoming clip is pre-rolled so it is
+// already at speed when the cut arrives. What is left is small, and a deadband
+// means the common case writes no rate at all.
+const NUDGE  = 0.03;   // ±3%: small enough that time-stretch is inaudible
+const DEAD   = 0.06;   // ~1.5 frames at 24fps: inside this, run at exactly c.rate
+const JUMP   = 1.0;    // past this it is a scrub or a cut, not drift
+const STUCK  = 2000;   // ms pinned at the cap before admitting the nudge cannot win
+const COOL   = 3000;   // ms between backstop seeks, so a stall cannot re-trigger one
+let MONITOR_BEHIND = false;
+// The paused tolerance must sit BETWEEN half a frame and a whole one: above the
+// worst landing error of a seek that snaps to a frame boundary (else the
+// readiness listener re-seeks the same spot forever and the monitor stays
+// black), and below one frame, or a single arrow-key step moves nothing.
+const frameTol = () => 0.75 / ((DOC && DOC.fps) || 24);
 function feed(slot,c,t) {
   const v = document.getElementById(slot);
   const want = mediaURL(c.mid);
+  // Captured BEFORE the assignment below: a slot that was not already tracking
+  // this clip is not positioned for it, whatever its currentTime happens to say.
+  const fresh = SLOT_UID[slot] !== c.uid;
   if (MON[slot]!==want) { v.preload='auto'; v.src=want; MON[slot]=want; }
   SLOT_UID[slot] = c.uid;
   // The model says a clip at rate r consumes r seconds of source per second of
-  // timeline. Without this the element ran at 1.0 and no retime could be judged
-  // in the monitor at all.
+  // timeline, so the rate is what the cut asks for and the nudge rides on top.
   const target = c.in + (t-c.t)*c.rate;
   const drift = v.currentTime - target;
   // ⚠️⚠️ PAUSED IS THE OPPOSITE PROBLEM AND MUST STAY EXACT. Scrubbing shows a
@@ -1919,18 +1928,54 @@ function feed(slot,c,t) {
   // for every drag shorter than a second — which is most of them.
   if (RAF === null) {
     setRate(v, c.rate);
-    if (Math.abs(drift) > 0.04) v.currentTime = target;   // one frame at 24fps
+    if (Math.abs(drift) > frameTol()) v.currentTime = target;
     return v;
   }
-  if (!v.seeking && Math.abs(drift) > JUMP) {
+  // ⚠️ FRESH IS THE CASE preloadNext() COULD NOT COVER. It bails whenever both
+  // slots are busy — every crossfade — so the clip after a dissolve arrives in a
+  // slot holding someone else's position. Nudging from there can take the whole
+  // shot; landing it once costs a single frame, at a cut, where the picture is
+  // changing anyway.
+  if (!v.seeking && (fresh || Math.abs(drift) > JUMP)) {
     setRate(v, c.rate);
     v.currentTime = target;
+    v.cutroomPinned = 0;
     return v;
   }
-  // Half the error per second: fast enough to close the gap a cut opens, gentle
-  // enough that nothing audible happens on the way.
-  const k = Math.max(-NUDGE, Math.min(NUDGE, -drift * 0.5));
-  setRate(v, c.rate * (1 + k), c.rate);
+  // Deadband. Inside a frame and a half the picture is right, and the honest
+  // rate is the clip's own — chasing zero from here is what produced a rate
+  // change on every frame and broke the sound.
+  const k = Math.abs(drift) > DEAD
+    ? Math.max(-NUDGE, Math.min(NUDGE, -drift * 0.5))
+    : 0;
+  // ⚠️ Only WRITE when it changes materially: `ratechange` is what the audio
+  // pipeline hears, not the value.
+  const wanted = c.rate * (1 + k);
+  if (Math.abs(v.playbackRate - wanted) > 0.004) setRate(v, wanted, c.rate);
+  // The backstop, and the honesty. If the nudge has been pinned at the cap for
+  // STUCK ms it is not going to win — this machine cannot decode this source at
+  // speed — so land it once, rate-limited so a stall cannot turn this back into
+  // the seek loop, and SAY so, because a monitor that is quietly 0.5s behind the
+  // sound is the failure a cutting room cannot see.
+  const now = performance.now();
+  if (Math.abs(k) >= NUDGE - 1e-9) {
+    if (!v.cutroomPinned) v.cutroomPinned = now;
+  } else v.cutroomPinned = 0;
+  // ⚠️ `|| 0` would mean "seeked at page load", and performance.now() is small
+  // for the first seconds of a session — the backstop could not fire at all
+  // during them. Never-seeked has to mean never.
+  const last = v.cutroomLastSeek === undefined ? -Infinity : v.cutroomLastSeek;
+  if (v.cutroomPinned && now - v.cutroomPinned > STUCK && !v.seeking
+      && now - last > COOL) {
+    v.currentTime = target;
+    v.cutroomLastSeek = now;
+    v.cutroomPinned = 0;
+    if (!MONITOR_BEHIND) {
+      MONITOR_BEHIND = true;
+      note('the monitor cannot decode this source at speed — the picture is behind the sound',
+           'var(--warn)');
+    }
+  }
   return v;
 }
 // <<< monitor-feed

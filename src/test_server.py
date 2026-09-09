@@ -4420,20 +4420,24 @@ console.log('js ok');
 
 
 def test_the_monitor_catches_up_on_rate_and_only_seeks_for_a_real_jump():
-    """The stutter that read as "black between every frame".
+    """The stutter that read as "black between every frame", and the audio
+    break-up that replaced it.
 
     feed() used to seek whenever the element was more than 0.2s off the
     playhead. On a source heavy enough that a seek costs more than 0.2s of
-    decode that is a feedback loop — the seek stalls playback, the stall
-    rebuilds the drift, the drift seeks again — and ready() blanks the picture
-    for every seek, correctly, because mid-seek an element holds a stale frame.
-    Measured on a 12-17 Mbps cut in a real browser: 64 of 300 painted frames
-    black, ~4.3 seeks a second.
+    decode that is a feedback loop, and ready() blanks the picture for every
+    seek: 64 of 300 painted frames black, measured.
 
-    So while playing, a small lag is corrected on playbackRate instead, which
-    costs no stall and no blank frame. A seek survives for a genuine jump, and
-    for the PAUSED case, where seeking is the only thing that can show the
-    frame that was asked for.
+    Correcting continuously on rate instead was also wrong. Writing
+    playbackRate every frame fired 1233 ratechange events in 22 seconds and the
+    SOUND broke up; and proportional correction alone holds a permanent error,
+    so a machine that cannot quite decode at speed parks the picture behind the
+    playhead silently, which is the failure a cutting room cannot see.
+
+    So the error is PREVENTED: a slot handed a clip it was not positioned for
+    lands exactly once, a deadband means the common case writes no rate at all,
+    and when the nudge is pinned at the cap the tool says so instead of drifting
+    quietly.
     """
     html = (pathlib.Path(server.HERE) / "ui.html").read_text()
     a = html.index("// >>> monitor-feed")
@@ -4447,43 +4451,53 @@ def test_the_monitor_catches_up_on_rate_and_only_seeks_for_a_real_jump():
 
     harness = r"""
 // --- the smallest monitor feed() touches -------------------------------------
-let RAF = 1;                      // playing unless a case says otherwise
+let RAF = 1;                       // playing unless a case says otherwise
+let DOC = {fps: 24};
 const MON = {}, SLOT_UID = {};
 const mediaURL = mid => '/media/' + mid;
-let SEEKS = 0, RATES = [];
-function setRate(v, rate, base) { RATES.push(+rate.toFixed(4)); v.playbackRate = rate; }
-function mkEl(ct) {
-  return {currentTime: ct, playbackRate: 1, seeking: false, preload: '', src: '',
-          _ct: ct,
-          get currentTimeProxy() { return this.currentTime; }};
-}
+let NOTES = [], RATE_WRITES = 0;
+// The region reads performance.now(); a real clock makes the backstop timings
+// untestable without sleeping for seconds, so drive it explicitly.
+let NOW = 100000;
+const performance = {now: () => NOW};
+function note(m) { NOTES.push(m); }
+function setRate(v, rate, base) { RATE_WRITES++; v.playbackRate = rate; }
 const EL = {};
 const document = {getElementById: id => EL[id]};
 __REGION__
 // --- the sequence ------------------------------------------------------------
 function fail(m) { console.error('FAIL: ' + m); process.exit(1); }
 const clip = {uid: 'c1', mid: 'm01', t: 0, in: 0, out: 10, rate: 1};
+EL.mA = {currentTime: 0, playbackRate: 1, seeking: false, preload: '', src: ''};
+const v = EL.mA;
+MON.mA = '/media/m01';
 
-// A quarter-second lag while PLAYING is what a cut leaves behind. It must be
-// corrected on rate, never by seeking: a seek here is the stall that starts the
-// loop and the blank frame the director actually sees.
-EL.mA = mkEl(0); MON.mA = '/media/m01';
-let v = EL.mA;
-v.currentTime = 4.75;                        // the element is 0.25s behind
+// ⚠️ A slot that is NOT already tracking this clip is not positioned for it,
+// whatever its currentTime says. preloadNext() bails whenever both slots are
+// busy — every crossfade — so this is the clip after a dissolve, and nudging it
+// into place can take the whole shot. Land it once, at the cut.
+SLOT_UID.mA = 'someone-else';
+v.currentTime = 4.9;               // only 0.1s off: drift alone would nudge
+feed('mA', clip, 5.0);
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('a slot handed a new clip did not land exactly');
+
+// From here the slot IS tracking the clip, which is the nudge's domain.
+// A quarter-second lag is what a cut leaves behind. Correct it on rate: a seek
+// here is the stall that starts the loop and the blank frame the director sees.
+v.currentTime = 4.75; v.playbackRate = 1;
 let before = v.currentTime;
 feed('mA', clip, 5.0);
 if (v.currentTime !== before) fail('seeked to correct a 0.25s lag while playing');
 if (!(v.playbackRate > 1)) fail('did not speed up to catch up a lag');
-if (v.playbackRate > 1.15001) fail('nudged harder than the ±15% cap');
+if (v.playbackRate > 1.03001) fail('nudged harder than the ±3% cap');
 
-// ⚠️ The cap has to BIND somewhere or it is not tested at all: k is -drift/2, so
-// only a lag past 0.3s reaches it. Under a second is still drift, not a jump.
-v.currentTime = 5.0 - 0.8;
-before = v.currentTime;
+// The cap has to BIND somewhere or it is not tested: k is -drift/2, so any lag
+// past 0.06s reaches it. Under a second is still drift, not a jump.
+v.currentTime = 5.0 - 0.8; before = v.currentTime;
 feed('mA', clip, 5.0);
 if (v.currentTime !== before) fail('seeked for a 0.8s lag instead of nudging');
-if (Math.abs(v.playbackRate - 1.15) > 1e-9)
-  fail('the ±15% cap did not bind on a large lag (rate ' + v.playbackRate + ')');
+if (Math.abs(v.playbackRate - 1.03) > 1e-9)
+  fail('the ±3% cap did not bind on a large lag (rate ' + v.playbackRate + ')');
 
 // Running AHEAD is the same problem mirrored: slow down, do not seek back.
 v.currentTime = 5.25; before = v.currentTime;
@@ -4491,44 +4505,93 @@ feed('mA', clip, 5.0);
 if (v.currentTime !== before) fail('seeked to correct a 0.25s lead while playing');
 if (!(v.playbackRate < 1)) fail('did not slow down when running ahead');
 
-// In sync: the rate must come back to the clip's own rate, or the nudge that
-// closed the gap would then open one in the other direction.
-v.currentTime = 5.0;
+// ⚠️⚠️ THE DEADBAND, which is what stopped the sound breaking up. Inside a frame
+// and a half the picture is right and the honest rate is the clip's own —
+// chasing zero from here wrote a new playbackRate on EVERY frame, and each
+// write is a ratechange the audio pipeline hears.
+v.currentTime = 5.0 - 0.04; v.playbackRate = 1;
+let writes = RATE_WRITES;
 feed('mA', clip, 5.0);
-if (Math.abs(v.playbackRate - 1) > 1e-9) fail('did not settle back to the clip rate when in sync');
+feed('mA', clip, 5.0);
+if (RATE_WRITES !== writes) fail('wrote a rate for a drift inside the deadband');
+if (v.playbackRate !== 1) fail('did not run at the clip rate inside the deadband');
+
+// And no repeated writes once it has settled, either.
+v.currentTime = 5.0; writes = RATE_WRITES;
+for (let i = 0; i < 5; i++) feed('mA', clip, 5.0);
+if (RATE_WRITES - writes > 1) fail('rewrote the rate every frame while in sync');
 
 // A retimed clip is nudged AROUND ITS OWN RATE, not around 1.0.
-const slow = {uid: 'c2', mid: 'm01', t: 0, in: 0, out: 10, rate: 0.5};
-v.currentTime = 2.4;                        // target 2.5 -> 0.1s behind
+const slow = {uid: 'c1', mid: 'm01', t: 0, in: 0, out: 10, rate: 0.5};
+v.currentTime = 2.4; v.playbackRate = 0.5;      // target 2.5 -> 0.1s behind
 feed('mA', slow, 5.0);
-if (!(v.playbackRate > 0.5 && v.playbackRate <= 0.5 * 1.15001))
+if (!(v.playbackRate > 0.5 && v.playbackRate <= 0.5 * 1.03001))
   fail('nudged a retimed clip around 1.0 instead of around its own rate');
 
-// A real JUMP is not drift — a scrub or a cut still seeks outright.
-v.currentTime = 0.0; v.playbackRate = 1;
+// A real JUMP is not drift — a scrub or a cut still seeks outright. Pinned just
+// past the threshold, not far past it, or a wider JUMP would pass this too.
+v.currentTime = 5.0 - 1.5; v.playbackRate = 1;
 feed('mA', clip, 5.0);
-if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('did not seek for a jump larger than a second');
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('did not seek for a 1.5s jump');
+// and just inside it is still drift, to be nudged rather than seeked
+v.currentTime = 5.0 - 0.9; v.playbackRate = 1; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked for a 0.9s error instead of nudging');
+v.cutroomPinned = 0;
 
-// ⚠️ Never stack a second seek on one already in flight: that is what keeps the
-// element permanently mid-seek, and ready() paints black the whole time.
-v.currentTime = 0.0; v.seeking = true;
-before = v.currentTime;
+// ⚠️ Never stack a seek on one already in flight: that is what keeps an element
+// permanently mid-seek, and ready() paints black the whole time.
+v.currentTime = 0.0; v.seeking = true; before = v.currentTime;
 feed('mA', clip, 5.0);
 if (v.currentTime !== before) fail('issued a seek while one was already in flight');
 v.seeking = false;
 
+// ⚠️⚠️ THE BACKSTOP AND THE HONESTY. Pinned at the cap means the nudge cannot
+// win — this machine cannot decode this source at speed. Proportional control
+// alone would sit there permanently, silently, with no seek and no symptom.
+NOW = 100000;
+v.currentTime = 5.0 - 0.9; v.playbackRate = 1;
+feed('mA', clip, 5.0);                       // pins at NOW
+NOW = 100500;                                // half a second: not yet stuck
+v.currentTime = 5.0 - 0.9; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('backstopped before it was stuck');
+if (NOTES.length) fail('warned before it was stuck');
+NOW = 103000;                                // three seconds pinned
+v.currentTime = 5.0 - 0.9;
+feed('mA', clip, 5.0);
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('never landed a stuck picture');
+if (!NOTES.some(n => /behind the sound/.test(n)))
+  fail('a monitor that cannot keep up did not say so');
+// ⚠️ and the cooldown must stop that becoming the seek loop all over again:
+// one seek every three seconds is a backstop, one every 0.23s was the disease.
+v.cutroomPinned = 100000;                    // pinned long enough again
+NOW = 104000;                                // but only 1s since that seek
+v.currentTime = 5.0 - 0.9; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('backstopped again inside the cooldown');
+
 // ⚠️⚠️ PAUSED IS THE OPPOSITE CASE. Scrubbing shows a frame by seeking to it, so
-// a sub-second drag MUST move the picture — the tolerance that is right while
-// playing would leave the monitor on the wrong frame for most drags.
+// a sub-second drag MUST move the picture.
 RAF = null;
 v.currentTime = 4.75;
 feed('mA', clip, 5.0);
 if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('a scrub shorter than a second did not move the picture');
-// but not for a sub-frame difference, which would seek on every paint
-v.currentTime = 4.99;
-before = v.currentTime;
+// A single frame step must move it too — the tolerance has to stay under one frame.
+v.currentTime = 5.0 - 1 / DOC.fps;
 feed('mA', clip, 5.0);
-if (v.currentTime !== before) fail('seeked for less than a frame while paused');
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('a one-frame step did not move the picture');
+// but not a sub-half-frame difference, or a seek that lands on a frame boundary
+// re-triggers itself forever and the monitor stays black.
+v.currentTime = 5.0 - 0.4 / DOC.fps; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked for less than half a frame while paused');
+// and the tolerance follows the project, not a hardcoded 24
+DOC = {fps: 60};
+v.currentTime = 5.0 - 1 / 60;
+feed('mA', clip, 5.0);
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('a one-frame step at 60fps did not move the picture');
+DOC = {fps: 24};
 RAF = 1;
 console.log('js ok');
 """
