@@ -4549,7 +4549,20 @@ v.seeking = false;
 // ⚠️⚠️ THE BACKSTOP AND THE HONESTY. Pinned at the cap means the nudge cannot
 // win — this machine cannot decode this source at speed. Proportional control
 // alone would sit there permanently, silently, with no seek and no symptom.
+// ⚠️ A SMALL residual lag is the corrector working, not a failure: the cap
+// binds at 0.06s, so saturation is a terrible proxy for "cannot keep up" and
+// using it cried wolf after every single cut.
 NOW = 100000;
+v.currentTime = 5.0 - 0.12; v.playbackRate = 1;   // pinned at the cap, but fine
+feed('mA', clip, 5.0);
+NOW = 106000;
+v.currentTime = 5.0 - 0.12; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('backstopped a lag small enough to nudge away');
+if (NOTES.length) fail('warned about a lag small enough to nudge away');
+
+NOW = 100000;
+v.cutroomPinned = 0;
 v.currentTime = 5.0 - 0.9; v.playbackRate = 1;
 feed('mA', clip, 5.0);                       // pins at NOW
 NOW = 100500;                                // half a second: not yet stuck

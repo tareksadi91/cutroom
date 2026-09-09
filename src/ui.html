@@ -1902,7 +1902,13 @@ function showClipHead(c) {
 const NUDGE  = 0.03;   // ±3%: small enough that time-stretch is inaudible
 const DEAD   = 0.06;   // ~1.5 frames at 24fps: inside this, run at exactly c.rate
 const JUMP   = 1.0;    // past this it is a scrub or a cut, not drift
-const STUCK  = 2000;   // ms pinned at the cap before admitting the nudge cannot win
+// ⚠️ HOW FAR BEHIND IS WORTH SAYING SOMETHING ABOUT — not "is the corrector
+// saturated". k is -drift/2 against a 3% cap, so the cap binds at 0.06s, barely
+// over one frame: using saturation as the signal cried wolf after every cut and
+// dragged a backstop seek along with it. Six frames out is a real desync; one
+// is the corrector doing its job.
+const BEHIND = 0.25;
+const STUCK  = 2000;   // ms that far behind before admitting the nudge cannot win
 const COOL   = 3000;   // ms between backstop seeks, so a stall cannot re-trigger one
 let MONITOR_BEHIND = false;
 // The paused tolerance must sit BETWEEN half a frame and a whole one: above the
@@ -1958,7 +1964,7 @@ function feed(slot,c,t) {
   // the seek loop, and SAY so, because a monitor that is quietly 0.5s behind the
   // sound is the failure a cutting room cannot see.
   const now = performance.now();
-  if (Math.abs(k) >= NUDGE - 1e-9) {
+  if (Math.abs(drift) > BEHIND) {
     if (!v.cutroomPinned) v.cutroomPinned = now;
   } else v.cutroomPinned = 0;
   // ⚠️ `|| 0` would mean "seeked at page load", and performance.now() is small
@@ -1970,10 +1976,12 @@ function feed(slot,c,t) {
     v.currentTime = target;
     v.cutroomLastSeek = now;
     v.cutroomPinned = 0;
+    // Say HOW far, not just that: "0.4s" is something a director can weigh
+    // against what they are judging; "cannot keep up" is not.
     if (!MONITOR_BEHIND) {
       MONITOR_BEHIND = true;
-      note('the monitor cannot decode this source at speed — the picture is behind the sound',
-           'var(--warn)');
+      note('the monitor cannot decode this source at speed — the picture was '
+           + Math.abs(drift).toFixed(2) + 's behind the sound', 'var(--warn)');
     }
   }
   return v;
