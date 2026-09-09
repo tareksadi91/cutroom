@@ -4419,6 +4419,127 @@ console.log('js ok');
         assert "js ok" in r.stdout, r.stdout
 
 
+def test_the_monitor_catches_up_on_rate_and_only_seeks_for_a_real_jump():
+    """The stutter that read as "black between every frame".
+
+    feed() used to seek whenever the element was more than 0.2s off the
+    playhead. On a source heavy enough that a seek costs more than 0.2s of
+    decode that is a feedback loop — the seek stalls playback, the stall
+    rebuilds the drift, the drift seeks again — and ready() blanks the picture
+    for every seek, correctly, because mid-seek an element holds a stale frame.
+    Measured on a 12-17 Mbps cut in a real browser: 64 of 300 painted frames
+    black, ~4.3 seeks a second.
+
+    So while playing, a small lag is corrected on playbackRate instead, which
+    costs no stall and no blank frame. A seek survives for a genuine jump, and
+    for the PAUSED case, where seeking is the only thing that can show the
+    frame that was asked for.
+    """
+    html = (pathlib.Path(server.HERE) / "ui.html").read_text()
+    a = html.index("// >>> monitor-feed")
+    b = html.index("// <<< monitor-feed")
+    region = html[a:b]
+    assert "function feed(" in region, "the monitor-feed markers no longer wrap feed()"
+    node = shutil.which("node")
+    if node is None:
+        print("   (skipped: node is not installed; the monitor is JS)")
+        return
+
+    harness = r"""
+// --- the smallest monitor feed() touches -------------------------------------
+let RAF = 1;                      // playing unless a case says otherwise
+const MON = {}, SLOT_UID = {};
+const mediaURL = mid => '/media/' + mid;
+let SEEKS = 0, RATES = [];
+function setRate(v, rate, base) { RATES.push(+rate.toFixed(4)); v.playbackRate = rate; }
+function mkEl(ct) {
+  return {currentTime: ct, playbackRate: 1, seeking: false, preload: '', src: '',
+          _ct: ct,
+          get currentTimeProxy() { return this.currentTime; }};
+}
+const EL = {};
+const document = {getElementById: id => EL[id]};
+__REGION__
+// --- the sequence ------------------------------------------------------------
+function fail(m) { console.error('FAIL: ' + m); process.exit(1); }
+const clip = {uid: 'c1', mid: 'm01', t: 0, in: 0, out: 10, rate: 1};
+
+// A quarter-second lag while PLAYING is what a cut leaves behind. It must be
+// corrected on rate, never by seeking: a seek here is the stall that starts the
+// loop and the blank frame the director actually sees.
+EL.mA = mkEl(0); MON.mA = '/media/m01';
+let v = EL.mA;
+v.currentTime = 4.75;                        // the element is 0.25s behind
+let before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked to correct a 0.25s lag while playing');
+if (!(v.playbackRate > 1)) fail('did not speed up to catch up a lag');
+if (v.playbackRate > 1.15001) fail('nudged harder than the ±15% cap');
+
+// ⚠️ The cap has to BIND somewhere or it is not tested at all: k is -drift/2, so
+// only a lag past 0.3s reaches it. Under a second is still drift, not a jump.
+v.currentTime = 5.0 - 0.8;
+before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked for a 0.8s lag instead of nudging');
+if (Math.abs(v.playbackRate - 1.15) > 1e-9)
+  fail('the ±15% cap did not bind on a large lag (rate ' + v.playbackRate + ')');
+
+// Running AHEAD is the same problem mirrored: slow down, do not seek back.
+v.currentTime = 5.25; before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked to correct a 0.25s lead while playing');
+if (!(v.playbackRate < 1)) fail('did not slow down when running ahead');
+
+// In sync: the rate must come back to the clip's own rate, or the nudge that
+// closed the gap would then open one in the other direction.
+v.currentTime = 5.0;
+feed('mA', clip, 5.0);
+if (Math.abs(v.playbackRate - 1) > 1e-9) fail('did not settle back to the clip rate when in sync');
+
+// A retimed clip is nudged AROUND ITS OWN RATE, not around 1.0.
+const slow = {uid: 'c2', mid: 'm01', t: 0, in: 0, out: 10, rate: 0.5};
+v.currentTime = 2.4;                        // target 2.5 -> 0.1s behind
+feed('mA', slow, 5.0);
+if (!(v.playbackRate > 0.5 && v.playbackRate <= 0.5 * 1.15001))
+  fail('nudged a retimed clip around 1.0 instead of around its own rate');
+
+// A real JUMP is not drift — a scrub or a cut still seeks outright.
+v.currentTime = 0.0; v.playbackRate = 1;
+feed('mA', clip, 5.0);
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('did not seek for a jump larger than a second');
+
+// ⚠️ Never stack a second seek on one already in flight: that is what keeps the
+// element permanently mid-seek, and ready() paints black the whole time.
+v.currentTime = 0.0; v.seeking = true;
+before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('issued a seek while one was already in flight');
+v.seeking = false;
+
+// ⚠️⚠️ PAUSED IS THE OPPOSITE CASE. Scrubbing shows a frame by seeking to it, so
+// a sub-second drag MUST move the picture — the tolerance that is right while
+// playing would leave the monitor on the wrong frame for most drags.
+RAF = null;
+v.currentTime = 4.75;
+feed('mA', clip, 5.0);
+if (Math.abs(v.currentTime - 5.0) > 1e-9) fail('a scrub shorter than a second did not move the picture');
+// but not for a sub-frame difference, which would seek on every paint
+v.currentTime = 4.99;
+before = v.currentTime;
+feed('mA', clip, 5.0);
+if (v.currentTime !== before) fail('seeked for less than a frame while paused');
+RAF = 1;
+console.log('js ok');
+"""
+    with tempfile.TemporaryDirectory() as d:
+        js = pathlib.Path(d) / "monitorfeed.mjs"
+        js.write_text(harness.replace("__REGION__", region))
+        r = subprocess.run([node, str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr).strip()
+        assert "js ok" in r.stdout, r.stdout
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

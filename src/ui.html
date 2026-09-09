@@ -1790,12 +1790,17 @@ const ready = v => v.readyState >= 2 && !v.seeking;
 // element at its previous rate and quietly restored the drift-seek judder this
 // change exists to remove, so say it once per rate instead.
 const RATE_WARNED = new Set();
-function setRate(v, rate) {
+// `base` is the rate the CUT asks for; `rate` may carry a catch-up nudge on top
+// of it. The warning is about a retime the browser cannot honour, so it is keyed
+// on the base — keyed on the nudged value, every distinct fraction would be its
+// own warning and the Set would grow without bound.
+function setRate(v, rate, base) {
+  const asked = base == null ? rate : base;
   if (v.playbackRate === rate) return;
   try { v.playbackRate = rate; } catch (e) { /* reported below */ }
-  if (Math.abs(v.playbackRate - rate) > 1e-6 && !RATE_WARNED.has(rate)) {
-    RATE_WARNED.add(rate);
-    note(`preview cannot play rate ${rate} — showing ${v.playbackRate}×. The export is unaffected.`,
+  if (Math.abs(v.playbackRate - rate) > 1e-6 && !RATE_WARNED.has(asked)) {
+    RATE_WARNED.add(asked);
+    note(`preview cannot play rate ${asked} — showing ${v.playbackRate}×. The export is unaffected.`,
          'var(--warn)');
   }
 }
@@ -1870,20 +1875,65 @@ function showClipHead(c) {
   return v;
 }
 // <<< clip-head
+// >>> monitor-feed (extracted verbatim by test_server.py — keep both markers)
+// ⚠️⚠️ A SEEK IS NOT A FREE CORRECTION, AND THE OLD RULE ASSUMED IT WAS.
+// "Seek whenever the element is more than 0.2s off the playhead" is a feedback
+// loop on any source heavy enough that a seek costs more than 0.2s of decode:
+// the seek stalls playback, the stall rebuilds the drift, the drift seeks
+// again — about four times a second, forever, because each correction re-
+// creates the condition that triggers it. ready() then blanks the picture for
+// every one of those seeks (correctly — mid-seek the element holds a stale
+// frame), so the cut strobes black between frames.
+//
+// Measured on a 12-17 Mbps 720p cut, in a real browser: 64 of 300 painted
+// frames black, 42 on/off flips, ~4.3 seeks a second.
+//
+// ⚠️ RAISING THE THRESHOLD IS NOT THE FIX. At 0.75s the strobe stops and the
+// picture simply sits 0.54s BEHIND the playhead for good — nothing ever trips
+// the correction again. Measured, and worse for cutting than the flicker.
+//
+// So while PLAYING, catch up on RATE. A few percent is inaudible, costs no
+// stall and no blank frame, and it converges: -0.225s to -0.004s over six
+// seconds, zero black frames in 600. A seek is kept only for a jump, which is
+// not drift at all.
+// ±15%. Measured on real footage: at ±5% the nudge PINS at the cap and never
+// converges — the picture just sits 0.1-0.5s behind, which is the same fault as
+// raising the seek threshold, only slower. At ±15% drift closes from -0.22s to
+// -0.01s in about 2.5s. ±30% measured identical, because the 0.5 gain below is
+// what actually governs, so this cap only bounds the pitch wobble after a cut.
+const NUDGE = 0.15;
+const JUMP  = 1.0;    // past this it is a scrub or a cut, not drift
 function feed(slot,c,t) {
   const v = document.getElementById(slot);
   const want = mediaURL(c.mid);
   if (MON[slot]!==want) { v.preload='auto'; v.src=want; MON[slot]=want; }
   SLOT_UID[slot] = c.uid;
   // The model says a clip at rate r consumes r seconds of source per second of
-  // timeline. Without this the element ran at 1.0 and feed()'s 0.2s correction
-  // yanked currentTime backwards a few times a second, which read as judder and
-  // meant no retime could be judged in the monitor at all.
-  setRate(v, c.rate);
+  // timeline. Without this the element ran at 1.0 and no retime could be judged
+  // in the monitor at all.
   const target = c.in + (t-c.t)*c.rate;
-  if (Math.abs(v.currentTime-target)>0.2) v.currentTime = target;
+  const drift = v.currentTime - target;
+  // ⚠️⚠️ PAUSED IS THE OPPOSITE PROBLEM AND MUST STAY EXACT. Scrubbing shows a
+  // frame BY seeking to it; a rate nudge means nothing on a stopped element.
+  // Reusing the playing tolerance here leaves the monitor on the wrong frame
+  // for every drag shorter than a second — which is most of them.
+  if (RAF === null) {
+    setRate(v, c.rate);
+    if (Math.abs(drift) > 0.04) v.currentTime = target;   // one frame at 24fps
+    return v;
+  }
+  if (!v.seeking && Math.abs(drift) > JUMP) {
+    setRate(v, c.rate);
+    v.currentTime = target;
+    return v;
+  }
+  // Half the error per second: fast enough to close the gap a cut opens, gentle
+  // enough that nothing audible happens on the way.
+  const k = Math.max(-NUDGE, Math.min(NUDGE, -drift * 0.5));
+  setRate(v, c.rate * (1 + k), c.rate);
   return v;
 }
+// <<< monitor-feed
 // Park the next clip's source in the idle slot BEFORE it is due, hidden, so the
 // cut arrives already decoded. Without it every source loaded at exactly the
 // moment it had to be on screen.
