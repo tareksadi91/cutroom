@@ -38,9 +38,9 @@ The agent is not locked into a vendor's idea of editing. It works with the same 
 
 ## What makes it different
 
-### Your footage is not the product
+### Nothing has to be uploaded
 
-Cutroom runs locally. It does not need to upload your footage or project to a platform before you can start.
+Cutroom runs on your computer. There is no account step, no upload step, and no platform between you and your footage before you can start cutting.
 
 You can use an agent with it, but that is your choice. If you use a hosted AI service, that service has its own privacy policy; Cutroom itself does not send your footage anywhere.
 
@@ -61,6 +61,14 @@ That means you can:
 - Have an agent edit it carefully
 - Build custom features around it
 - Leave without losing access to your work
+
+### The ceiling is ffmpeg, not a feature list
+
+An editor built around a hosted service gives you the adjustments its makers decided to ship. When the shot needs something that is not on that list, you are finished negotiating — the answer is no.
+
+Cutroom gives you a timeline, your files on disk, and a way to run anything you can write against them. A post pass is a small script that reads a clip and writes a new file: an ffmpeg filter graph, a grade, a strobe that ramps across a shot, a frame-exact slice, whatever the film actually needs. The result comes back as a new clip on the timeline, with the original untouched. And because the cut is plain JSON, a value you would otherwise nudge with a mouse can simply be set.
+
+The agent is what makes that reach cheap. You describe the treatment; it writes the pass.
 
 ## Get Cutroom
 
