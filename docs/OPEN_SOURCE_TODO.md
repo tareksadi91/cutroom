@@ -239,17 +239,41 @@ updated to assert the new placement instead of the old tooltip location.
 
 ## 9. Clean public-facing repository history and documents
 
-- [ ] Decide whether personal email in commit `0f18e55` may remain public.
-- [ ] If privacy matters, rewrite that author metadata before making repository
+- [x] Decide whether personal email in commit `0f18e55` may remain public.
+- [x] If privacy matters, rewrite that author metadata before making repository
       public, then verify all refs. This is destructive and requires an explicit
       decision before execution.
-- [ ] Reframe `NOTES.md` as historical engineering notes, move it under `docs/`,
+- [x] Reframe `NOTES.md` as historical engineering notes, move it under `docs/`,
       or omit it from public root.
-- [ ] Remove or label stale claims in `NOTES.md`, including info-icon tooltips and
+- [x] Remove or label stale claims in `NOTES.md`, including info-icon tooltips and
       old 77-test count.
-- [ ] Run full-history credential scan with a dedicated scanner before public
+- [x] Run full-history credential scan with a dedicated scanner before public
       release. Regex review found no live secret, but no dedicated scanner was
       installed during review.
+
+**DONE 2026-09-11.**
+
+**Email: ACCEPTED AS PUBLIC, no history rewrite.** `0f18e55` is the only commit
+in all 70 authored from `tarek.sadi91@gmail.com` (a GitHub-web PR merge); every
+other commit uses the GitHub noreply address. Explicit decision to leave it —
+so no rebase, no force-push, and every SHA on `origin/main` stays valid.
+
+**`NOTES.md` and this file moved under `docs/`.** The public root is now
+README, SPEC, AGENTS, CONTRIBUTING, SECURITY, and LICENSE — documents a visitor
+should read — instead of a 29 KB internal rewrite log and an unfinished
+checklist. `NOTES.md` gained a header marking it a snapshot from the rewrite
+rather than current documentation, and pointing at SPEC/AGENTS/`./cutroom check`
+for what is true today. The two named stale claims are fixed in place: the
+"info-icon tooltips" line now says the tooltips stayed and the info icons they
+hung off were removed (`ui.html` no longer contains the string `info` at all,
+though 13 `title=` tooltips remain), and the "77 tests" line is labelled as the
+rewrite-time count with a pointer to the live one. The number today is 163.
+
+**Credential scan: `gitleaks detect --log-opts="--all"` — "no leaks found",
+70 commits, 893 KB scanned.** Backed by an independent regex sweep over every
+commit for `sk-`, `xox[baprs]-`, `ghp_`, `github_pat_`, `AKIA`, and
+`-----BEGIN` — no hits — and a sweep for `/Users/tareksadi`, which appears
+nowhere in the tree or in any commit.
 
 ## 10. Final release gate
 

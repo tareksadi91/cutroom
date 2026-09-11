@@ -1,7 +1,14 @@
-# Rewrite notes
+# Rewrite notes (historical)
 
 What the standalone version kept, what it deleted, the drag-and-drop decision,
 and how each hard boundary is enforced and proved.
+
+> **These are engineering notes from the rewrite, kept as a record of how the
+> program got its shape and why each boundary is drawn where it is. They are a
+> snapshot, not current documentation.** Counts, file sizes, and UI details are
+> as they stood at the rewrite and have moved on since. For what is true today,
+> read [`SPEC.md`](../SPEC.md), [`AGENTS.md`](../AGENTS.md), and the tests —
+> `./cutroom check` prints the real number.
 
 ## Kept, deliberately unchanged
 
@@ -26,8 +33,8 @@ redesigned.
 - **`ui.html`**: the design as approved. Same palette, type scale, three-column
   grid, header zones, five-second ruler, lane surfaces without borders, the
   crossfade hatch that spans the lane stack, drag/trim/lane-drag behaviour,
-  program monitor with two cross-faded video elements, zoom steps, info-icon
-  tooltips, and — verbatim, markers and all — the save loop with its coalescing
+  program monitor with two cross-faded video elements, zoom steps, control
+  tooltips (the info icons they hung off have since been removed), and — verbatim, markers and all — the save loop with its coalescing
   and its `keep mine` / `take theirs` conflict banner.
 - **The suites**: every test that still describes this program, including all
   the mutation-tested render tests. 35 render tests, 42 server tests — 52
@@ -196,6 +203,8 @@ step and diffed, unchanged each time; the directory still holds its 41 files.
    re-pointed the clip, left `m03` on the list and the original byte-identical.
 6. Re-exported at v005: 5.000000s, 120 frames again.
 7. Both suites: **77 tests, all green** (35 render, 42 server), run repeatedly.
+   *(As of the rewrite. The suite has grown since — `./cutroom check` is the
+   live count.)*
 
 ## Residual concerns
 
