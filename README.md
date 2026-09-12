@@ -1,8 +1,8 @@
 # cutroom
 
-A local video cutting room for people who want to make films with agents, without handing their footage, timeline, or workflow to a walled garden.
+A local video cutting room for making films with agents, without handing your footage, timeline, or workflow to somebody else's platform.
 
-Cutroom opens in a browser but runs on your own computer. Your project stays as a simple file you can inspect, copy, edit, and keep. You make decisions visually; an agent can make precise changes to the same cut or help build the workflow you wish existed.
+Cutroom opens in a browser but runs on your own computer. Your project stays as a simple file you can inspect, copy, edit, and keep. You make decisions visually; an agent can make precise changes to the same cut, or build you a workflow that does not exist yet.
 
 No account. No subscription. No upload requirement. No proprietary project format.
 
@@ -13,11 +13,11 @@ the program monitor at top right showing the shot under the playhead, and the
 timeline across the bottom with clips laid out on lanes, a playhead, and
 crossfades between shots.](docs/assets/cutroom-the-courier.png)
 
-## What problem does it solve?
+## Why it exists
 
-Most editing software assumes one of two things: you are already a professional editor, or you are happy to work inside somebody else's app, cloud, format, and limitations.
+Editing software mostly comes in two shapes. Professional tools assume you already know how to edit. Hosted apps ask you to work inside somebody else's cloud, format, and limits.
 
-Cutroom takes a different approach. You can drag clips onto a timeline and make a normal cut yourself. If you are not an editing expert, you can also work with an agent locally:
+Cutroom is a timeline on your own machine. You can drag clips onto it and make a normal cut yourself. If you are not an editing expert, you can work with an agent instead:
 
 - “Make this opening 20 seconds faster.”
 - “Try three versions with a slower build.”
@@ -25,7 +25,7 @@ Cutroom takes a different approach. You can drag clips onto a timeline and make 
 - “Make a vertical version for social.”
 - “Build me a button for the repetitive thing I keep doing.”
 
-The agent is not locked into a vendor's idea of editing. It works with the same project you do. You can inspect every change, keep what works, and make the tool fit your film instead of fitting your film into somebody else's product.
+The agent works on the same project you do, so you can read every change and keep the ones that worked. When the tool is missing something your film needs, you can add it.
 
 ## What Cutroom is good at
 
@@ -62,13 +62,13 @@ That means you can:
 - Build custom features around it
 - Leave without losing access to your work
 
-### The ceiling is ffmpeg, not a feature list
+### A post pass is just a script
 
-An editor built around a hosted service gives you the adjustments its makers decided to ship. When the shot needs something that is not on that list, you are finished negotiating — the answer is no.
+An editor built around a hosted service gives you the adjustments its makers decided to ship. When a shot needs something that is not on that list, there is nothing you can do about it.
 
-Cutroom gives you a timeline, your files on disk, and a way to run anything you can write against them. A post pass is a small script that reads a clip and writes a new file: an ffmpeg filter graph, a grade, a strobe that ramps across a shot, a frame-exact slice, whatever the film actually needs. The result comes back as a new clip on the timeline, with the original untouched. And because the cut is plain JSON, a value you would otherwise nudge with a mouse can simply be set.
+Here you have a timeline, your files on disk, and a way to run anything you can write against them. A post pass reads a clip and writes a new file: an ffmpeg filter graph, a grade, a strobe that ramps across a shot, a frame-exact slice, whatever the film needs. The result comes back as a new clip on the timeline and the original is untouched. Because the cut is plain JSON, a value you would otherwise nudge with a mouse can be typed.
 
-The agent is what makes that reach cheap. You describe the treatment; it writes the pass.
+The agent is what makes this cheap. You describe the treatment, it writes the pass.
 
 ## Get Cutroom
 
