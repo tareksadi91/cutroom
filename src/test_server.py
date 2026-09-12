@@ -4616,6 +4616,39 @@ console.log('js ok');
         assert "js ok" in r.stdout, r.stdout
 
 
+def test_a_missing_ffmpeg_is_named_instead_of_thrown():
+    """Without ffmpeg, `cutroom check` used to die twenty lines into a
+    traceback whose only useful word was 'ffmpeg', after printing two ok
+    lines. It is the first command in the README, so it is the first thing a
+    person without ffmpeg sees. Now it is named, with the install line."""
+    real = shutil.which
+    try:
+        shutil.which = lambda t: None if t in ("ffmpeg", "ffprobe") else real(t)
+        assert server.missing_tools() == ["ffmpeg", "ffprobe"]
+        try:
+            server.require_tools()
+            assert False, "require_tools() let a missing ffmpeg through"
+        except SystemExit as e:
+            said = str(e)
+        assert "ffmpeg" in said and "ffprobe" in said, said
+        assert "Traceback" not in said, said
+        assert said.count("\n") == 1, f"more than one hint line: {said!r}"
+
+        # ffprobe alone missing reads as one tool, not two.
+        shutil.which = lambda t: None if t == "ffprobe" else real(t)
+        assert server.missing_tools() == ["ffprobe"]
+        try:
+            server.require_tools()
+            assert False, "require_tools() let a missing ffprobe through"
+        except SystemExit as e:
+            assert "cannot find it" in str(e), str(e)
+    finally:
+        shutil.which = real
+
+    # And the two commands that never shell out stay usable without it.
+    assert server.missing_tools() == [], "this machine has no ffmpeg to test with"
+
+
 if __name__ == "__main__":
     # An optional substring argument runs one test. Used to demonstrate a fix
     # FAILING FIRST against a patched copy of the module it fixes.

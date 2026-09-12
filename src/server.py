@@ -77,6 +77,7 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -1675,6 +1676,28 @@ def serve(name, port, passes_dir=None, open_browser=True):
     srv.serve_forever()
 
 
+INSTALL_HINT = {"darwin": "brew install ffmpeg",
+                "linux": "sudo apt install ffmpeg  (or your distribution's equivalent)"}
+
+
+def missing_tools():
+    """ffmpeg and ffprobe are the one thing cutroom needs and cannot ship.
+
+    Every door that touches video shells out to them, so without them the
+    first command in the README dies twenty lines deep in a traceback whose
+    only useful word is 'ffmpeg'. Checked here, once, by name."""
+    return [t for t in ("ffmpeg", "ffprobe") if shutil.which(t) is None]
+
+
+def require_tools():
+    missing = missing_tools()
+    if not missing:
+        return
+    hint = INSTALL_HINT.get(sys.platform, "install ffmpeg with your package manager")
+    sys.exit(f"cutroom needs {' and '.join(missing)} on your PATH, and cannot "
+             f"find {'them' if len(missing) > 1 else 'it'}.\n  {hint}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cutroom")
     sub = ap.add_subparsers(dest="cmd")
@@ -1710,6 +1733,8 @@ def main(argv=None):
     sub.add_parser("check", help="run the test suites")
 
     a = ap.parse_args(argv)
+    if a.cmd in ("add", "serve", "export", "check"):
+        require_tools()  # ponytail: "new" and "ls" never shell out
     try:
         if a.cmd == "new":
             w, x, h = a.res.partition("x")
